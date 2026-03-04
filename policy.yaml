@@ -1,0 +1,17 @@
+trading:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  max_leverage: 3
+  order_type: "market" # market or limit (MVP primarily uses market for simplicity, or limit with aggressive pricing)
+  
+risk_limits:
+  daily_max_loss_pct: 3.0    # Stop trading if daily loss exceeds 3% of account balance
+  max_consecutive_losses: 3  # Pause trading after 3 consecutive losing trades
+  cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
+  max_open_positions: 2      # Maximum number of concurrent positions
+  
+intervals:
+  strategy_loop_minutes: 60  # 1 hour
+  position_loop_minutes: 15  # 15 minutes
+  trigger_loop_minutes: 5    # 5 minutes
