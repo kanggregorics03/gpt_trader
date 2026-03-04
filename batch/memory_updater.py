@@ -9,6 +9,7 @@ from google.genai import types
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from core.models import MemoryCondition
 from db.state_store import StateStore
 
 load_dotenv()
@@ -21,6 +22,14 @@ class MemoryLesson(BaseModel):
     support_count: int = Field(ge=1)
     evidence_journal_ids: List[int] = Field(default_factory=list)
     hypothesis: bool = False
+    apply_when: MemoryCondition = Field(
+        description="Conditions for applying the lesson. Must include regime, volatility, and trend tags."
+    )
+    ignore_when: List[str] = Field(
+        default_factory=list,
+        description="Counterexamples or conditions where the lesson should be ignored.",
+        min_length=1,
+    )
 
 
 class MemoryUpdater:
@@ -128,8 +137,10 @@ Rules:
 2. Do not invent profit factors, samples, or evidence.
 3. A lesson with support_count < 3 must be marked hypothesis=true.
 4. Favor anti-patterns and risk-control rules over generic advice.
-5. Return only JSON matching the schema.
-6. All text must be in English.
+5. Every lesson must include apply_when.regime, apply_when.volatility, and apply_when.trend.
+6. Every lesson must include ignore_when with at least one concrete counterexample condition.
+7. Return only JSON matching the schema.
+8. All text must be in English.
 
 Computed statistics:
 {stats_json}
@@ -177,6 +188,8 @@ Computed statistics:
                 "category": lesson.category,
                 "regime": lesson.regime,
                 "status": status,
+                "apply_when": lesson.apply_when.model_dump(),
+                "ignore_when": lesson.ignore_when,
                 "win_rate": stats_package["win_rate"],
                 "avg_estimated_pnl_pct": stats_package["avg_estimated_pnl_pct"],
                 "ledger_net_realized_pnl": ledger_stats.get("net_realized_pnl", 0.0),

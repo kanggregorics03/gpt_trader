@@ -42,9 +42,19 @@ collector
 
 지표/특징 계산(ATR, 추세 기울기, 변동성 등)
 
+가능하면 Bybit public WebSocket으로 ticker/orderbook/kline을 수신하고, 부족한 데이터만 REST fallback
+
 account_reader
 
 잔고/포지션/미체결 주문을 Bybit에서 조회
+
+포지션별 청산가/레버리지/증거금/명목가치와 미체결 주문 상세까지 정규화
+
+시장 데이터는 메인넷 public API를 사용하고, 계좌 조회/주문 실행은 live 또는 demo private API를 선택할 수 있게 분리
+
+짧은 TTL 계좌 캐시를 사용하고, 주문 실행 직후에는 invalidate 후 재조회해 stale 상태를 방지
+
+가능하면 Bybit private WebSocket으로 wallet/position/order/execution을 유지하고, 일정 주기로 REST reconcile
 
 state_store (DB)
 
@@ -101,20 +111,40 @@ monitoring & alert
 
 신규 진입보다 리스크 관리(감축/청산/정정) 중심 운영
 
+트리거는 두 부류로 분리:
+
+opportunity_trigger: 급변/돌파/거래량 급증처럼 관찰 빈도를 높일 이유가 있는 이벤트
+
+risk_trigger: 스프레드 확대, 펀딩비 왜곡처럼 신규 진입을 줄이거나 막아야 하는 거래 품질 악화
+
+fast_price_move_15m, volume_surge_15m, range_break_1h에는 ON/OFF 기준을 분리한 히스테리시스를 적용해 경계 구간 점멸을 줄임
+
 5) 입력/출력 표준화(JSON)
 5.1 Gemini 입력(DecisionRequest)
 
 policy_summary: 현재 정책 핵심(레버리지/한도/쿨다운 등)
 
-account_state: 잔고/포지션/미체결 요약(사실)
+account_state: 계좌 스냅샷 시각, 잔고, 총 미실현손익, 마진비율, 포지션 위험정보, 미체결 주문 상세(사실)
 
 market_snapshot: 15m/1h 캔들(마감된 캔들만), 핵심 지표/레벨 요약
+
+멀티 심볼 운영에서는 market_snapshots로 여러 심볼 스냅샷을 한 번에 전달해 포트폴리오 단일 판단을 생성
+
+market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 분리해 포함
+
+risk_state: 일일 손익률, 연속 손실, 쿨다운, 드로우다운 상태
 
 recent_journal_summaries: 최근 10~20건 요약
 
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
 
 constraints: “JSON only”, 출력 최대 길이, 허용 행동 제한
+
+프롬프트는 compact JSON으로 직렬화하고, 완전히 동일한 prompt + model은 decision_cache에서 재사용
+
+시장 데이터 수집은 OHLCV 롤링 캐시와 ticker/order book/funding/open interest TTL 캐시를 사용해 네트워크 부하를 줄임
+
+RAG는 audit 저장 시 시장 feature vector를 함께 저장하고, 조회 시에는 심볼별 반복 스캔 대신 배치 유사도 계산으로 DB 부하를 줄임
 
 5.2 Gemini 출력(TradeIntent.json)
 

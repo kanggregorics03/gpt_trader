@@ -217,8 +217,19 @@ HTML_TEMPLATE = """
             const fills = detail.fills || [];
             const replayRuns = detail.replay_runs || [];
             const ledgerEntries = detail.ledger_entries || [];
+            const riskProfile = parseJson(detail.risk_profile, {});
+            const orderStateTransitions = detail.order_state_transitions || [];
+            const positionStateTransitions = detail.position_state_transitions || [];
             document.getElementById('audit-detail').innerHTML = `
                 <div class="detail-grid">
+                    <div class="detail-box">
+                        <p class="eyebrow">Candidate Input Hash</p>
+                        <pre>${detail.decision_input_hash || '(empty)'}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Risk Mode / Profile</p>
+                        <pre>${pretty({ risk_mode: detail.risk_mode, risk_profile: riskProfile })}</pre>
+                    </div>
                     <div class="detail-box">
                         <p class="eyebrow">Stored Request</p>
                         <pre>${pretty(requestPayload)}</pre>
@@ -246,6 +257,14 @@ HTML_TEMPLATE = """
                     <div class="detail-box" style="grid-column: 1 / -1;">
                         <p class="eyebrow">Replay Runs</p>
                         <pre>${pretty(replayRuns)}</pre>
+                    </div>
+                    <div class="detail-box" style="grid-column: 1 / -1;">
+                        <p class="eyebrow">Order State Transitions</p>
+                        <pre>${pretty(orderStateTransitions)}</pre>
+                    </div>
+                    <div class="detail-box" style="grid-column: 1 / -1;">
+                        <p class="eyebrow">Position State Transitions</p>
+                        <pre>${pretty(positionStateTransitions)}</pre>
                     </div>
                 </div>
             `;
@@ -290,7 +309,7 @@ HTML_TEMPLATE = """
                         <div class="fill-item">
                             <strong>audit ${run.audit_log_id}: ${run.original_decision || 'UNKNOWN'} -> ${run.replayed_decision || 'UNKNOWN'}</strong>
                             <div class="fill-meta">
-                                changed ${run.decision_changed ? 'yes' : 'no'} • order delta ${run.order_count_changed ? 'yes' : 'no'} • confidence ${run.confidence_delta || 0}
+                                changed ${run.decision_changed ? 'yes' : 'no'} • side ${run.side_changed ? 'changed' : 'same'} • size ${run.size_delta || 0} • confidence ${run.confidence_delta || 0}
                             </div>
                         </div>
                     `);
@@ -344,12 +363,14 @@ HTML_TEMPLATE = """
                 renderList('memory-list', 'No memory rules saved yet.', data.recent_memory, item => {
                     const metrics = item.metrics || {};
                     const badgeClass = metrics.status === 'rule' ? 'ok' : 'warn';
+                    const applyWhen = item.apply_when || {};
+                    const ignoreWhen = item.ignore_when || [];
                     return `
                         <div class="memory-item">
                             <span class="badge ${badgeClass}">${metrics.status || 'unknown'}</span>
                             <strong>${item.rule}</strong>
                             <div class="memory-meta">
-                                support ${metrics.support || 0} • regime ${metrics.regime || 'general'} • saved ${item.timestamp}
+                                support ${metrics.support || 0} • regime ${metrics.regime || 'general'} • apply ${((applyWhen.trend || []).join('/') || 'n/a')} • ignore ${ignoreWhen[0] || 'n/a'}
                             </div>
                         </div>
                     `;
@@ -377,7 +398,7 @@ HTML_TEMPLATE = """
                     <div class="fill-item">
                         <strong>audit ${run.audit_log_id}: ${run.original_decision || 'UNKNOWN'} -> ${run.replayed_decision || 'UNKNOWN'}</strong>
                         <div class="fill-meta">
-                            changed ${run.decision_changed ? 'yes' : 'no'} • order delta ${run.order_count_changed ? 'yes' : 'no'} • confidence ${run.confidence_delta || 0}
+                            changed ${run.decision_changed ? 'yes' : 'no'} • side ${run.side_changed ? 'changed' : 'same'} • size ${run.size_delta || 0} • confidence ${run.confidence_delta || 0}
                         </div>
                     </div>
                 `);

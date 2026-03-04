@@ -1,7 +1,8 @@
 import argparse
 import json
 import os
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List, Set
 
 from dotenv import load_dotenv
 
@@ -12,16 +13,66 @@ from db.state_store import StateStore
 load_dotenv()
 
 
+STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "after",
+    "before", "during", "over", "under", "risk", "mode", "signal", "price",
+    "market", "position", "positions", "trade", "trading", "order", "orders",
+    "setup", "hold", "exit", "reduce", "buy", "sell",
+}
+
+
+def extract_rationale_keywords(rationale: Any) -> List[str]:
+    texts = rationale if isinstance(rationale, list) else [rationale]
+    keywords: Set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for token in re.findall(r"[a-zA-Z][a-zA-Z_-]{2,}", str(text).lower()):
+            if token in STOPWORDS:
+                continue
+            keywords.add(token)
+    return sorted(keywords)
+
+
+def extract_order_sides(intent: Dict[str, Any]) -> List[str]:
+    orders = intent.get("orders") or []
+    sides = {str(order.get("action") or "").upper() for order in orders if order.get("action")}
+    if not sides and intent.get("decision") in ("BUY", "SELL"):
+        sides.add(str(intent.get("decision")).upper())
+    return sorted(sides)
+
+
+def extract_total_size(intent: Dict[str, Any]) -> float:
+    total = 0.0
+    for order in intent.get("orders") or []:
+        total += abs(float(order.get("quantity") or 0.0))
+    return round(total, 8)
+
+
 def compare_intents(original: Dict[str, Any], replayed: Dict[str, Any]) -> Dict[str, Any]:
+    original_sides = extract_order_sides(original)
+    replayed_sides = extract_order_sides(replayed)
+    original_size = extract_total_size(original)
+    replayed_size = extract_total_size(replayed)
+    original_keywords = extract_rationale_keywords(original.get("rationale") or [])
+    replayed_keywords = extract_rationale_keywords(replayed.get("rationale") or [])
     return {
         "decision_changed": original.get("decision") != replayed.get("decision"),
         "order_count_changed": len(original.get("orders", [])) != len(replayed.get("orders", [])),
+        "side_changed": original_sides != replayed_sides,
+        "size_delta": round(replayed_size - original_size, 8),
         "confidence_delta": round(
             float(replayed.get("confidence", 0.0)) - float(original.get("confidence", 0.0)),
             6,
         ),
         "original_decision": original.get("decision"),
         "replayed_decision": replayed.get("decision"),
+        "original_sides": original_sides,
+        "replayed_sides": replayed_sides,
+        "original_total_size": original_size,
+        "replayed_total_size": replayed_size,
+        "rationale_keywords_added": sorted(set(replayed_keywords) - set(original_keywords)),
+        "rationale_keywords_removed": sorted(set(original_keywords) - set(replayed_keywords)),
     }
 
 

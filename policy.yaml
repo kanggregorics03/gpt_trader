@@ -7,9 +7,27 @@ trading:
   
 risk_limits:
   daily_max_loss_pct: 3.0    # Stop trading if daily loss exceeds 3% of account balance
+  drawdown_activate_pct: 1.5 # Enter drawdown mode before the hard daily kill-switch is hit
   max_consecutive_losses: 3  # Pause trading after 3 consecutive losing trades
   cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
   max_open_positions: 2      # Maximum number of concurrent positions
+  mode_profiles:
+    normal:
+      max_open_positions: 2
+      max_order_notional_pct_balance: 100
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+    trigger:
+      max_open_positions: 1
+      max_order_notional_pct_balance: 35
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+    cooldown:
+      max_open_positions: 2
+      max_order_notional_pct_balance: 0
+      allowed_actions: [HOLD, REDUCE, EXIT]
+    drawdown:
+      max_open_positions: 1
+      max_order_notional_pct_balance: 20
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
   
 intervals:
   strategy_loop_minutes: 60  # 1 hour

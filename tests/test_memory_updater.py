@@ -1,6 +1,7 @@
 import unittest
 
 from batch.memory_updater import MemoryLesson, MemoryUpdater
+from core.models import MemoryCondition
 
 
 class TestMemoryUpdater(unittest.TestCase):
@@ -74,6 +75,12 @@ class TestMemoryUpdater(unittest.TestCase):
                 support_count=2,
                 evidence_journal_ids=[7, 8],
                 hypothesis=True,
+                apply_when=MemoryCondition(
+                    regime=["high_volatility"],
+                    volatility=["high"],
+                    trend=["up"],
+                ),
+                ignore_when=["Ignore when breakout retest holds with rising volume."],
             )
         ]
 
@@ -83,6 +90,11 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(entries[0]["metrics"]["status"], "hypothesis")
         self.assertEqual(entries[0]["metrics"]["support"], 2)
         self.assertEqual(entries[0]["metrics"]["regime"], "high_volatility")
+        self.assertEqual(entries[0]["metrics"]["apply_when"]["trend"], ["up"])
+        self.assertEqual(
+            entries[0]["metrics"]["ignore_when"],
+            ["Ignore when breakout retest holds with rising volume."],
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,12 @@ class StateStore:
         self.conn.row_factory = sqlite3.Row
         self._init_db()
 
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
     def _init_db(self):
         with self.conn:
             self.conn.executescript("""
@@ -21,11 +27,15 @@ class StateStore:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     account_state JSON,
                     market_state JSON,
+                    market_vectors JSON,
                     intent JSON,
                     risk_approved BOOLEAN,
                     risk_reason TEXT,
                     receipts JSON,
                     policy_snapshot TEXT,
+                    decision_input_hash TEXT,
+                    risk_mode TEXT,
+                    risk_profile JSON,
                     decision_request JSON,
                     ai_raw_response TEXT,
                     execution_summary JSON
@@ -93,17 +103,70 @@ class StateStore:
                     replayed_decision TEXT,
                     decision_changed BOOLEAN DEFAULT 0,
                     order_count_changed BOOLEAN DEFAULT 0,
+                    side_changed BOOLEAN DEFAULT 0,
+                    size_delta REAL DEFAULT 0,
                     confidence_delta REAL DEFAULT 0,
+                    rationale_keywords_added JSON,
+                    rationale_keywords_removed JSON,
                     payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS order_state_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_log_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT,
+                    client_order_id TEXT,
+                    exchange_order_id TEXT,
+                    from_state TEXT,
+                    to_state TEXT,
+                    event_type TEXT,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS position_state_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_log_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT,
+                    event_type TEXT,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS trigger_state (
+                    symbol TEXT PRIMARY KEY,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS decision_cache (
+                    prompt_hash TEXT PRIMARY KEY,
+                    model_name TEXT NOT NULL,
+                    input_hash TEXT,
+                    raw_response TEXT NOT NULL,
+                    intent JSON NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    hit_count INTEGER DEFAULT 0
                 );
             """)
         self._ensure_column("audit_logs", "policy_snapshot", "TEXT")
+        self._ensure_column("audit_logs", "decision_input_hash", "TEXT")
+        self._ensure_column("audit_logs", "risk_mode", "TEXT")
+        self._ensure_column("audit_logs", "risk_profile", "JSON")
         self._ensure_column("audit_logs", "decision_request", "JSON")
         self._ensure_column("audit_logs", "ai_raw_response", "TEXT")
         self._ensure_column("audit_logs", "execution_summary", "JSON")
+        self._ensure_column("audit_logs", "market_vectors", "JSON")
         self._ensure_column("journal", "risk_reason", "TEXT")
         self._ensure_column("journal", "estimated_pnl_pct", "REAL")
         self._ensure_column("journal", "loss_signal", "BOOLEAN DEFAULT 0")
+        self._ensure_column("replay_runs", "side_changed", "BOOLEAN DEFAULT 0")
+        self._ensure_column("replay_runs", "size_delta", "REAL DEFAULT 0")
+        self._ensure_column("replay_runs", "rationale_keywords_added", "JSON")
+        self._ensure_column("replay_runs", "rationale_keywords_removed", "JSON")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str):
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
@@ -123,9 +186,13 @@ class StateStore:
         reason: str,
         receipts: list,
         policy_snapshot: Optional[str] = None,
+        decision_input_hash: Optional[str] = None,
+        risk_mode: Optional[str] = None,
+        risk_profile: Optional[dict] = None,
         decision_request: Optional[dict] = None,
         ai_raw_response: Optional[str] = None,
         execution_summary: Optional[dict] = None,
+        market_vectors: Optional[dict] = None,
     ) -> Optional[int]:
         try:
             with self.conn:
@@ -134,24 +201,32 @@ class StateStore:
                     INSERT INTO audit_logs (
                         account_state,
                         market_state,
+                        market_vectors,
                         intent,
                         risk_approved,
                         risk_reason,
                         receipts,
                         policy_snapshot,
+                        decision_input_hash,
+                        risk_mode,
+                        risk_profile,
                         decision_request,
                         ai_raw_response,
                         execution_summary
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         json.dumps(account),
                         json.dumps(market),
+                        json.dumps(market_vectors) if market_vectors is not None else None,
                         json.dumps(intent),
                         risk_ok,
                         reason,
                         json.dumps(receipts),
                         policy_snapshot,
+                        decision_input_hash,
+                        risk_mode,
+                        json.dumps(risk_profile) if risk_profile is not None else None,
                         json.dumps(decision_request) if decision_request is not None else None,
                         ai_raw_response,
                         json.dumps(execution_summary) if execution_summary is not None else None,
@@ -205,15 +280,36 @@ class StateStore:
             logger.error(f"Failed to fetch journals: {e}")
             return []
 
-    def get_long_term_memory(self) -> List[str]:
+    def get_long_term_memory(self) -> List[Dict[str, Any]]:
         try:
-            cursor = self.conn.execute("SELECT rule FROM long_term_memory ORDER BY id DESC LIMIT 50")
-            rows = cursor.fetchall()
-            rules = [row['rule'] for row in rows]
-            # Default empty lesson if none exists
-            if not rules:
-                return ["No long term lessons recorded yet. Be conservative."]
-            return rules
+            cursor = self.conn.execute(
+                """
+                SELECT id, timestamp, rule, version, metrics
+                FROM long_term_memory
+                ORDER BY id DESC
+                LIMIT 50
+                """
+            )
+            rows = [self._format_memory_row(dict(row)) for row in cursor.fetchall()]
+            if not rows:
+                return [
+                    {
+                        "rule": "No long term lessons recorded yet. Be conservative.",
+                        "category": "risk_control",
+                        "status": "rule",
+                        "support": 0,
+                        "regime": "general",
+                        "apply_when": {
+                            "regime": ["general"],
+                            "volatility": ["unknown"],
+                            "trend": ["unknown"],
+                        },
+                        "ignore_when": ["No validated long-term evidence yet."],
+                        "evidence_journal_ids": [],
+                        "metrics": {},
+                    }
+                ]
+            return rows
         except Exception as e:
             logger.error(f"Failed to fetch long term memory: {e}")
             return []
@@ -367,9 +463,13 @@ class StateStore:
                         replayed_decision,
                         decision_changed,
                         order_count_changed,
+                        side_changed,
+                        size_delta,
                         confidence_delta,
+                        rationale_keywords_added,
+                        rationale_keywords_removed,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         audit_log_id,
@@ -377,12 +477,82 @@ class StateStore:
                         comparison.get("replayed_decision"),
                         int(bool(comparison.get("decision_changed"))),
                         int(bool(comparison.get("order_count_changed"))),
+                        int(bool(comparison.get("side_changed"))),
+                        float(comparison.get("size_delta") or 0.0),
                         float(comparison.get("confidence_delta") or 0.0),
+                        json.dumps(comparison.get("rationale_keywords_added") or []),
+                        json.dumps(comparison.get("rationale_keywords_removed") or []),
                         json.dumps(payload),
                     ),
                 )
         except Exception as e:
             logger.error(f"Failed to save replay run: {e}")
+
+    def save_order_state_transitions(self, audit_log_id: int, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO order_state_transitions (
+                        audit_log_id,
+                        symbol,
+                        client_order_id,
+                        exchange_order_id,
+                        from_state,
+                        to_state,
+                        event_type,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            audit_log_id,
+                            entry.get("symbol"),
+                            entry.get("client_order_id"),
+                            entry.get("exchange_order_id"),
+                            entry.get("from_state"),
+                            entry.get("to_state"),
+                            entry.get("event_type"),
+                            json.dumps(entry.get("payload", {})),
+                        )
+                        for entry in entries
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save order state transitions: {e}")
+
+    def save_position_state_transitions(self, audit_log_id: int, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO position_state_transitions (
+                        audit_log_id,
+                        symbol,
+                        from_state,
+                        to_state,
+                        event_type,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            audit_log_id,
+                            entry.get("symbol"),
+                            entry.get("from_state"),
+                            entry.get("to_state"),
+                            entry.get("event_type"),
+                            json.dumps(entry.get("payload", {})),
+                        )
+                        for entry in entries
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save position state transitions: {e}")
 
     def get_recent_long_term_memory(self, limit: int = 10) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
@@ -396,12 +566,7 @@ class StateStore:
         )
         rows = []
         for row in cursor.fetchall():
-            item = dict(row)
-            try:
-                item["metrics"] = json.loads(item["metrics"]) if item["metrics"] else {}
-            except Exception:
-                item["metrics"] = {}
-            rows.append(item)
+            rows.append(self._format_memory_row(dict(row)))
         return rows
 
     def get_monitoring_snapshot(self, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -466,20 +631,38 @@ class StateStore:
             "recent_fills": self.get_recent_fills(limit=10),
             "recent_ledger": self.get_recent_position_ledger(limit=10),
             "recent_replays": self.get_recent_replay_runs(limit=10),
+            "recent_order_states": self.get_recent_order_state_transitions(limit=10),
+            "recent_position_states": self.get_recent_position_state_transitions(limit=10),
         }
         return snapshot
 
     def get_recent_audits(self, limit: int = 20) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
             """
-            SELECT id, timestamp, intent, risk_approved, risk_reason, execution_summary
+            SELECT
+                id,
+                timestamp,
+                intent,
+                risk_approved,
+                risk_reason,
+                decision_input_hash,
+                risk_mode,
+                execution_summary,
+                market_vectors
             FROM audit_logs
             ORDER BY id DESC
             LIMIT ?
             """,
             (limit,),
         )
-        return [dict(row) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+            item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+            item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
+            rows.append(item)
+        return rows
 
     def get_audit_log(self, audit_id: int) -> Optional[Dict[str, Any]]:
         cursor = self.conn.execute(
@@ -498,12 +681,14 @@ class StateStore:
         decoded["fills"] = self.get_execution_fills(audit_id)
         decoded["ledger_entries"] = self.get_position_ledger_for_audit(audit_id)
         decoded["replay_runs"] = self.get_replay_runs_for_audit(audit_id, limit=10)
+        decoded["order_state_transitions"] = self.get_order_state_transitions_for_audit(audit_id)
+        decoded["position_state_transitions"] = self.get_position_state_transitions_for_audit(audit_id)
         return decoded
 
     def get_replay_candidates(self, limit: int = 20) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
             """
-            SELECT id, timestamp, intent, risk_approved, risk_reason
+            SELECT id, timestamp, intent, risk_approved, risk_reason, market_vectors
             FROM audit_logs
             WHERE decision_request IS NOT NULL
             ORDER BY id DESC
@@ -514,6 +699,33 @@ class StateStore:
         rows = []
         for row in cursor.fetchall():
             item = dict(row)
+            item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+            item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
+            rows.append(item)
+        return rows
+
+    def get_recent_rag_candidates(self, limit: int = 500) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                id,
+                timestamp,
+                market_state,
+                market_vectors,
+                intent,
+                risk_approved
+            FROM audit_logs
+            WHERE market_state IS NOT NULL
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["market_state"] = self._safe_json_loads(item.get("market_state"), default={})
+            item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
             item["intent"] = self._safe_json_loads(item.get("intent"), default={})
             rows.append(item)
         return rows
@@ -739,7 +951,11 @@ class StateStore:
                 replayed_decision,
                 decision_changed,
                 order_count_changed,
+                side_changed,
+                size_delta,
                 confidence_delta,
+                rationale_keywords_added,
+                rationale_keywords_removed,
                 payload
             FROM replay_runs
             ORDER BY id DESC
@@ -750,6 +966,14 @@ class StateStore:
         rows = []
         for row in cursor.fetchall():
             item = dict(row)
+            item["rationale_keywords_added"] = self._safe_json_loads(
+                item.get("rationale_keywords_added"),
+                default=[],
+            )
+            item["rationale_keywords_removed"] = self._safe_json_loads(
+                item.get("rationale_keywords_removed"),
+                default=[],
+            )
             item["payload"] = self._safe_json_loads(item.get("payload"), default={})
             rows.append(item)
         return rows
@@ -765,7 +989,11 @@ class StateStore:
                 replayed_decision,
                 decision_changed,
                 order_count_changed,
+                side_changed,
+                size_delta,
                 confidence_delta,
+                rationale_keywords_added,
+                rationale_keywords_removed,
                 payload
             FROM replay_runs
             WHERE audit_log_id = ?
@@ -777,6 +1005,114 @@ class StateStore:
         rows = []
         for row in cursor.fetchall():
             item = dict(row)
+            item["rationale_keywords_added"] = self._safe_json_loads(
+                item.get("rationale_keywords_added"),
+                default=[],
+            )
+            item["rationale_keywords_removed"] = self._safe_json_loads(
+                item.get("rationale_keywords_removed"),
+                default=[],
+            )
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_recent_order_state_transitions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                audit_log_id,
+                created_at,
+                symbol,
+                client_order_id,
+                exchange_order_id,
+                from_state,
+                to_state,
+                event_type,
+                payload
+            FROM order_state_transitions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_order_state_transitions_for_audit(self, audit_log_id: int) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                audit_log_id,
+                created_at,
+                symbol,
+                client_order_id,
+                exchange_order_id,
+                from_state,
+                to_state,
+                event_type,
+                payload
+            FROM order_state_transitions
+            WHERE audit_log_id = ?
+            ORDER BY id ASC
+            """,
+            (audit_log_id,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_recent_position_state_transitions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                audit_log_id,
+                created_at,
+                symbol,
+                from_state,
+                to_state,
+                event_type,
+                payload
+            FROM position_state_transitions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_position_state_transitions_for_audit(self, audit_log_id: int) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                audit_log_id,
+                created_at,
+                symbol,
+                from_state,
+                to_state,
+                event_type,
+                payload
+            FROM position_state_transitions
+            WHERE audit_log_id = ?
+            ORDER BY id ASC
+            """,
+            (audit_log_id,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
             item["payload"] = self._safe_json_loads(item.get("payload"), default={})
             rows.append(item)
         return rows
@@ -784,17 +1120,13 @@ class StateStore:
     def _decode_metrics_row(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
-        item = dict(row)
-        try:
-            item["metrics"] = json.loads(item["metrics"]) if item.get("metrics") else {}
-        except Exception:
-            item["metrics"] = {}
-        return item
+        return self._format_memory_row(dict(row))
 
     def get_risk_state(
         self,
         current_balance: float,
         cooldown_minutes: int,
+        drawdown_activate_pct: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         now = now or self._utcnow()
@@ -803,6 +1135,9 @@ class StateStore:
         daily_pnl_pct = 0.0
         if daily_start_balance > 0:
             daily_pnl_pct = ((current_balance - daily_start_balance) / daily_start_balance) * 100
+        drawdown_active = False
+        if drawdown_activate_pct is not None:
+            drawdown_active = daily_pnl_pct <= -abs(float(drawdown_activate_pct))
 
         recent_losses = self._get_recent_consecutive_losses()
         cooldown_until = self._get_last_loss_timestamp()
@@ -820,10 +1155,123 @@ class StateStore:
         return {
             "daily_start_balance": daily_start_balance,
             "daily_pnl_pct": daily_pnl_pct,
+            "drawdown_active": drawdown_active,
+            "drawdown_activate_pct": drawdown_activate_pct,
             "consecutive_losses": recent_losses,
             "cooldown_active": cooldown_active,
             "cooldown_remaining_minutes": cooldown_remaining_minutes,
         }
+
+    def get_symbol_trigger_state(self, symbol: str) -> Dict[str, Any]:
+        cursor = self.conn.execute(
+            """
+            SELECT payload
+            FROM trigger_state
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        return self._safe_json_loads(row["payload"], default={})
+
+    def save_symbol_trigger_state(self, symbol: str, state: Dict[str, Any]):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO trigger_state (symbol, updated_at, payload)
+                    VALUES (?, CURRENT_TIMESTAMP, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP,
+                        payload = excluded.payload
+                    """,
+                    (
+                        symbol,
+                        json.dumps(state or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save trigger state for {symbol}: {e}")
+
+    def get_cached_decision(self, prompt_hash: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                prompt_hash,
+                model_name,
+                input_hash,
+                raw_response,
+                intent,
+                created_at,
+                last_used_at,
+                hit_count
+            FROM decision_cache
+            WHERE prompt_hash = ?
+            """,
+            (prompt_hash,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE decision_cache
+                SET
+                    last_used_at = CURRENT_TIMESTAMP,
+                    hit_count = hit_count + 1
+                WHERE prompt_hash = ?
+                """,
+                (prompt_hash,),
+            )
+
+        item = dict(row)
+        item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+        item["hit_count"] = int(item.get("hit_count") or 0) + 1
+        return item
+
+    def save_cached_decision(
+        self,
+        prompt_hash: str,
+        model_name: str,
+        input_hash: str,
+        raw_response: str,
+        intent: Dict[str, Any],
+    ):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO decision_cache (
+                        prompt_hash,
+                        model_name,
+                        input_hash,
+                        raw_response,
+                        intent,
+                        created_at,
+                        last_used_at,
+                        hit_count
+                    ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)
+                    ON CONFLICT(prompt_hash) DO UPDATE SET
+                        model_name = excluded.model_name,
+                        input_hash = excluded.input_hash,
+                        raw_response = excluded.raw_response,
+                        intent = excluded.intent,
+                        last_used_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        prompt_hash,
+                        model_name,
+                        input_hash,
+                        raw_response,
+                        json.dumps(intent),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save cached decision for {prompt_hash}: {e}")
 
     def _get_daily_start_balance(self, day_start: datetime) -> Optional[float]:
         cursor = self.conn.execute(
@@ -889,14 +1337,37 @@ class StateStore:
         defaults = {
             "account_state": {},
             "market_state": {},
+            "market_vectors": {},
             "intent": {},
             "receipts": [],
+            "risk_profile": {},
             "decision_request": {},
             "execution_summary": {},
         }
         for key, default in defaults.items():
             decoded[key] = self._safe_json_loads(decoded.get(key), default=default)
         return decoded
+
+    def _format_memory_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        metrics = self._safe_json_loads(item.get("metrics"), default={})
+        apply_when = metrics.get("apply_when") or {
+            "regime": [metrics.get("regime")] if metrics.get("regime") else [],
+            "volatility": [],
+            "trend": [],
+        }
+        ignore_when = metrics.get("ignore_when") or [
+            "No explicit ignore condition stored; treat as low-priority guidance."
+        ]
+        item["metrics"] = metrics
+        item["category"] = metrics.get("category", "lesson")
+        item["status"] = metrics.get("status", "rule")
+        item["support"] = int(metrics.get("support") or 0)
+        item["regime"] = metrics.get("regime", "general")
+        item["apply_when"] = apply_when
+        item["ignore_when"] = ignore_when
+        item["evidence_journal_ids"] = metrics.get("evidence_journal_ids") or []
+        return item
 
     def _safe_json_loads(self, value: Any, default: Any):
         if value in (None, ""):
