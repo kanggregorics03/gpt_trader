@@ -4,7 +4,7 @@ import time
 import yaml
 from pathlib import Path
 from core.risk_engine import RiskEngine
-from core.models import DerivativesSnapshot, MarketSnapshot, TradeIntent, AccountState, PositionState, OrderIntent
+from core.models import DerivativesSnapshot, EvidenceItem, MarketSnapshot, RationaleItem, TradeIntent, AccountState, PositionState, OrderIntent
 
 class TestRiskEngine(unittest.TestCase):
     def setUp(self):
@@ -388,6 +388,131 @@ class TestRiskEngine(unittest.TestCase):
 
         self.assertFalse(approved)
         self.assertIn("cannot open more than", reason.lower())
+
+    def test_structured_evidence_quality_can_tighten_entry_size_cap(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.03)],
+            rationale=["Momentum setup"],
+            rationale_items=[
+                RationaleItem(
+                    summary="Single weak signal",
+                    why_it_matters="Momentum may continue.",
+                    trade_implication="Consider a cautious long.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="rsi_14",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=62.0,
+                            threshold=60.0,
+                            units="index",
+                            source="market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                        )
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.8,
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("candidate size", reason.lower())
+        self.assertIn("evidence_quality", reason.lower())
+
+    def test_strong_structured_evidence_does_not_reduce_size_cap(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.03)],
+            rationale=["Momentum setup"],
+            rationale_items=[
+                RationaleItem(
+                    summary="Momentum and volume align",
+                    why_it_matters="Multiple confirmed signals support continuation.",
+                    trade_implication="Allow a standard-sized long.",
+                    failure_mode="Breakout fails back into range.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="rsi_14",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=62.0,
+                            threshold=60.0,
+                            units="index",
+                            source="market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                        ),
+                        EvidenceItem(
+                            signal="volume_ratio",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=2.1,
+                            threshold=1.8,
+                            units="ratio",
+                            source="market_snapshots.BTCUSDT.timeframes.15m.volume_ratio",
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.8,
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(reason, "Approved")
+
+    def test_effective_entry_size_cap_summary_exposes_adjustment(self):
+        weak_intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.01)],
+            rationale=["Weak setup"],
+            rationale_items=[
+                RationaleItem(
+                    summary="Single signal",
+                    why_it_matters="One signal is present.",
+                    trade_implication="Entry is possible but low quality.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="rsi_14",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=61.0,
+                            threshold=60.0,
+                            units="index",
+                            source="market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                        )
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.6,
+        )
+
+        summary = self.engine.get_effective_max_order_notional_pct_balance(
+            intent=weak_intent,
+            active_profile=self.engine.get_active_risk_profile(),
+        )
+
+        self.assertTrue(summary["adjusted"])
+        self.assertLess(summary["effective_cap_pct"], summary["base_cap_pct"])
+        self.assertIn("low_signal_diversity", summary["evidence_quality"]["issues"])
 
 if __name__ == '__main__':
     unittest.main()

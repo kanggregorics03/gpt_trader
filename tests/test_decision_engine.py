@@ -32,7 +32,6 @@ class TestDecisionEngine(unittest.TestCase):
                 consecutive_losses=1,
                 cooldown_active=False,
             ),
-            recent_journal_summaries=[],
             long_term_memory=[],
         )
         changed_request = base_request.model_copy(
@@ -85,7 +84,6 @@ class TestDecisionEngine(unittest.TestCase):
                     consecutive_losses=1,
                     cooldown_active=False,
                 ),
-                recent_journal_summaries=[],
                 long_term_memory=[],
             )
 
@@ -148,7 +146,6 @@ class TestDecisionEngine(unittest.TestCase):
                 consecutive_losses=0,
                 cooldown_active=False,
             ),
-            recent_journal_summaries=[],
             long_term_memory=[],
         )
         changed_request = base_request.model_copy(
@@ -164,6 +161,59 @@ class TestDecisionEngine(unittest.TestCase):
                         recent_volume_surge=True,
                     ),
                 }
+            }
+        )
+
+        base_hash = engine._build_candidate_input_hash(base_request)
+        changed_hash = engine._build_candidate_input_hash(changed_request)
+
+        self.assertNotEqual(base_hash, changed_hash)
+
+    def test_recent_journal_context_is_included_in_candidate_hash(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        base_request = DecisionRequest(
+            policy_summary="risk: normal",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=900.0,
+            ),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            recent_journal_context=[
+                {
+                    "journal_id": 1,
+                    "decision": "HOLD",
+                    "rationale": ["Waiting"],
+                    "risk_reason": "Safe action.",
+                    "summary": "HOLD: Waiting",
+                }
+            ],
+            long_term_memory=[],
+        )
+        changed_request = base_request.model_copy(
+            update={
+                "recent_journal_context": [
+                    {
+                        "journal_id": 2,
+                        "decision": "BUY",
+                        "rationale": ["Momentum"],
+                        "risk_reason": "Approved",
+                        "summary": "BUY: Momentum",
+                    }
+                ]
             }
         )
 

@@ -44,8 +44,10 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS journal (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    audit_log_id INTEGER,
                     decision TEXT,
                     rationale TEXT,
+                    rationale_json JSON,
                     confidence REAL,
                     risk_reason TEXT,
                     estimated_pnl_pct REAL,
@@ -108,6 +110,9 @@ class StateStore:
                     confidence_delta REAL DEFAULT 0,
                     rationale_keywords_added JSON,
                     rationale_keywords_removed JSON,
+                    evidence_signals_added JSON,
+                    evidence_signals_removed JSON,
+                    evidence_signal_count_delta INTEGER DEFAULT 0,
                     payload JSON
                 );
 
@@ -160,6 +165,8 @@ class StateStore:
         self._ensure_column("audit_logs", "ai_raw_response", "TEXT")
         self._ensure_column("audit_logs", "execution_summary", "JSON")
         self._ensure_column("audit_logs", "market_vectors", "JSON")
+        self._ensure_column("journal", "audit_log_id", "INTEGER")
+        self._ensure_column("journal", "rationale_json", "JSON")
         self._ensure_column("journal", "risk_reason", "TEXT")
         self._ensure_column("journal", "estimated_pnl_pct", "REAL")
         self._ensure_column("journal", "loss_signal", "BOOLEAN DEFAULT 0")
@@ -167,6 +174,9 @@ class StateStore:
         self._ensure_column("replay_runs", "size_delta", "REAL DEFAULT 0")
         self._ensure_column("replay_runs", "rationale_keywords_added", "JSON")
         self._ensure_column("replay_runs", "rationale_keywords_removed", "JSON")
+        self._ensure_column("replay_runs", "evidence_signals_added", "JSON")
+        self._ensure_column("replay_runs", "evidence_signals_removed", "JSON")
+        self._ensure_column("replay_runs", "evidence_signal_count_delta", "INTEGER DEFAULT 0")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str):
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
@@ -242,6 +252,8 @@ class StateStore:
         decision: str,
         rationale: List[str],
         confidence: float,
+        audit_log_id: Optional[int] = None,
+        rationale_items: Optional[List[Dict[str, Any]]] = None,
         risk_reason: str = "",
         estimated_pnl_pct: Optional[float] = None,
         loss_signal: bool = False,
@@ -251,17 +263,21 @@ class StateStore:
                 self.conn.execute(
                     """
                     INSERT INTO journal (
+                        audit_log_id,
                         decision,
                         rationale,
+                        rationale_json,
                         confidence,
                         risk_reason,
                         estimated_pnl_pct,
                         loss_signal
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        audit_log_id,
                         decision,
                         "\\n".join(rationale),
+                        json.dumps(rationale_items) if rationale_items is not None else None,
                         confidence,
                         risk_reason,
                         estimated_pnl_pct,
@@ -273,12 +289,51 @@ class StateStore:
 
     def get_recent_journals(self, limit: int = 10) -> List[str]:
         try:
-            cursor = self.conn.execute("SELECT decision, rationale FROM journal ORDER BY id DESC LIMIT ?", (limit,))
-            rows = cursor.fetchall()
-            return [f"{row['decision']}: {row['rationale']}" for row in rows]
+            return [
+                self._format_journal_summary(item)
+                for item in self.get_recent_journal_context(limit=limit)
+            ]
         except Exception as e:
             logger.error(f"Failed to fetch journals: {e}")
             return []
+
+    def get_recent_journal_context(self, limit: int = 10) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                j.id,
+                j.timestamp,
+                j.audit_log_id,
+                j.decision,
+                j.rationale,
+                j.rationale_json,
+                j.confidence,
+                j.risk_reason,
+                j.estimated_pnl_pct,
+                j.loss_signal,
+                COALESCE(ledger.net_realized_pnl, 0) AS ledger_net_realized_pnl,
+                COALESCE(ledger.fee_cost, 0) AS ledger_fee_cost,
+                a.risk_approved,
+                a.risk_mode,
+                a.market_state,
+                a.execution_summary
+            FROM journal j
+            LEFT JOIN (
+                SELECT
+                    audit_log_id,
+                    COALESCE(SUM(net_realized_pnl), 0) AS net_realized_pnl,
+                    COALESCE(SUM(fee_cost), 0) AS fee_cost
+                FROM position_ledger
+                GROUP BY audit_log_id
+            ) ledger ON ledger.audit_log_id = j.audit_log_id
+            LEFT JOIN audit_logs a ON a.id = j.audit_log_id
+            ORDER BY j.id DESC
+            LIMIT ?
+        """
+        rows = []
+        cursor = self.conn.execute(query, (limit,))
+        for row in cursor.fetchall():
+            rows.append(self._decode_journal_context_row(dict(row)))
+        return rows
 
     def get_long_term_memory(self) -> List[Dict[str, Any]]:
         try:
@@ -321,17 +376,34 @@ class StateStore:
     ) -> List[Dict[str, Any]]:
         query = """
             SELECT
-                id,
-                timestamp,
-                decision,
-                rationale,
-                confidence,
-                risk_reason,
-                estimated_pnl_pct,
-                loss_signal
-            FROM journal
-            WHERE timestamp >= ?
-            ORDER BY id ASC
+                j.id,
+                j.timestamp,
+                j.audit_log_id,
+                j.decision,
+                j.rationale,
+                j.rationale_json,
+                j.confidence,
+                j.risk_reason,
+                j.estimated_pnl_pct,
+                j.loss_signal,
+                COALESCE(ledger.net_realized_pnl, 0) AS ledger_net_realized_pnl,
+                COALESCE(ledger.fee_cost, 0) AS ledger_fee_cost,
+                a.risk_approved,
+                a.risk_mode,
+                a.market_state,
+                a.execution_summary
+            FROM journal j
+            LEFT JOIN (
+                SELECT
+                    audit_log_id,
+                    COALESCE(SUM(net_realized_pnl), 0) AS net_realized_pnl,
+                    COALESCE(SUM(fee_cost), 0) AS fee_cost
+                FROM position_ledger
+                GROUP BY audit_log_id
+            ) ledger ON ledger.audit_log_id = j.audit_log_id
+            LEFT JOIN audit_logs a ON a.id = j.audit_log_id
+            WHERE j.timestamp >= ?
+            ORDER BY j.id ASC
         """
         params: List[Any] = [since.strftime("%Y-%m-%d %H:%M:%S")]
         if limit is not None:
@@ -339,7 +411,10 @@ class StateStore:
             params.append(limit)
 
         cursor = self.conn.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            rows.append(self._decode_journal_context_row(dict(row)))
+        return rows
 
     def save_long_term_memory_entries(self, entries: List[Dict[str, Any]]):
         if not entries:
@@ -468,8 +543,11 @@ class StateStore:
                         confidence_delta,
                         rationale_keywords_added,
                         rationale_keywords_removed,
+                        evidence_signals_added,
+                        evidence_signals_removed,
+                        evidence_signal_count_delta,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         audit_log_id,
@@ -482,6 +560,9 @@ class StateStore:
                         float(comparison.get("confidence_delta") or 0.0),
                         json.dumps(comparison.get("rationale_keywords_added") or []),
                         json.dumps(comparison.get("rationale_keywords_removed") or []),
+                        json.dumps(comparison.get("evidence_signals_added") or []),
+                        json.dumps(comparison.get("evidence_signals_removed") or []),
+                        int(comparison.get("evidence_signal_count_delta") or 0),
                         json.dumps(payload),
                     ),
                 )
@@ -614,6 +695,8 @@ class StateStore:
             LIMIT 1
             """
         ).fetchone()
+        recent_logs = self.get_recent_audits(limit=20)
+        semantic_validation_summary = self._build_semantic_validation_summary(now=now)
 
         snapshot = {
             "total_audits_24h": int(stats.get("total_audits") or 0),
@@ -626,7 +709,8 @@ class StateStore:
             "ledger_net_pnl_24h": self.get_position_ledger_stats(hours=24, now=now)["net_realized_pnl"],
             "latest_audit": dict(latest_audit_row) if latest_audit_row else None,
             "latest_memory": self._decode_metrics_row(latest_memory_row),
-            "recent_logs": self.get_recent_audits(limit=20),
+            "recent_logs": recent_logs,
+            "semantic_validation_summary": semantic_validation_summary,
             "recent_memory": self.get_recent_long_term_memory(limit=5),
             "recent_fills": self.get_recent_fills(limit=10),
             "recent_ledger": self.get_recent_position_ledger(limit=10),
@@ -636,25 +720,101 @@ class StateStore:
         }
         return snapshot
 
-    def get_recent_audits(self, limit: int = 20) -> List[Dict[str, Any]]:
-        cursor = self.conn.execute(
-            """
-            SELECT
-                id,
-                timestamp,
-                intent,
-                risk_approved,
-                risk_reason,
-                decision_input_hash,
-                risk_mode,
-                execution_summary,
-                market_vectors
-            FROM audit_logs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
+    def _build_semantic_validation_summary(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        now = now or self._utcnow()
+        last_24h_logs = self.get_recent_audits(limit=500, since=now - timedelta(hours=24))
+        last_7d_logs = self.get_recent_audits(limit=5000, since=now - timedelta(days=7))
+        latest_50_logs = self.get_recent_audits(limit=50)
+        return {
+            "last_24h": self._summarize_semantic_validation_issues(last_24h_logs),
+            "last_7d": self._summarize_semantic_validation_issues(last_7d_logs),
+            "latest_50": self._summarize_semantic_validation_issues(latest_50_logs),
+        }
+
+    def _summarize_semantic_validation_issues(self, recent_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        issue_counts: Dict[str, int] = {}
+        model_failure_counts: Dict[str, int] = {}
+        model_total_counts: Dict[str, int] = {}
+        validation_failures = 0
+        for row in recent_logs:
+            execution_summary = row.get("execution_summary") or {}
+            ai_usage = execution_summary.get("ai_usage") or {}
+            model_name = str(ai_usage.get("model_name") or "unknown").strip() or "unknown"
+            if ai_usage:
+                model_total_counts[model_name] = model_total_counts.get(model_name, 0) + 1
+            if not ai_usage.get("semantic_validation_error"):
+                continue
+            validation_failures += 1
+            model_failure_counts[model_name] = model_failure_counts.get(model_name, 0) + 1
+            for issue in ai_usage.get("issues") or []:
+                key = str(issue).strip()
+                if not key:
+                    continue
+                issue_counts[key] = issue_counts.get(key, 0) + 1
+        top_issues = [
+            {"issue": issue, "count": count}
+            for issue, count in sorted(issue_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+        ]
+        top_models = []
+        for model_name, failure_count in sorted(model_failure_counts.items(), key=lambda item: (-item[1], item[0]))[:5]:
+            total_count = model_total_counts.get(model_name, failure_count)
+            failure_rate = (failure_count / total_count) if total_count > 0 else 0.0
+            top_models.append(
+                {
+                    "model_name": model_name,
+                    "count": failure_count,
+                    "total_calls": total_count,
+                    "failure_rate": round(failure_rate, 4),
+                }
+            )
+        return {
+            "total_calls": sum(model_total_counts.values()),
+            "failure_count": validation_failures,
+            "top_issues": top_issues,
+            "top_models": top_models,
+        }
+
+    def get_recent_audits(self, limit: int = 20, since: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        if since is not None:
+            since_value = since.strftime("%Y-%m-%d %H:%M:%S")
+            cursor = self.conn.execute(
+                """
+                SELECT
+                    id,
+                    timestamp,
+                    intent,
+                    risk_approved,
+                    risk_reason,
+                    decision_input_hash,
+                    risk_mode,
+                    execution_summary,
+                    market_vectors
+                FROM audit_logs
+                WHERE timestamp >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (since_value, limit),
+            )
+        else:
+            cursor = self.conn.execute(
+                """
+                SELECT
+                    id,
+                    timestamp,
+                    intent,
+                    risk_approved,
+                    risk_reason,
+                    decision_input_hash,
+                    risk_mode,
+                    execution_summary,
+                    market_vectors
+                FROM audit_logs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
         rows = []
         for row in cursor.fetchall():
             item = dict(row)
@@ -956,6 +1116,9 @@ class StateStore:
                 confidence_delta,
                 rationale_keywords_added,
                 rationale_keywords_removed,
+                evidence_signals_added,
+                evidence_signals_removed,
+                evidence_signal_count_delta,
                 payload
             FROM replay_runs
             ORDER BY id DESC
@@ -972,6 +1135,14 @@ class StateStore:
             )
             item["rationale_keywords_removed"] = self._safe_json_loads(
                 item.get("rationale_keywords_removed"),
+                default=[],
+            )
+            item["evidence_signals_added"] = self._safe_json_loads(
+                item.get("evidence_signals_added"),
+                default=[],
+            )
+            item["evidence_signals_removed"] = self._safe_json_loads(
+                item.get("evidence_signals_removed"),
                 default=[],
             )
             item["payload"] = self._safe_json_loads(item.get("payload"), default={})
@@ -994,6 +1165,9 @@ class StateStore:
                 confidence_delta,
                 rationale_keywords_added,
                 rationale_keywords_removed,
+                evidence_signals_added,
+                evidence_signals_removed,
+                evidence_signal_count_delta,
                 payload
             FROM replay_runs
             WHERE audit_log_id = ?
@@ -1011,6 +1185,14 @@ class StateStore:
             )
             item["rationale_keywords_removed"] = self._safe_json_loads(
                 item.get("rationale_keywords_removed"),
+                default=[],
+            )
+            item["evidence_signals_added"] = self._safe_json_loads(
+                item.get("evidence_signals_added"),
+                default=[],
+            )
+            item["evidence_signals_removed"] = self._safe_json_loads(
+                item.get("evidence_signals_removed"),
                 default=[],
             )
             item["payload"] = self._safe_json_loads(item.get("payload"), default={})
@@ -1367,6 +1549,88 @@ class StateStore:
         item["apply_when"] = apply_when
         item["ignore_when"] = ignore_when
         item["evidence_journal_ids"] = metrics.get("evidence_journal_ids") or []
+        return item
+
+    def _format_journal_summary(self, row: Dict[str, Any]) -> str:
+        decision = row.get("decision") or "UNKNOWN"
+        rationale_value = row.get("rationale") or []
+        if isinstance(rationale_value, list):
+            rationale_text = " | ".join(str(item) for item in rationale_value if item)
+        else:
+            rationale_text = str(rationale_value).strip()
+        rationale_json = row.get("rationale_json") or row.get("rationale_items") or []
+        risk_reason = (row.get("risk_reason") or "").strip()
+        estimated_pnl_pct = row.get("estimated_pnl_pct")
+        ledger_net_realized_pnl = row.get("ledger_net_realized_pnl")
+        ledger_fee_cost = row.get("ledger_fee_cost")
+        risk_mode = row.get("risk_mode")
+        risk_approved = row.get("risk_approved")
+        trigger_symbols = row.get("trigger_symbols") or []
+        risk_trigger_symbols = row.get("risk_trigger_symbols") or []
+        evidence_quality = row.get("evidence_quality") or {}
+        entry_size_cap = row.get("entry_size_cap") or {}
+        evidence_parts = []
+        for item in rationale_json[:2]:
+            evidence = (item or {}).get("evidence") or []
+            if not evidence:
+                continue
+            first = evidence[0]
+            signal = first.get("signal") or "signal"
+            timeframe = first.get("timeframe") or "context"
+            observed = first.get("observed_value")
+            operator = first.get("operator") or "note"
+            threshold = first.get("threshold")
+            if threshold is None:
+                evidence_parts.append(f"{signal}@{timeframe}={observed}")
+            else:
+                evidence_parts.append(f"{signal}@{timeframe}={observed} {operator} {threshold}")
+
+        parts = [f"{decision}:"]
+        if rationale_text:
+            parts.append(rationale_text.replace("\n", " | "))
+        if evidence_parts:
+            parts.append(f"evidence={' ; '.join(evidence_parts)}")
+        if risk_reason:
+            parts.append(f"risk={risk_reason}")
+        if risk_mode:
+            parts.append(f"mode={risk_mode}")
+        if risk_approved is not None:
+            parts.append(f"approved={bool(risk_approved)}")
+        if estimated_pnl_pct is not None:
+            parts.append(f"pnl={float(estimated_pnl_pct):.2f}%")
+        if ledger_net_realized_pnl is not None:
+            parts.append(f"ledger_net={float(ledger_net_realized_pnl):.4f}")
+        if ledger_fee_cost is not None:
+            parts.append(f"fees={float(ledger_fee_cost):.4f}")
+        if evidence_quality:
+            parts.append(f"eq={float(evidence_quality.get('factor') or 0.0):.2f}")
+        if entry_size_cap:
+            parts.append(
+                "cap="
+                f"{float(entry_size_cap.get('base_cap_pct') or 0.0):.1f}"
+                "->"
+                f"{float(entry_size_cap.get('effective_cap_pct') or 0.0):.1f}"
+            )
+        if trigger_symbols:
+            parts.append(f"trigger={','.join(trigger_symbols)}")
+        if risk_trigger_symbols:
+            parts.append(f"risk_trigger={','.join(risk_trigger_symbols)}")
+        return " ".join(parts)
+
+    def _decode_journal_context_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        item["rationale_json"] = self._safe_json_loads(item.get("rationale_json"), default=[])
+        item["market_state"] = self._safe_json_loads(item.get("market_state"), default={})
+        item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+        rationale_text = item.get("rationale") or ""
+        item["rationale"] = [line for line in str(rationale_text).split("\n") if line]
+        item["rationale_items"] = item["rationale_json"]
+        item["journal_id"] = int(item.get("id") or 0)
+        item["trigger_symbols"] = (item["market_state"].get("trigger_symbols") or [])
+        item["risk_trigger_symbols"] = (item["market_state"].get("risk_trigger_symbols") or [])
+        item["evidence_quality"] = item["execution_summary"].get("evidence_quality") or {}
+        item["entry_size_cap"] = item["execution_summary"].get("entry_size_cap") or {}
+        item["summary"] = self._format_journal_summary(item)
         return item
 
     def _safe_json_loads(self, value: Any, default: Any):

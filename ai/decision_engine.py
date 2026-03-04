@@ -9,6 +9,7 @@ from google.genai import types
 from loguru import logger
 from pydantic import ValidationError
 
+from core.intent_validator import StructuredIntentValidator
 from core.models import DecisionRequest, LongTermMemoryRecord, TradeIntent
 
 @dataclass
@@ -35,6 +36,7 @@ class DecisionEngine:
             trigger_model=trigger_model,
         )
         self.cache_store = cache_store
+        self.intent_validator = StructuredIntentValidator()
 
     def _resolve_models(
         self,
@@ -67,6 +69,15 @@ class DecisionEngine:
         if request.market_snapshot is not None:
             return request.market_snapshot.model_dump(mode="json")
         return {}
+
+    def _build_recent_journal_context_payload(self, request: DecisionRequest):
+        payload = []
+        for item in request.recent_journal_context:
+            if hasattr(item, "model_dump"):
+                payload.append(item.model_dump(mode="json"))
+            else:
+                payload.append(dict(item))
+        return payload
         
     def _create_prompt(self, request: DecisionRequest) -> str:
         memory_payload = [
@@ -92,8 +103,8 @@ risk_mode:
 {request.risk_mode}
 risk_profile:
 {self._compact_json(request.risk_profile)}
-recent_journal_summaries:
-{self._compact_json(request.recent_journal_summaries)}
+recent_journal_context:
+{self._compact_json(self._build_recent_journal_context_payload(request))}
 long_term_memory:
 {self._compact_json(memory_payload)}
 similar_past_cases:
@@ -109,10 +120,25 @@ RULES
 5. Review existing open orders and avoid duplicate or conflicting orders for the same symbol.
 6. If liquidation risk, cooldown pressure, drawdown pressure, wide spread, or unfavorable funding is elevated, prefer REDUCE or EXIT over new exposure.
 7. In trigger mode, prioritize risk reduction. Avoid new positions unless uniquely supported by long_term_memory.
-8. Consider idempotency and avoid repeating a failed request from recent_journal_summaries.
+8. Consider idempotency and avoid repeating a failed request from recent_journal_context.
 9. Put identified risks in risk_notes.
 10. All text fields must be English.
 11. When market_context contains multiple symbols, compare them and only place orders on the strongest justified symbols.
+12. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
+13. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
+14. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14 or risk_state.cooldown_remaining_minutes.
+15. If operator is not note, threshold is required. If operator is note, threshold must be null.
+16. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+
+OUTPUT EXAMPLE
+{{
+  "decision":"BUY",
+  "orders":[{{"symbol":"BTCUSDT","action":"BUY","order_type":"MARKET","quantity":0.01,"price":null,"reduce_only":false,"take_profit":31200.0,"stop_loss":29850.0}}],
+  "rationale":["BTC 15m momentum and volume confirm continuation above the hourly range."],
+  "rationale_items":[{{"summary":"BTC momentum confirmation on 15m breakout","why_it_matters":"Momentum and participation are aligned with continuation risk/reward.","trade_implication":"Allows one small long entry with defined exit levels.","failure_mode":"Invalidate if the breakout loses volume or falls back inside the 1h range.","evidence":[{{"signal":"volume_ratio","symbol":"BTCUSDT","timeframe":"15m","operator":"gte","observed_value":2.4,"threshold":1.8,"units":"ratio","source":"market_snapshots.BTCUSDT.timeframes.15m.volume_ratio","confidence_contribution":0.3}},{{"signal":"last_close","symbol":"BTCUSDT","timeframe":"1h","operator":"cross_up","observed_value":30120.0,"threshold":30000.0,"units":"usdt","source":"market_snapshots.BTCUSDT.timeframes.1h.last_close","confidence_contribution":0.2}}]}}],
+  "risk_notes":["Wide spread or negative follow-through would invalidate the setup."],
+  "confidence":0.62
+}}
 """
         return prompt
 
@@ -124,6 +150,7 @@ RULES
             "risk_state": request.risk_state.model_dump(mode="json"),
             "risk_mode": request.risk_mode,
             "risk_profile": request.risk_profile,
+            "recent_journal_context": self._build_recent_journal_context_payload(request),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -189,6 +216,32 @@ RULES
             )
             raw_text = response.text
             intent = TradeIntent.model_validate_json(raw_text)
+            validation_result = self.intent_validator.validate(request, intent)
+            if not validation_result.is_valid:
+                logger.warning(
+                    "Gemini structured rationale validation failed: {}",
+                    ", ".join(validation_result.issues),
+                )
+                return DecisionResult(
+                    intent=TradeIntent(
+                        decision="HOLD",
+                        orders=[],
+                        rationale=["Fallback due to invalid structured rationale from AI."],
+                        rationale_items=[],
+                        risk_notes=["Structured rationale validation failed."],
+                        confidence=0.0,
+                    ),
+                    prompt=prompt,
+                    raw_response=raw_text,
+                    model_name=model_to_use,
+                    input_hash=input_hash,
+                    cache_hit=False,
+                    usage_metadata={
+                        "semantic_validation_error": True,
+                        "model_name": model_to_use,
+                        "issues": validation_result.issues,
+                    },
+                )
             usage_metadata = self._extract_usage_metadata(response)
             if self.cache_store is not None:
                 self.cache_store.save_cached_decision(

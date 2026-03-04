@@ -134,7 +134,9 @@ market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 
 
 risk_state: 일일 손익률, 연속 손실, 쿨다운, 드로우다운 상태
 
-recent_journal_summaries: 최근 10~20건 요약
+recent_journal_context: 같은 최근 일지 정보를 구조화 객체로 전달
+
+문자열 파싱 대신 rationale_items, evidence_quality, entry_size_cap, trigger 정보를 직접 참조할 수 있게 함
 
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
 
@@ -153,6 +155,24 @@ decision: HOLD/BUY/SELL/REDUCE/EXIT
 orders[]: 주문 후보(가격/수량/TP/SL/reduce_only 포함)
 
 rationale[]: 근거(짧게)
+
+rationale_items[]: 구조화 근거
+
+각 rationale_item은 summary, why_it_matters, trade_implication, failure_mode, evidence[]를 포함
+
+각 evidence는 signal, timeframe, operator, observed_value, threshold, units, source를 포함
+
+timeframe snapshot에는 previous_values를 둘 수 있고, cross_up/cross_down 검증 시 source별 직전값으로 사용한다
+
+source는 DecisionRequest 안의 실제 경로여야 하고, 관측값과 맞지 않으면 보수적으로 HOLD fallback
+
+operator도 의미 검증한다. gte/lt/cross_up/delta_abs_gte 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 HOLD fallback
+
+신규 진입에서는 trade_implication이 실제 행동 방향과 맞지 않거나, 근거 품질에 비해 confidence가 과하면 보수적으로 HOLD fallback
+
+신규 진입에서는 구조화 근거의 품질도 리스크 판단에 반영한다
+
+예: signal 다양성 부족, 주문 심볼 근거 누락, failure_mode 부재 시 max_order_notional cap을 추가로 축소
 
 risk_notes[]: 위험 요인
 
@@ -250,11 +270,45 @@ Gemini 요청/응답 원문
 
 오늘의 교훈 후보(배치 업데이트에 반영)
 
+텍스트 rationale은 사람용으로 유지하되, 구조화 근거는 journal.rationale_json에도 저장
+
+audit에도 같은 구조화 근거를 원본 그대로 남겨 당시 판단 근거를 재현 가능하게 유지
+
+daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 market regime를 함께 읽어 장기 규칙을 만든다
+
+또한 evidence signal 반복에서 heuristic candidate lesson을 먼저 만들고, LLM은 이를 정제/병합하는 역할로 사용한다
+
 9.3 리플레이(강력 권장)
 
 과거 스냅샷으로 “그때 의사결정 재현(모의)”
 
 중복 주문/폭주/부분체결 꼬임 같은 운영 문제를 가장 빨리 잡는 장치
+
+리플레이 비교에는 rationale 키워드뿐 아니라 rationale_items.evidence signal 추가/삭제도 포함해, 어떤 근거 변화가 decision 변화로 이어졌는지 추적한다
+
+운영 대시보드는 최근 replay의 evidence diff와 최근 memory의 heuristic candidate lesson seed를 함께 노출한다
+
+audit detail에서는 raw JSON뿐 아니라 rationale_items 요약과 evidence quality / entry size cap 요약도 카드 형태로 노출한다
+
+source 경로는 클릭해서 저장된 DecisionRequest 내 실제 값을 바로 조회할 수 있게 한다
+
+동시에 Stored Request JSON에서도 해당 값 위치를 강조 표시한다
+
+latest replay가 있으면 같은 source에 대한 original observed_value와 replay observed_value 차이도 함께 보여준다
+
+이 replay source diff는 표 형태로 요약해 source / original / replayed / delta를 한 줄씩 비교할 수 있게 한다
+
+대시보드 상단에는 최근 audit 기준 semantic validation fallback 횟수와 최다 실패 유형도 함께 노출한다
+
+source lookup에는 current value뿐 아니라 previous value와 original/replay threshold도 함께 보여준다
+
+semantic validation fallback은 24h / 7d / latest 50 calls 기준으로 나눠 본다
+
+같은 카드에서 모델별 fallback rate도 함께 보여준다
+
+daily memory batch는 evidence signal 반복뿐 아니라 evidence_quality.factor 버킷과 entry_size_cap 조정 패턴도 집계해, 낮은 근거 품질이 실제 손실과 묶이는지까지 heuristic candidate lesson에 반영한다
+
+memory batch 모델은 실시간 의사결정 모델과 분리할 수 있고, `GEMINI_MEMORY_MODEL`이 지정되면 장기 교훈 추출에 그 모델을 우선 사용한다
 
 10) 정책 파일(policy.yaml) 운영
 
@@ -284,7 +338,149 @@ Gemini API 비용은 호출 횟수보다 **입력/출력 토큰(추론 토큰 �
 
 출력은 “짧은 JSON”으로 제한
 
-13) 단계별 로드맵
+13) 유지보수 상세
+
+이 시스템의 유지보수는 단순 재시작이 아니라, 정책/모델/데이터/실행/메모리의 다섯 축을 계속 점검하는 작업이다
+
+일간 체크리스트:
+
+대시보드에서 ledger net pnl, Symbol Report, Semantic Fallbacks를 먼저 본다
+
+24h / 7d / latest 50 calls 기준 semantic fallback이 급증했는지 본다
+
+최근 audit 5~10개의 risk_reason, evidence_quality, entry_size_cap이 비정상적으로 치우치지 않았는지 본다
+
+Bybit 실제 포지션/미체결과 audit의 positions, open_orders, receipts가 맞는지 샘플 확인한다
+
+timeout_unresolved, failed, market fetch warning이 반복되는지 로그를 본다
+
+주간 체크리스트:
+
+최근 손실 audit 10~20개를 replay로 다시 비교한다
+
+evidence_signals_added/removed, source diff, previous value / threshold를 함께 본다
+
+long_term_memory의 recent rule과 candidate_lessons를 읽고 과잉 일반화 여부를 확인한다
+
+심볼별 net pnl을 보고 손실 심볼 유지 여부를 결정한다
+
+정책 변경은 한 번에 하나만 조정하고, 변경 후에는 demo 또는 축소 size로 다시 본다
+
+월간 체크리스트:
+
+policy.yaml의 손실 한도, size cap, max positions, trigger threshold를 재검토한다
+
+default / trigger / memory 모델 분리가 여전히 적절한지 본다
+
+SQLite 파일 크기와 audit_logs / position_ledger / replay_runs 증가량을 점검한다
+
+오래된 memory rule pruning과 audit archive 정책이 필요한지 검토한다
+
+모델 품질 점검:
+
+대시보드의 Semantic Fallbacks를 먼저 본다
+
+24h / 7d / latest 50 calls 기준으로 fallback이 늘면 최근 모델 변경, 프롬프트 변경, journal 문맥 변화가 있었는지 확인한다
+
+특정 모델의 failure rate가 높으면 default / trigger / memory 모델 분리를 다시 조정한다
+
+fallback issue가 operator_condition_failed인지 trade_implication_action_mismatch인지 구분해 원인을 좁힌다
+
+정책 파일 유지:
+
+policy.yaml은 운영 중 가장 자주 손대는 파일이다
+
+daily_max_loss_pct, max_consecutive_losses, mode_profiles의 size cap, max_open_positions, max_leverage는 시장 레짐 변화 시 재조정 대상이다
+
+정책 변경 후에는 바로 live 전환하지 말고 demo 관찰 → replay 비교 → journal 확인 순서로 검증한다
+
+데이터 품질 점검:
+
+market snapshot의 timeframes, order_book, derivatives, previous_values가 비정상적으로 비지 않았는지 본다
+
+WebSocket 장애 시 REST fallback으로 운영은 되지만 지연과 호출 수가 올라갈 수 있다
+
+로그에서 market fetch 실패, open-order fetch fallback, semantic fallback 급증이 반복되면 데이터 품질 이슈로 본다
+
+계좌/실행 동기화 점검:
+
+audit의 receipts, order_state_transitions, position_state_transitions, Bybit 실제 상태가 일치하는지 본다
+
+timeout_unresolved가 늘어나면 size 확대나 live 운영 확대를 멈추는 게 맞다
+
+장기 메모리 유지:
+
+long_term_memory는 많이 쌓는 것보다 나쁜 교훈을 오래 유지하지 않는 것이 중요하다
+
+candidate_lessons, winning/losing evidence_signals, evidence_quality_patterns를 같이 본다
+
+특정 regime에서만 맞는 룰을 전체 룰처럼 일반화하지 않도록 검토한다
+
+DB / 로그 유지:
+
+SQLite 파일 크기 증가 속도, audit_logs / position_ledger / replay_runs 증가량, 로그 rotation을 주기적으로 본다
+
+운영이 길어지면 최근 30~90일은 hot storage, 그 이전은 archive하는 정책을 두는 것이 좋다
+
+14) 수익률이 안 나올 때 해볼 것
+
+수익률 부진은 보통 실행 품질, 과다 진입, 과도한 보수화, 특정 심볼 문제, 시장 레짐 변화 중 하나로 나뉜다
+
+진입은 맞는데 실행이 나쁜 경우:
+
+wide_spread / elevated_funding이 잦은 시간대를 줄인다
+
+max_order_notional_pct_balance를 낮춰 슬리피지 영향을 줄인다
+
+유동성 낮은 심볼을 제외한다
+
+진입 자체가 과다한 경우:
+
+trigger threshold를 보수화한다
+
+trigger mode의 size cap과 max_open_positions를 더 낮춘다
+
+low evidence quality에서는 HOLD가 더 자주 나오도록 validator / risk 정책을 강화한다
+
+최근 journal에서 반복 손실 signal과 anti-pattern 반영 여부를 확인한다
+
+손실은 적은데 수익도 안 나는 경우:
+
+REDUCE / EXIT journal을 따로 모아 너무 빨리 수익 포지션을 잘라내는지 본다
+
+장기 메모리가 지나치게 보수적인 교훈만 강화하는지 점검한다
+
+trigger mode의 신규 진입 억제가 과한지 본다
+
+특정 심볼만 문제인 경우:
+
+Symbol Report로 심볼별 net pnl을 본다
+
+손실 심볼을 잠시 제외하고 관찰한다
+
+해당 심볼의 spread_bps, funding_rate, open_interest 변동이 다른 심볼보다 거친지 확인한다
+
+시장 레짐이 바뀐 경우:
+
+예전 성공 audit와 최근 실패 audit를 replay로 비교한다
+
+trend_alignment, volatility_regime, risk_trigger_reasons 차이를 본다
+
+오래된 long-term memory rule을 약화하거나 pruning 한다
+
+수익률 부진 시 권장 순서:
+
+대시보드에서 ledger net pnl, Symbol Report, Semantic Fallbacks를 먼저 본다
+
+손실 audit 10~20개를 replay로 비교한다
+
+journal의 반복 손실 signal과 evidence quality 패턴을 확인한다
+
+정책 변경은 한 번에 하나씩만 한다
+
+변경 후에는 demo 또는 축소 size로 다시 관찰한다
+
+15) 단계별 로드맵
 Phase 1: MVP(안전한 자동매매 최소셋)
 
 BTCUSDT/ETHUSDT 1~2개 심볼
@@ -319,7 +515,7 @@ Phase 4: 운영 최적화
 
 대시보드(거절률/슬리피지/오류율/성과) 추가
 
-14) MVP 권장 초기 기본값
+16) MVP 권장 초기 기본값
 
 심볼: BTCUSDT, ETHUSDT
 

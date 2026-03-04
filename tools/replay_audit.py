@@ -49,6 +49,40 @@ def extract_total_size(intent: Dict[str, Any]) -> float:
     return round(total, 8)
 
 
+def extract_evidence_signals(intent: Dict[str, Any]) -> List[str]:
+    signals: Set[str] = set()
+    for item in intent.get("rationale_items") or []:
+        for evidence in (item or {}).get("evidence") or []:
+            signal = evidence.get("signal") or "signal"
+            timeframe = evidence.get("timeframe") or "context"
+            symbol = evidence.get("symbol")
+            if symbol:
+                signals.add(f"{symbol}:{signal}@{timeframe}")
+            else:
+                signals.add(f"{signal}@{timeframe}")
+    return sorted(signals)
+
+
+def extract_evidence_by_source(intent: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in intent.get("rationale_items") or []:
+        for evidence in (item or {}).get("evidence") or []:
+            source = str(evidence.get("source") or "").strip()
+            if not source:
+                continue
+            grouped.setdefault(source, []).append(
+                {
+                    "signal": evidence.get("signal"),
+                    "symbol": evidence.get("symbol"),
+                    "timeframe": evidence.get("timeframe"),
+                    "observed_value": evidence.get("observed_value"),
+                    "threshold": evidence.get("threshold"),
+                    "operator": evidence.get("operator"),
+                }
+            )
+    return grouped
+
+
 def compare_intents(original: Dict[str, Any], replayed: Dict[str, Any]) -> Dict[str, Any]:
     original_sides = extract_order_sides(original)
     replayed_sides = extract_order_sides(replayed)
@@ -56,6 +90,23 @@ def compare_intents(original: Dict[str, Any], replayed: Dict[str, Any]) -> Dict[
     replayed_size = extract_total_size(replayed)
     original_keywords = extract_rationale_keywords(original.get("rationale") or [])
     replayed_keywords = extract_rationale_keywords(replayed.get("rationale") or [])
+    original_evidence_signals = extract_evidence_signals(original)
+    replayed_evidence_signals = extract_evidence_signals(replayed)
+    original_evidence_by_source = extract_evidence_by_source(original)
+    replayed_evidence_by_source = extract_evidence_by_source(replayed)
+    evidence_source_diffs = []
+    for source in sorted(set(original_evidence_by_source) | set(replayed_evidence_by_source)):
+        original_rows = original_evidence_by_source.get(source, [])
+        replayed_rows = replayed_evidence_by_source.get(source, [])
+        if original_rows == replayed_rows:
+            continue
+        evidence_source_diffs.append(
+            {
+                "source": source,
+                "original": original_rows,
+                "replayed": replayed_rows,
+            }
+        )
     return {
         "decision_changed": original.get("decision") != replayed.get("decision"),
         "order_count_changed": len(original.get("orders", [])) != len(replayed.get("orders", [])),
@@ -73,6 +124,12 @@ def compare_intents(original: Dict[str, Any], replayed: Dict[str, Any]) -> Dict[
         "replayed_total_size": replayed_size,
         "rationale_keywords_added": sorted(set(replayed_keywords) - set(original_keywords)),
         "rationale_keywords_removed": sorted(set(original_keywords) - set(replayed_keywords)),
+        "original_evidence_signal_count": len(original_evidence_signals),
+        "replayed_evidence_signal_count": len(replayed_evidence_signals),
+        "evidence_signal_count_delta": len(replayed_evidence_signals) - len(original_evidence_signals),
+        "evidence_signals_added": sorted(set(replayed_evidence_signals) - set(original_evidence_signals)),
+        "evidence_signals_removed": sorted(set(original_evidence_signals) - set(replayed_evidence_signals)),
+        "evidence_source_diffs": evidence_source_diffs,
     }
 
 

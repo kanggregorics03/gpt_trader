@@ -50,7 +50,7 @@ HTML_TEMPLATE = """
         }
         .action-button { background: var(--accent); }
         .grid {
-            display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px;
+            display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px;
         }
         .card, .panel {
             background: var(--panel); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 22px; box-shadow: 0 16px 40px rgba(58, 39, 23, 0.08);
@@ -87,6 +87,21 @@ HTML_TEMPLATE = """
         }
         .detail-box pre {
             margin: 0; font-size: 12px; line-height: 1.55; overflow: auto; white-space: pre-wrap; word-break: break-word;
+        }
+        mark.path-highlight {
+            background: rgba(182, 73, 38, 0.2);
+            color: var(--ink);
+            padding: 2px 0;
+            border-radius: 4px;
+        }
+        .source-link {
+            border: 0;
+            background: rgba(182, 73, 38, 0.1);
+            color: var(--accent);
+            border-radius: 999px;
+            padding: 3px 8px;
+            cursor: pointer;
+            font-size: 11px;
         }
         .detail-actions { display: flex; gap: 10px; margin-bottom: 14px; }
         @media (max-width: 1080px) {
@@ -129,6 +144,12 @@ HTML_TEMPLATE = """
                 <p class="eyebrow">Unresolved Timeouts</p>
                 <p class="value" id="val-timeouts">-</p>
                 <p class="sub">Timed out orders that were not recovered.</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Semantic Fallbacks</p>
+                <p class="value" id="val-semantic-fallbacks">-</p>
+                <p class="sub" id="val-semantic-top-issue">Top issue: -</p>
+                <p class="sub" id="val-semantic-models">Models: -</p>
             </article>
             <article class="card">
                 <p class="eyebrow">Fees 24h</p>
@@ -201,6 +222,17 @@ HTML_TEMPLATE = """
 
     <script>
         let selectedAuditId = null;
+        let currentRequestPayload = {};
+        let selectedSourcePath = '';
+        let currentAuditDetail = null;
+
+        function renderModelRouting(models) {
+            const value = models || {};
+            const defaultModel = value.default_model || 'unset';
+            const triggerModel = value.trigger_model || defaultModel;
+            const memoryModel = value.memory_model || triggerModel || defaultModel;
+            return `default ${defaultModel} | trigger ${triggerModel} | memory ${memoryModel}`;
+        }
 
         function parseJson(raw, fallback = {}) {
             if (raw && typeof raw === 'object') return raw;
@@ -211,15 +243,302 @@ HTML_TEMPLATE = """
             return JSON.stringify(value, null, 2);
         }
 
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function summarizeCandidateLessons(metrics) {
+            const lessons = (metrics && metrics.candidate_lessons) || [];
+            if (!lessons.length) return 'no heuristic candidates';
+            return lessons.slice(0, 2).map(item => {
+                const support = item.support_count || 0;
+                const seed = item.seed_signal || 'signal';
+                return `${seed} (${support})`;
+            }).join(' | ');
+        }
+
+        function summarizeEvidenceDiff(run) {
+            const added = (run.evidence_signals_added || []).slice(0, 2).join(', ') || 'none';
+            const removed = (run.evidence_signals_removed || []).slice(0, 2).join(', ') || 'none';
+            const delta = run.evidence_signal_count_delta || 0;
+            return `evidence Δ ${delta} • + ${added} • - ${removed}`;
+        }
+
+        function renderRationaleItems(intent) {
+            const items = (intent && intent.rationale_items) || [];
+            if (!items.length) {
+                return '<p class="sub">No structured rationale stored.</p>';
+            }
+            return items.map(item => {
+                const evidence = (item.evidence || []).map(ev => {
+                    const symbol = ev.symbol ? `${ev.symbol} ` : '';
+                    const threshold = ev.threshold === null || ev.threshold === undefined ? '' : ` ${ev.operator} ${ev.threshold}`;
+                    return `
+                        <div class="fill-meta">
+                            ${symbol}${ev.signal}@${ev.timeframe}: ${ev.observed_value}${threshold}
+                            <button class="source-link" data-source="${escapeHtml(ev.source || '')}">${escapeHtml(ev.source || 'source')}</button>
+                        </div>
+                    `;
+                }).join('');
+                return `
+                    <div class="memory-item">
+                        <strong>${item.summary || 'Structured rationale'}</strong>
+                        <div class="memory-meta">${item.why_it_matters || ''}</div>
+                        <div class="memory-meta">${item.trade_implication || ''}</div>
+                        <div class="memory-meta">failure mode: ${item.failure_mode || 'n/a'}</div>
+                        ${evidence}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderEvidenceQuality(executionSummary) {
+            const evidenceQuality = executionSummary.evidence_quality || {};
+            const entrySizeCap = executionSummary.entry_size_cap || {};
+            if (!Object.keys(evidenceQuality).length && !Object.keys(entrySizeCap).length) {
+                return '<p class="sub">No evidence quality summary stored.</p>';
+            }
+            return `
+                <div class="memory-item">
+                    <strong>Evidence quality factor ${evidenceQuality.factor ?? 'n/a'}</strong>
+                    <div class="memory-meta">
+                        signals ${evidenceQuality.unique_signal_count ?? 0} • evidence rows ${evidenceQuality.evidence_count ?? 0}
+                        • covered symbols ${(evidenceQuality.covered_symbols || []).join(', ') || 'none'}
+                    </div>
+                    <div class="memory-meta">
+                        issues ${(evidenceQuality.issues || []).join(', ') || 'none'}
+                    </div>
+                    <div class="memory-meta">
+                        entry cap ${(entrySizeCap.base_cap_pct ?? 0)}% -> ${(entrySizeCap.effective_cap_pct ?? 0)}%
+                        • adjusted ${entrySizeCap.adjusted ? 'yes' : 'no'}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderReplaySourceDiffs(detail) {
+            const latestRun = (detail && detail.replay_runs || [])[0];
+            if (!latestRun) {
+                return '<p class="sub">No replay run stored yet.</p>';
+            }
+            const payload = parseJson(latestRun.payload, {});
+            const diffs = (((payload || {}).comparison || {}).evidence_source_diffs) || [];
+            if (!diffs.length) {
+                return '<p class="sub">No source-level evidence diff detected.</p>';
+            }
+            return `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Source</th>
+                            <th>Original</th>
+                            <th>Replayed</th>
+                            <th>Delta</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${diffs.map(diff => {
+                            const originalValue = summarizeEvidenceObservedValue(diff.original || []);
+                            const replayedValue = summarizeEvidenceObservedValue(diff.replayed || []);
+                            return `
+                                <tr>
+                                    <td>${escapeHtml(diff.source || 'source')}</td>
+                                    <td>${escapeHtml(originalValue.label)}</td>
+                                    <td>${escapeHtml(replayedValue.label)}</td>
+                                    <td>${escapeHtml(computeObservedDeltaLabel(originalValue.numeric, replayedValue.numeric))}</td>
+                                </tr>
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function summarizeEvidenceObservedValue(rows) {
+            const values = (rows || []).map(row => row && row.observed_value).filter(value => value !== undefined && value !== null);
+            if (!values.length) {
+                return { label: 'n/a', numeric: null };
+            }
+            if (values.length === 1) {
+                return { label: String(values[0]), numeric: parseNumericValue(values[0]) };
+            }
+            const label = values.map(value => String(value)).join(', ');
+            return { label: label, numeric: null };
+        }
+
+        function parseNumericValue(value) {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric : null;
+        }
+
+        function computeObservedDeltaLabel(originalValue, replayedValue) {
+            if (originalValue === null || replayedValue === null) {
+                return 'n/a';
+            }
+            const delta = replayedValue - originalValue;
+            return delta > 0 ? `+${delta.toFixed(4)}` : delta.toFixed(4);
+        }
+
+        function getPreviousValuePath(path) {
+            if (!path || !path.includes('.')) return '';
+            const parts = path.split('.');
+            const metric = parts.pop();
+            return `${parts.join('.')}.previous_values.${metric}`;
+        }
+
+        function collectThresholdValues(intent, path) {
+            const values = [];
+            for (const item of ((intent && intent.rationale_items) || [])) {
+                for (const evidence of ((item && item.evidence) || [])) {
+                    if ((evidence && evidence.source) !== path) continue;
+                    if (evidence.threshold === null || evidence.threshold === undefined) continue;
+                    values.push(evidence.threshold);
+                }
+            }
+            return values;
+        }
+
+        function resolvePath(payload, path) {
+            if (!path) return undefined;
+            return path.split('.').reduce((current, part) => {
+                if (current === undefined || current === null) return undefined;
+                if (Array.isArray(current)) {
+                    const index = Number(part);
+                    return Number.isInteger(index) ? current[index] : undefined;
+                }
+                return current[part];
+            }, payload);
+        }
+
+        function updateSourceLookup(path) {
+            const root = document.getElementById('source-lookup');
+            if (!root) return;
+            selectedSourcePath = path || '';
+            const requestPre = document.getElementById('stored-request-json');
+            if (requestPre) {
+                requestPre.innerHTML = highlightRequestPayload(currentRequestPayload, selectedSourcePath);
+            }
+            if (!path) {
+                root.innerHTML = '<p class="sub">Click a source path in Structured Rationale to inspect the stored request value.</p>';
+                return;
+            }
+            const resolved = resolvePath(currentRequestPayload, path);
+            const previousPath = getPreviousValuePath(path);
+            const previousResolved = previousPath ? resolvePath(currentRequestPayload, previousPath) : undefined;
+            const auditResolved = resolveAuditMarketPath(currentAuditDetail, path);
+            const auditPreviousResolved = previousPath ? resolveAuditMarketPath(currentAuditDetail, previousPath) : undefined;
+            const originalObserved = collectObservedValues((currentAuditDetail && currentAuditDetail.intent) || {}, path);
+            const originalThresholds = collectThresholdValues((currentAuditDetail && currentAuditDetail.intent) || {}, path);
+            const replayObserved = collectLatestReplayObservedValues(currentAuditDetail, path);
+            const latestReplay = (((currentAuditDetail && currentAuditDetail.replay_runs) || [])[0] || {});
+            const replayPayload = parseJson(latestReplay.payload, {});
+            const replayThresholds = collectThresholdValues((replayPayload && replayPayload.replayed_intent) || {}, path);
+            root.innerHTML = `
+                <div class="memory-item">
+                    <strong>${escapeHtml(path)}</strong>
+                    <div class="memory-meta">resolved from stored DecisionRequest</div>
+                    <pre>${escapeHtml(pretty(resolved === undefined ? '(missing)' : resolved))}</pre>
+                    <div class="memory-meta">previous value from stored DecisionRequest</div>
+                    <pre>${escapeHtml(pretty(previousResolved === undefined ? '(missing)' : previousResolved))}</pre>
+                    <div class="memory-meta">resolved from stored audit market payload</div>
+                    <pre>${escapeHtml(pretty(auditResolved === undefined ? '(missing)' : auditResolved))}</pre>
+                    <div class="memory-meta">previous value from stored audit market payload</div>
+                    <pre>${escapeHtml(pretty(auditPreviousResolved === undefined ? '(missing)' : auditPreviousResolved))}</pre>
+                    <div class="memory-meta">original intent evidence observed_value</div>
+                    <pre>${escapeHtml(pretty(originalObserved.length ? originalObserved : '(missing)'))}</pre>
+                    <div class="memory-meta">original intent evidence threshold</div>
+                    <pre>${escapeHtml(pretty(originalThresholds.length ? originalThresholds : '(missing)'))}</pre>
+                    <div class="memory-meta">latest replay evidence observed_value</div>
+                    <pre>${escapeHtml(pretty(replayObserved.length ? replayObserved : '(missing)'))}</pre>
+                    <div class="memory-meta">latest replay evidence threshold</div>
+                    <pre>${escapeHtml(pretty(replayThresholds.length ? replayThresholds : '(missing)'))}</pre>
+                </div>
+            `;
+        }
+
+        function resolveAuditMarketPath(detail, path) {
+            if (!detail || !path) return undefined;
+            const marketState = parseJson(detail.market_state, {});
+            if (path.startsWith('market_snapshots.')) {
+                return resolvePath(marketState, path);
+            }
+            if (path.startsWith('market_snapshot.')) {
+                const marketSnapshot = (marketState.market_snapshots && Object.values(marketState.market_snapshots)[0]) || marketState.market_snapshot;
+                const suffix = path.slice('market_snapshot.'.length);
+                return resolvePath(marketSnapshot || {}, suffix);
+            }
+            return undefined;
+        }
+
+        function collectObservedValues(intent, path) {
+            const values = [];
+            for (const item of (intent && intent.rationale_items) || []) {
+                for (const evidence of (item.evidence || [])) {
+                    if ((evidence.source || '') === path) {
+                        values.push({
+                            signal: evidence.signal || 'signal',
+                            observed_value: evidence.observed_value,
+                            threshold: evidence.threshold,
+                            operator: evidence.operator,
+                        });
+                    }
+                }
+            }
+            return values;
+        }
+
+        function collectLatestReplayObservedValues(detail, path) {
+            if (!detail) return [];
+            const latestRun = (detail.replay_runs || [])[0];
+            if (!latestRun) return [];
+            const payload = parseJson(latestRun.payload, {});
+            return collectObservedValues(payload.replayed_intent || {}, path);
+        }
+
+        function highlightRequestPayload(payload, path) {
+            const raw = pretty(payload);
+            const escapedRaw = escapeHtml(raw);
+            if (!path) {
+                return escapedRaw;
+            }
+            const resolved = resolvePath(payload, path);
+            if (resolved === undefined) {
+                return escapedRaw;
+            }
+            const snippet = escapeHtml(pretty(resolved));
+            const highlighted = `<mark class="path-highlight">${snippet}</mark>`;
+            const index = escapedRaw.indexOf(snippet);
+            if (index < 0) {
+                return escapedRaw;
+            }
+            return escapedRaw.slice(0, index) + highlighted + escapedRaw.slice(index + snippet.length);
+        }
+
+        function bindSourceLinks() {
+            document.querySelectorAll('.source-link').forEach(button => {
+                button.addEventListener('click', () => {
+                    updateSourceLookup(button.dataset.source || '');
+                });
+            });
+        }
+
         function renderDetail(detail) {
+            currentAuditDetail = detail;
             const executionSummary = parseJson(detail.execution_summary, {});
             const requestPayload = parseJson(detail.decision_request, {});
+            currentRequestPayload = requestPayload;
             const fills = detail.fills || [];
             const replayRuns = detail.replay_runs || [];
             const ledgerEntries = detail.ledger_entries || [];
             const riskProfile = parseJson(detail.risk_profile, {});
             const orderStateTransitions = detail.order_state_transitions || [];
             const positionStateTransitions = detail.position_state_transitions || [];
+            const storedIntent = detail.intent || {};
             document.getElementById('audit-detail').innerHTML = `
                 <div class="detail-grid">
                     <div class="detail-box">
@@ -232,11 +551,15 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="detail-box">
                         <p class="eyebrow">Stored Request</p>
-                        <pre>${pretty(requestPayload)}</pre>
+                        <pre id="stored-request-json">${highlightRequestPayload(requestPayload, selectedSourcePath)}</pre>
                     </div>
                     <div class="detail-box">
-                        <p class="eyebrow">Stored Intent</p>
-                        <pre>${pretty(detail.intent || {})}</pre>
+                        <p class="eyebrow">Structured Rationale</p>
+                        ${renderRationaleItems(storedIntent)}
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Evidence Quality</p>
+                        ${renderEvidenceQuality(executionSummary)}
                     </div>
                     <div class="detail-box">
                         <p class="eyebrow">Execution Summary</p>
@@ -245,6 +568,20 @@ HTML_TEMPLATE = """
                     <div class="detail-box">
                         <p class="eyebrow">AI Raw Response</p>
                         <pre>${detail.ai_raw_response || '(empty)'}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Stored Intent</p>
+                        <pre>${pretty(storedIntent)}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Source Lookup</p>
+                        <div id="source-lookup">
+                            <p class="sub">Click a source path in Structured Rationale to inspect the stored request value.</p>
+                        </div>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Replay Source Diff</p>
+                        ${renderReplaySourceDiffs(detail)}
                     </div>
                     <div class="detail-box" style="grid-column: 1 / -1;">
                         <p class="eyebrow">Ledger Entries</p>
@@ -268,6 +605,8 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             `;
+            bindSourceLinks();
+            updateSourceLookup('');
         }
 
         function loadAuditDetail(auditId) {
@@ -327,12 +666,38 @@ HTML_TEMPLATE = """
                 document.getElementById('val-audits').innerText = data.total_audits_24h;
                 document.getElementById('val-errors').innerText = data.loop_errors_24h || 0;
                 document.getElementById('val-timeouts').innerText = data.timeouts_unresolved_24h || 0;
+                const semanticSummary = data.semantic_validation_summary || {};
+                const semantic24h = semanticSummary.last_24h || {};
+                const semantic7d = semanticSummary.last_7d || {};
+                const semanticLatest50 = semanticSummary.latest_50 || {};
+                document.getElementById('val-semantic-fallbacks').innerText =
+                    `${semantic24h.failure_count || 0} / ${semantic7d.failure_count || 0} / ${semanticLatest50.failure_count || 0}`;
                 document.getElementById('val-fees').innerText = Number(data.fee_cost_24h || 0).toFixed(4);
                 document.getElementById('val-ledger-pnl').innerText = Number(data.ledger_net_pnl_24h || 0).toFixed(4);
                 const rejectRate = data.total_audits_24h > 0
                     ? ((data.rejected_24h / data.total_audits_24h) * 100).toFixed(1) + '%'
                     : '0%';
                 document.getElementById('val-rejections').innerText = rejectRate;
+                const topSemanticIssue = ((semantic24h.top_issues || [])[0] || {});
+                document.getElementById('val-semantic-top-issue').innerText =
+                    `Issues 24h/7d/50: ${topSemanticIssue.issue || '-'}${topSemanticIssue.count ? ` (${topSemanticIssue.count})` : ''}`;
+                const topSemanticModels = (semantic24h.top_models || [])
+                    .map(item => {
+                        const rate24 = Number(item.failure_rate || 0) * 100;
+                        const model7d = (semantic7d.top_models || []).find(model => model.model_name === item.model_name) || {};
+                        const model50 = (semanticLatest50.top_models || []).find(model => model.model_name === item.model_name) || {};
+                        const rate7 = Number(model7d.failure_rate || 0) * 100;
+                        const rate50 = Number(model50.failure_rate || 0) * 100;
+                        return `${item.model_name} (24h ${rate24.toFixed(1)}%, 7d ${rate7.toFixed(1)}%, 50 ${rate50.toFixed(1)}%)`;
+                    })
+                    .join(' | ');
+                document.getElementById('val-semantic-models').innerText =
+                    `Models: ${topSemanticModels || '-'}`;
+                const headerDescription = document.querySelector('.header p');
+                if (headerDescription) {
+                    headerDescription.innerText =
+                        `Operational health, replay controls, cost drag, symbol reports, and full audit drill-down for execution review. Models: ${renderModelRouting(data.models)}`;
+                }
 
                 const tbody = document.getElementById('audit-table-body');
                 tbody.innerHTML = '';
@@ -371,6 +736,7 @@ HTML_TEMPLATE = """
                             <strong>${item.rule}</strong>
                             <div class="memory-meta">
                                 support ${metrics.support || 0} • regime ${metrics.regime || 'general'} • apply ${((applyWhen.trend || []).join('/') || 'n/a')} • ignore ${ignoreWhen[0] || 'n/a'}
+                                <br>candidates ${summarizeCandidateLessons(metrics)}
                             </div>
                         </div>
                     `;
@@ -399,6 +765,7 @@ HTML_TEMPLATE = """
                         <strong>audit ${run.audit_log_id}: ${run.original_decision || 'UNKNOWN'} -> ${run.replayed_decision || 'UNKNOWN'}</strong>
                         <div class="fill-meta">
                             changed ${run.decision_changed ? 'yes' : 'no'} • side ${run.side_changed ? 'changed' : 'same'} • size ${run.size_delta || 0} • confidence ${run.confidence_delta || 0}
+                            <br>${summarizeEvidenceDiff(run)}
                         </div>
                     </div>
                 `);
@@ -438,6 +805,19 @@ def api_stats():
         snapshot = state_store.get_monitoring_snapshot()
         snapshot["symbol_report"] = state_store.get_symbol_performance_report(hours=24)
         snapshot["daily_report"] = state_store.get_daily_ledger_report(days=7)
+        default_model = (os.getenv("GEMINI_DEFAULT_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip())
+        trigger_model = (os.getenv("GEMINI_TRIGGER_MODEL", "").strip() or default_model)
+        memory_model = (
+            os.getenv("GEMINI_MEMORY_MODEL", "").strip()
+            or trigger_model
+            or default_model
+            or "gemini-3.0-pro"
+        )
+        snapshot["models"] = {
+            "default_model": default_model,
+            "trigger_model": trigger_model,
+            "memory_model": memory_model,
+        }
         return jsonify(snapshot)
     except Exception as e:
         return jsonify({"error": str(e)}), 500

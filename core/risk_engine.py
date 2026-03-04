@@ -82,6 +82,69 @@ class RiskEngine:
             profiles["normal"],
         )
 
+    def get_evidence_quality_summary(self, intent: TradeIntent) -> Dict[str, object]:
+        evidence_items = []
+        unique_signals = set()
+        covered_symbols = set()
+        failure_mode_count = 0
+        for item in intent.rationale_items:
+            if item.failure_mode:
+                failure_mode_count += 1
+            for evidence in item.evidence:
+                evidence_items.append(evidence)
+                unique_signals.add((evidence.symbol or "", evidence.signal, evidence.timeframe))
+                if evidence.symbol:
+                    covered_symbols.add(evidence.symbol)
+
+        factor = 1.0
+        issues = []
+        if intent.rationale_items:
+            if len(unique_signals) < 2:
+                factor = min(factor, 0.7)
+                issues.append("low_signal_diversity")
+            if len(evidence_items) < max(1, len(intent.orders)):
+                factor = min(factor, 0.6)
+                issues.append("insufficient_evidence_rows")
+            if failure_mode_count < len(intent.rationale_items):
+                factor = min(factor, 0.85)
+                issues.append("missing_failure_mode")
+
+            entry_symbols = {
+                order.symbol
+                for order in intent.orders
+                if not order.reduce_only
+            }
+            uncovered_symbols = sorted(symbol for symbol in entry_symbols if symbol not in covered_symbols)
+            if uncovered_symbols:
+                factor = min(factor, 0.5)
+                issues.append(f"missing_symbol_evidence:{','.join(uncovered_symbols)}")
+        return {
+            "factor": factor,
+            "issues": issues,
+            "unique_signal_count": len(unique_signals),
+            "evidence_count": len(evidence_items),
+            "covered_symbols": sorted(covered_symbols),
+        }
+
+    def get_effective_max_order_notional_pct_balance(
+        self,
+        intent: TradeIntent,
+        active_profile: Optional[Dict] = None,
+    ) -> Dict[str, object]:
+        active_profile = active_profile or {}
+        base_cap_pct = float(active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0)
+        evidence_quality = self.get_evidence_quality_summary(intent)
+        factor = float(evidence_quality.get("factor") or 1.0)
+        effective_cap_pct = base_cap_pct
+        if intent.rationale_items:
+            effective_cap_pct *= factor
+        return {
+            "base_cap_pct": base_cap_pct,
+            "effective_cap_pct": effective_cap_pct,
+            "evidence_quality": evidence_quality,
+            "adjusted": bool(intent.rationale_items) and effective_cap_pct != base_cap_pct,
+        }
+
     def evaluate_intent(
         self,
         intent: TradeIntent,
@@ -226,6 +289,12 @@ class RiskEngine:
             active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0
         )
         if is_entry_decision and max_order_notional_pct_balance >= 0:
+            cap_summary = self.get_effective_max_order_notional_pct_balance(
+                intent=intent,
+                active_profile=active_profile,
+            )
+            evidence_quality = cap_summary["evidence_quality"]
+            adjusted_notional_pct_balance = float(cap_summary["effective_cap_pct"])
             candidate_notional = 0.0
             for order in intent.orders:
                 if order.reduce_only:
@@ -238,11 +307,15 @@ class RiskEngine:
                     )
                     reference_price = 0.0
                 candidate_notional += abs(order.quantity) * float(reference_price)
-            max_candidate_notional = account_state.total_balance * (max_order_notional_pct_balance / 100.0)
+            max_candidate_notional = account_state.total_balance * (adjusted_notional_pct_balance / 100.0)
             if candidate_notional > max_candidate_notional:
+                issue_suffix = ""
+                if intent.rationale_items and evidence_quality.get("issues"):
+                    issue_suffix = f" evidence_quality={','.join(evidence_quality['issues'])}."
                 return False, (
                     f"Risk profile {active_mode} limits candidate size to "
                     f"{max_candidate_notional:.2f}, got {candidate_notional:.2f}."
+                    f"{issue_suffix}"
                 )
 
         return True, "Approved"

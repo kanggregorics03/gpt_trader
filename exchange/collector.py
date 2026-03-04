@@ -20,6 +20,8 @@ class MarketCollector:
         self.public_feed = public_feed
         self._ohlcv_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._response_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._previous_order_books: Dict[str, OrderBookSnapshot] = {}
+        self._previous_derivatives: Dict[str, DerivativesSnapshot] = {}
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         if len(df) < period + 1:
@@ -229,6 +231,13 @@ class MarketCollector:
         volume_mean_20 = self._safe_float(df_closed["volume"].tail(20).mean())
         volume_last = self._safe_float(last["volume"])
         volume_ratio = volume_last / volume_mean_20 if volume_mean_20 > 0 else 0.0
+        previous_row = df_closed.iloc[-2] if len(df_closed) >= 2 else last
+        previous_rsi = self.calculate_rsi(df_closed.iloc[:-1], 14) if len(df_closed) >= 3 else rsi_14
+        previous_volume_mean_20 = self._safe_float(df_closed["volume"].iloc[:-1].tail(20).mean(), volume_mean_20)
+        previous_volume_last = self._safe_float(previous_row["volume"], volume_last)
+        previous_volume_ratio = (
+            previous_volume_last / previous_volume_mean_20 if previous_volume_mean_20 > 0 else volume_ratio
+        )
 
         prior_window = df_closed.iloc[:-1].tail(20) if len(df_closed) > 1 else df_closed.tail(20)
         range_window = df_closed.tail(20)
@@ -252,6 +261,15 @@ class MarketCollector:
         return TimeframeSnapshot(
             timeframe=timeframe,
             last_close=last_close,
+            previous_values={
+                "last_close": self._safe_float(previous_row["close"], last_close),
+                "rsi_14": previous_rsi,
+                "volume_ratio": previous_volume_ratio,
+                "close_vs_vwap_pct": self._pct_change(
+                    self._safe_float(previous_row["close"], last_close),
+                    rolling_vwap,
+                ),
+            },
             atr=atr,
             atr_pct=(atr / last_close) * 100 if last_close > 0 else 0.0,
             realized_volatility_pct=realized_volatility_pct,
@@ -315,7 +333,15 @@ class MarketCollector:
         if best_bid is not None and best_ask is not None and (bid_size + ask_size) > 0:
             microprice = ((best_ask * bid_size) + (best_bid * ask_size)) / (bid_size + ask_size)
 
-        return OrderBookSnapshot(
+        previous_snapshot = self._previous_order_books.get(symbol, OrderBookSnapshot())
+        snapshot = OrderBookSnapshot(
+            previous_values={
+                "best_bid": self._safe_float(previous_snapshot.best_bid, default=best_bid),
+                "best_ask": self._safe_float(previous_snapshot.best_ask, default=best_ask),
+                "spread_bps": self._safe_float(previous_snapshot.spread_bps, default=spread_bps),
+                "imbalance_top5": self._safe_float(previous_snapshot.imbalance_top5, default=imbalance_top5),
+                "microprice": self._safe_float(previous_snapshot.microprice, default=microprice),
+            },
             best_bid=best_bid,
             best_ask=best_ask,
             spread_bps=spread_bps,
@@ -327,6 +353,8 @@ class MarketCollector:
             imbalance_top5=imbalance_top5,
             microprice=microprice,
         )
+        self._previous_order_books[symbol] = snapshot
+        return snapshot
 
     def _call_optional_exchange_method(self, method_name: str, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         has_capability = getattr(self.exchange, "has", {}).get(method_name)
@@ -378,7 +406,17 @@ class MarketCollector:
         if mark_price not in (None, 0) and index_price not in (None, 0):
             basis_pct = ((mark_price - index_price) / index_price) * 100
 
-        return DerivativesSnapshot(
+        previous_snapshot = self._previous_derivatives.get(symbol, DerivativesSnapshot())
+        snapshot = DerivativesSnapshot(
+            previous_values={
+                "mark_price": self._safe_float(previous_snapshot.mark_price, default=mark_price),
+                "index_price": self._safe_float(previous_snapshot.index_price, default=index_price),
+                "basis_pct": self._safe_float(previous_snapshot.basis_pct, default=basis_pct),
+                "funding_rate": self._safe_float(previous_snapshot.funding_rate, default=None),
+                "next_funding_rate": self._safe_float(previous_snapshot.next_funding_rate, default=None),
+                "open_interest": self._safe_float(previous_snapshot.open_interest, default=None),
+                "open_interest_value": self._safe_float(previous_snapshot.open_interest_value, default=None),
+            },
             mark_price=mark_price,
             index_price=index_price,
             basis_pct=basis_pct,
@@ -402,6 +440,8 @@ class MarketCollector:
                 default=None,
             ),
         )
+        self._previous_derivatives[symbol] = snapshot
+        return snapshot
 
     def _build_regime_snapshot(
         self,

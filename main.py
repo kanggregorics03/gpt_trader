@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from ai.decision_engine import DecisionEngine, DecisionResult
 from ai.rag_engine import RagEngine
-from core.models import DecisionRequest, TradeIntent
+from core.models import DecisionRequest, EvidenceItem, RationaleItem, TradeIntent
 from core.risk_engine import RiskEngine
 from db.state_store import StateStore
 from exchange.account_reader import AccountReader
@@ -204,10 +204,6 @@ class TradingOrchestrator:
         if account_state.positions or account_state.open_orders:
             return None
 
-        allowed_actions = {str(action).upper() for action in risk_profile.get("allowed_actions", [])}
-        if "BUY" not in allowed_actions and "SELL" not in allowed_actions:
-            return f"risk_profile_{risk_mode}_blocks_entries"
-
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
         daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
@@ -228,7 +224,127 @@ class TradingOrchestrator:
         ):
             return "all_symbols_wide_spread"
 
+        allowed_actions = {str(action).upper() for action in risk_profile.get("allowed_actions", [])}
+        if "BUY" not in allowed_actions and "SELL" not in allowed_actions:
+            return f"risk_profile_{risk_mode}_blocks_entries"
+
         return None
+
+    def _build_skip_rationale_items(self, skip_reason: str, risk_state, market_snapshots, risk_profile):
+        if skip_reason == "cooldown_active":
+            remaining = float(risk_state.get("cooldown_remaining_minutes", 0) or 0.0)
+            return [
+                RationaleItem(
+                    summary="Cooldown blocks new entries.",
+                    why_it_matters="The strategy is in mandatory cooldown after recent losses.",
+                    trade_implication="Keep the portfolio flat until cooldown expires.",
+                    failure_mode="Cooldown expires and no other blocking risk state remains.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="cooldown_remaining_minutes",
+                            timeframe="risk",
+                            operator="gt",
+                            observed_value=remaining,
+                            threshold=0.0,
+                            units="minutes",
+                            source="risk_state.cooldown_remaining_minutes",
+                        )
+                    ],
+                )
+            ]
+        if skip_reason == "all_symbols_wide_spread":
+            first_symbol = next(iter(market_snapshots.keys()), None)
+            spread = 0.0
+            source = "market_snapshot.order_book.spread_bps"
+            if first_symbol and first_symbol in market_snapshots:
+                spread = float(market_snapshots[first_symbol].order_book.spread_bps or 0.0)
+                source = f"market_snapshots.{first_symbol}.order_book.spread_bps"
+            return [
+                RationaleItem(
+                    summary="Execution quality is too poor for new entries.",
+                    why_it_matters="Wide spreads materially increase slippage and degrade entry quality.",
+                    trade_implication="Do not open new positions while spreads stay elevated.",
+                    failure_mode="Spread compresses below the risk threshold.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="spread_bps",
+                            symbol=first_symbol,
+                            timeframe="microstructure",
+                            operator="gte",
+                            observed_value=spread,
+                            threshold=10.0,
+                            units="bps",
+                            source=source,
+                        )
+                    ],
+                )
+            ]
+        if skip_reason.startswith("risk_profile_"):
+            max_positions = float(risk_profile.get("max_open_positions", 0.0) or 0.0)
+            return [
+                RationaleItem(
+                    summary="Active risk profile disallows new entries.",
+                    why_it_matters="Current policy mode only permits defensive actions.",
+                    trade_implication="Return HOLD until the risk profile re-enables BUY or SELL.",
+                    failure_mode="Risk mode changes and entry actions are allowed again.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="max_open_positions",
+                            timeframe="risk",
+                            operator="note",
+                            observed_value=max_positions,
+                            threshold=None,
+                            units="count",
+                            source="risk_profile.max_open_positions",
+                        )
+                    ],
+                )
+            ]
+        if skip_reason == "daily_loss_kill_switch":
+            daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+            limit = float(self.risk_engine.policy.get("risk_limits", {}).get("daily_max_loss_pct", 0.0) or 0.0)
+            return [
+                RationaleItem(
+                    summary="Daily loss kill switch is active.",
+                    why_it_matters="Further entries would violate the daily drawdown control.",
+                    trade_implication="Stop initiating new risk for the rest of the daily window.",
+                    failure_mode="A new trading day resets the daily loss state.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="daily_pnl_pct",
+                            timeframe="risk",
+                            operator="lte",
+                            observed_value=daily_pnl_pct,
+                            threshold=-limit,
+                            units="pct",
+                            source="risk_state.daily_pnl_pct",
+                        )
+                    ],
+                )
+            ]
+        if skip_reason == "consecutive_loss_kill_switch":
+            losses = float(risk_state.get("consecutive_losses", 0) or 0.0)
+            limit = float(self.risk_engine.policy.get("risk_limits", {}).get("max_consecutive_losses", 0) or 0.0)
+            return [
+                RationaleItem(
+                    summary="Consecutive-loss kill switch is active.",
+                    why_it_matters="The recent loss streak signals degraded strategy conditions.",
+                    trade_implication="Pause new entries until the loss streak resets.",
+                    failure_mode="The loss streak resets under the configured policy rules.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="consecutive_losses",
+                            timeframe="risk",
+                            operator="gte",
+                            observed_value=losses,
+                            threshold=limit,
+                            units="count",
+                            source="risk_state.consecutive_losses",
+                        )
+                    ],
+                )
+            ]
+        return []
 
     def run_cycle(self, loop_type: str):
         log.info(f"--- Starting {loop_type} Cycle ---")
@@ -246,7 +362,7 @@ class TradingOrchestrator:
                 cooldown_minutes=cooldown_minutes,
                 drawdown_activate_pct=drawdown_activate_pct,
             )
-            recent_journals = self.state_store.get_recent_journals(limit=10)
+            recent_journal_context = self.state_store.get_recent_journal_context(limit=10)
             long_term_memory = self.state_store.get_long_term_memory()
             policy_summary = self.risk_engine.get_summary()
 
@@ -285,7 +401,7 @@ class TradingOrchestrator:
                 market_snapshot=next(iter(market_snapshots.values())) if len(market_snapshots) == 1 else None,
                 market_snapshots=market_snapshots,
                 risk_state=risk_state,
-                recent_journal_summaries=recent_journals,
+                recent_journal_context=recent_journal_context,
                 long_term_memory=long_term_memory,
                 similar_past_cases=similar_past_cases,
                 is_trigger_mode=is_trigger_mode,
@@ -304,11 +420,18 @@ class TradingOrchestrator:
             if skip_reason:
                 input_hash = self.ai_engine._build_candidate_input_hash(request)
                 log.info(f"Skipping AI decision call: {skip_reason}")
+                rationale_items = self._build_skip_rationale_items(
+                    skip_reason=skip_reason,
+                    risk_state=risk_state,
+                    market_snapshots=market_snapshots,
+                    risk_profile=risk_profile,
+                )
                 decision_result = DecisionResult(
                     intent=TradeIntent(
                         decision="HOLD",
                         orders=[],
                         rationale=[f"Deterministic HOLD: {skip_reason}."],
+                        rationale_items=rationale_items,
                         risk_notes=[skip_reason],
                         confidence=1.0,
                     ),
@@ -331,6 +454,11 @@ class TradingOrchestrator:
                 market_prices=market_prices,
                 risk_state=risk_state,
                 is_trigger_mode=is_trigger_mode,
+            )
+            evidence_quality_summary = self.risk_engine.get_evidence_quality_summary(intent)
+            entry_size_cap_summary = self.risk_engine.get_effective_max_order_notional_pct_balance(
+                intent=intent,
+                active_profile=risk_profile,
             )
 
             # 5. Execution
@@ -358,6 +486,8 @@ class TradingOrchestrator:
                 "risk_state": risk_state,
                 "decision_input_hash": decision_result.input_hash,
                 "ai_usage": decision_result.usage_metadata or {},
+                "evidence_quality": evidence_quality_summary,
+                "entry_size_cap": entry_size_cap_summary,
                 "executed_order_count": 0,
             }
             post_account_state = None
@@ -474,9 +604,11 @@ class TradingOrchestrator:
                 intent.decision,
                 intent.rationale,
                 intent.confidence,
+                audit_log_id=audit_id,
                 risk_reason=reason,
                 estimated_pnl_pct=estimated_pnl_pct,
                 loss_signal=loss_signal,
+                rationale_items=intent.rationale_items,
             )
                 
         except Exception as e:

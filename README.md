@@ -230,7 +230,9 @@ gpt_trader/
 - `account_state`
 - `market_snapshot` 또는 `market_snapshots`
 - `risk_state`
-- `recent_journal_summaries`
+- `recent_journal_context`
+  - 최근 journal 문맥을 구조화 객체로 전달
+  - `rationale_items`, `evidence_quality`, `entry_size_cap`, trigger 정보까지 포함
 - `long_term_memory`
 - `similar_past_cases`
 - `is_trigger_mode`
@@ -292,6 +294,11 @@ AI 출력은 `TradeIntent`다.
   - 각 주문 후보의 심볼, 액션, 주문 타입, 수량, 가격, `reduce_only`, TP, SL
 - `rationale`
   - 왜 그런 결정을 내렸는지에 대한 짧은 근거
+- `rationale_items`
+  - 기계 검증 가능한 구조화 근거
+  - 각 항목은 `summary`, `why_it_matters`, `trade_implication`, `failure_mode`, `evidence[]`를 가진다
+  - `evidence[]`는 `signal`, `timeframe`, `operator`, `observed_value`, `threshold`, `units`, `source`, `confidence_contribution`을 포함한다
+  - timeframe snapshot에는 `previous_values`가 포함될 수 있고, `cross_up/cross_down` 검증 시 source별 직전값으로 사용된다
 - `risk_notes`
   - 감지한 위험 요인
 - `confidence`
@@ -305,6 +312,10 @@ AI 출력은 `TradeIntent`다.
 - 영어 텍스트 강제
 - 트리거 모드에서는 신규 진입보다 리스크 축소 우선
 - `risk_trigger`가 있으면 스프레드와 펀딩 같은 거래 품질 악화를 별도 위험 신호로 해석
+- `rationale_items.evidence[].source`는 실제 `DecisionRequest` 경로를 가리켜야 하며, 관측값과 어긋나면 보수적으로 `HOLD` fallback
+- `operator`도 의미 검증한다. 즉 `gte`, `lt`, `cross_up`, `delta_abs_gte` 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 `HOLD` fallback
+- 신규 진입에서는 `trade_implication`이 실제 행동 방향과 맞지 않거나, 근거 품질 대비 confidence가 과하면 보수적으로 `HOLD` fallback
+- 신규 진입에서 `rationale_items`가 있으면 evidence 품질도 본다. 신호 다양성, symbol 커버리지, failure_mode 유무가 약하면 entry size cap을 더 낮춘다.
 
 ## 리스크 관리 상세
 
@@ -568,10 +579,23 @@ intervals:
 
 - 결정
 - rationale
+- rationale_json
 - confidence
 - risk reason
 - 추정 손익률
 - 손실 신호 여부
+
+`rationale` 텍스트는 사람용으로 유지한다.  
+동시에 `rationale_json`에는 구조화 근거를 그대로 저장해 리플레이, 메모리 생성, 사후 분석에서 재사용한다.
+
+최근 journal 요약을 AI에 다시 넣을 때는 텍스트 이유만 보내지 않는다.  
+가능한 경우 audit/ledger와 연결해 실제 결과, 수수료, risk mode, trigger 정보를 함께 요약해 피드백 루프를 강화한다.
+
+daily memory batch는 `rationale_json.evidence`의 반복 시그널에서 heuristic `candidate_lessons`를 먼저 만들고, Gemini는 이를 정제하거나 병합하는 역할을 한다.  
+Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
+
+이 배치는 signal 반복뿐 아니라 `evidence_quality.factor` 버킷과 `entry_size_cap` 조정 패턴도 같이 집계한다.  
+즉 근거 품질이 낮거나 size cap이 줄어든 상황이 실제 손실과 함께 반복되는지도 candidate lesson seed에 반영한다.
 
 ### `long_term_memory`
 
@@ -770,8 +794,25 @@ python tools/replay_audit.py --audit-id 12 --save
 - `confidence_delta`
 - `rationale_keywords_added`
 - `rationale_keywords_removed`
+- `evidence_signals_added`
+- `evidence_signals_removed`
+- `evidence_signal_count_delta`
 
 즉, 예전엔 `BUY`였는데 지금은 `HOLD`인지, 같은 `BUY`여도 크기가 줄었는지, rationale의 중심 키워드가 무엇으로 바뀌었는지 바로 볼 수 있다.
+
+이제 replay는 `rationale_items.evidence`도 비교한다.  
+즉 어떤 evidence signal이 추가되거나 사라져서 결정이 바뀌었는지까지 추적할 수 있다.
+
+대시보드는 최근 replay에 이 evidence diff를, 최근 memory에는 heuristic candidate lesson seed를 함께 보여준다.
+
+audit detail 화면은 raw JSON 외에도 `rationale_items`와 evidence quality / entry size cap 요약을 카드로 보여준다.
+`rationale_items.evidence[].source`는 클릭해서 stored DecisionRequest 안의 실제 값을 바로 lookup할 수 있다.
+선택한 source는 Stored Request JSON에서도 해당 값이 강조되어 보인다.
+또한 audit detail에서는 latest replay 기준으로 같은 source의 original vs replay observed value 차이도 함께 볼 수 있다.
+이 source diff는 `source / original / replayed / delta` 표로 요약되어 숫자 변화가 바로 보이게 구성된다.
+source lookup에는 current value뿐 아니라 previous value와 original/replay threshold도 함께 보여준다.
+상단 카드에는 semantic validation fallback을 `24h / 7d / latest 50 calls` 기준으로 나눠 표시한다.
+같은 카드에서 fallback이 어느 모델에서 더 자주 났는지도 모델별 failure rate와 함께 표시된다.
 
 ## 장기 메모리 배치 상세
 
@@ -898,6 +939,7 @@ BYBIT_TESTNET="False"
 GEMINI_API_KEY="your_gemini_api_key_here"
 GEMINI_DEFAULT_MODEL="gemini-2.5-flash"
 GEMINI_TRIGGER_MODEL="gemini-2.5-pro"
+GEMINI_MEMORY_MODEL="gemini-2.5-pro"
 DB_PATH="data/gpt_trader.db"
 LOG_LEVEL="INFO"
 LOG_FORMAT="text"
@@ -910,6 +952,9 @@ LOG_FORMAT="text"
 - `GEMINI_TRIGGER_MODEL`
   - trigger mode에서만 따로 쓰고 싶을 때 지정
   - 비우면 `GEMINI_DEFAULT_MODEL`을 재사용
+- `GEMINI_MEMORY_MODEL`
+  - 일일 memory batch에서 사용하는 모델
+  - 비우면 `GEMINI_TRIGGER_MODEL -> GEMINI_DEFAULT_MODEL -> GEMINI_MODEL` 순서로 fallback
 - `GEMINI_MODEL`
   - 레거시 단일 모델 fallback
 
@@ -985,6 +1030,203 @@ python -m unittest discover -s tests
 - `EXIT` 의사결정에 `orders`가 비어 있으면 현재 포지션을 기준으로 reduce-only 시장가 청산 주문을 자동 생성한다.
 - 주문 실행 중 일반 예외가 나면 receipt에 `failed` 상태로 남는다.
 - 알림 웹훅이 없으면 알림은 로그만 남기고 종료한다.
+
+## 유지보수 상세
+
+운영 중에는 "코드가 돌아간다"보다 "판단이 여전히 유효하다"를 계속 확인해야 한다.
+이 프로젝트에서 유지보수는 크게 6가지를 주기적으로 보는 작업이다.
+
+### 일간 체크리스트
+
+1. 대시보드에서 `ledger net pnl`, `Symbol Report`, `Semantic Fallbacks`를 확인한다.
+2. `24h / 7d / latest 50 calls` 기준 semantic fallback이 갑자기 늘었는지 본다.
+3. 최근 audit 5~10개에서 `risk_reason`, `evidence_quality`, `entry_size_cap`이 이상하게 치우치지 않았는지 본다.
+4. `wide_spread`, `elevated_funding`, `cooldown`, `drawdown`이 특정 시간대에 몰리는지 확인한다.
+5. Bybit 실제 포지션/미체결과 audit의 `positions`, `open_orders`, `receipts`가 맞는지 샘플 확인한다.
+6. `timeout_unresolved`, `failed`, market fetch warning이 반복되는지 로그를 본다.
+
+### 주간 체크리스트
+
+1. `tools/replay_audit.py`로 최근 손실 audit 10~20개를 다시 비교한다.
+2. replay에서 `evidence_signals_added/removed`, `source diff`, `previous value / threshold`를 점검한다.
+3. `long_term_memory`의 최근 rule과 `candidate_lessons`를 읽고 과잉 일반화가 없는지 확인한다.
+4. 심볼별 net pnl을 보고 손실 심볼을 유지할지 제외할지 결정한다.
+5. 정책 변경이 필요하면 한 번에 하나의 파라미터만 조정한다.
+6. 변경 후에는 반드시 demo 또는 축소된 size로 관찰한다.
+
+### 월간 체크리스트
+
+1. `policy.yaml`의 손실 한도, size cap, max positions, trigger threshold를 다시 검토한다.
+2. `GEMINI_DEFAULT_MODEL`, `GEMINI_TRIGGER_MODEL`, `GEMINI_MEMORY_MODEL` 역할 분리가 여전히 적절한지 본다.
+3. SQLite 파일 크기, `audit_logs`, `position_ledger`, `replay_runs` 증가량을 점검한다.
+4. 오래된 audit archive 정책이 필요한지 판단한다.
+5. 오래된 memory rule 중 현재 시장 레짐에서 더 이상 맞지 않는 항목을 pruning 할지 검토한다.
+6. 실계좌 운영이면 월간 최대 drawdown, symbol concentration, execution quality를 따로 리뷰한다.
+
+### 1. 모델 품질 점검
+
+- 대시보드의 `Semantic Fallbacks`를 먼저 본다.
+- `24h / 7d / latest 50 calls` 기준으로 fallback 수가 올라가면 최근 모델 변경, 프롬프트 변경, journal 문맥 변화가 있었는지 확인한다.
+- 특정 모델의 failure rate가 높으면:
+  - `GEMINI_DEFAULT_MODEL`, `GEMINI_TRIGGER_MODEL`, `GEMINI_MEMORY_MODEL` 분리를 다시 점검
+  - 저가 모델을 실시간 루프에만 쓰고, memory batch는 상위 모델 유지
+  - fallback issue가 `operator_condition_failed`인지 `trade_implication_action_mismatch`인지 구분
+- replay detail에서 `current value / previous value / threshold`를 같이 보면서 모델이 숫자는 맞게 읽었는지, 교차 해석을 잘못했는지 확인한다.
+
+### 2. 정책 파일 유지
+
+- `policy.yaml`은 코드보다 먼저 점검하는 운영 파일이다.
+- 아래 항목은 시장 레짐이 바뀌면 재조정 대상이다:
+  - `risk_limits.daily_max_loss_pct`
+  - `risk_limits.max_consecutive_losses`
+  - `risk_limits.mode_profiles.*.max_order_notional_pct_balance`
+  - `risk_limits.mode_profiles.*.max_open_positions`
+  - `trading.max_leverage`
+  - trigger 관련 threshold
+- 정책 변경 후에는 바로 실거래에 넣지 말고:
+  1. demo 모드로 며칠 관찰
+  2. replay 결과 비교
+  3. journal / audit에서 거절률과 size cap 변화 확인
+
+### 3. 데이터 품질 점검
+
+- market snapshot의 핵심 필드가 비정상적으로 비어 있지 않은지 본다:
+  - `timeframes`
+  - `order_book`
+  - `derivatives`
+  - `previous_values`
+- public/private WebSocket이 끊기면 REST fallback으로 운영은 되지만, 호출 수와 지연이 올라갈 수 있다.
+- 로그에서 반복적으로 다음이 보이면 데이터 품질 이슈로 본다:
+  - `Failed to fetch market data`
+  - `Bulk open-order fetch failed`
+  - semantic fallback 급증
+- 이 경우 원인을 나눠 본다:
+  - 거래소 응답 문제
+  - WebSocket 세션 문제
+  - 특정 필드 schema drift
+  - 너무 공격적인 timeout / TTL 설정
+
+### 4. 계좌/실행 동기화 점검
+
+- 주문 체결 후 audit와 실제 Bybit 상태가 맞는지 주기적으로 확인한다.
+- 특히 아래가 어긋나면 운영 리스크가 커진다:
+  - `open_orders`
+  - `positions`
+  - ledger net pnl
+  - synced fills
+- 점검 순서:
+  1. 최근 audit의 `receipts`
+  2. `order_state_transitions`
+  3. `position_state_transitions`
+  4. Bybit 실제 미체결/포지션
+- timeout 관련 receipt가 늘어나면 실거래 전환이나 size 확대를 멈추는 게 맞다.
+
+### 5. 장기 메모리 유지
+
+- `long_term_memory`는 많이 쌓이는 것보다 "나쁜 교훈을 오래 유지하지 않는 것"이 더 중요하다.
+- daily memory batch 결과는 아래를 같이 검토한다:
+  - `candidate_lessons`
+  - `winning_evidence_signals`
+  - `losing_evidence_signals`
+  - `evidence_quality_patterns`
+- memory rule은 다음 경우 재검토 대상이다:
+  - support는 높은데 이후 replay에서 자주 무시됨
+  - 특정 regime에서만 맞고 다른 regime에서 계속 손실
+  - 저품질 evidence에서 나온 anti-pattern이 너무 일반화됨
+- memory batch 모델을 바꿨다면 최소 며칠은 새 rule의 tone과 과잉 일반화 여부를 직접 읽어보는 게 좋다.
+
+### 6. DB / 로그 유지
+
+- SQLite 단일 파일 운영이므로 아래를 주기적으로 확인한다:
+  - DB 파일 크기 증가 속도
+  - `audit_logs`, `position_ledger`, `replay_runs` 증가량
+  - 로그 파일 rotation 정상 동작 여부
+- 운영이 길어지면 archive 정책을 정하는 게 좋다:
+  - 최근 30~90일 audit는 hot storage
+  - 그 이전은 별도 백업
+- replay와 memory를 계속 쓸 계획이면 `audit_logs`는 함부로 지우지 않는 편이 좋다.
+
+## 수익률이 안 나올 때 해볼 것
+
+수익률이 안 나올 때는 모델을 바로 바꾸기보다, 먼저 "무엇이 나쁜지"를 분리해서 봐야 한다.
+대체로 아래 5가지 유형 중 하나다.
+
+### 1. 진입은 맞는데 실행이 나쁜 경우
+
+증상:
+
+- 방향은 대체로 맞는데 net pnl이 수수료/슬리피지 때문에 깎인다.
+- replay 기준 decision은 괜찮아 보이는데 ledger net이 약하다.
+
+해볼 것:
+
+1. `wide_spread`, `elevated_funding`이 잦은 시간대를 줄인다.
+2. `max_order_notional_pct_balance`를 낮춰 슬리피지 민감도를 줄인다.
+3. 심볼 수를 줄이고 유동성 좋은 심볼만 남긴다.
+4. market order만 허용 중이라면, 정책상 limit 운용이 가능한지 별도로 검토한다.
+
+### 2. 진입 자체가 과다한 경우
+
+증상:
+
+- 거래 수는 많은데 기대값이 낮다.
+- `BUY/SELL`은 많은데 대부분 작은 손실이 누적된다.
+
+해볼 것:
+
+1. trigger 조건을 더 보수화한다.
+2. `mode_profiles.trigger.max_order_notional_pct_balance`와 `max_open_positions`를 더 줄인다.
+3. low evidence quality에서 사실상 `HOLD`가 더 자주 나오도록 validator/risk 정책을 강화한다.
+4. 최근 journal에서 같은 signal 조합이 반복 손실인지 확인하고 memory anti-pattern 반영 여부를 점검한다.
+
+### 3. 손실은 적은데 수익도 안 나는 경우
+
+증상:
+
+- drawdown은 얕지만 계좌 곡선이 옆으로 간다.
+- `REDUCE/EXIT`가 너무 빠르거나, 좋은 추세를 끝까지 못 먹는다.
+
+해볼 것:
+
+1. `EXIT`와 `REDUCE` journal을 따로 모아 "너무 빨리 줄였는지" 본다.
+2. 장기 메모리가 지나치게 보수적인 교훈만 축적했는지 확인한다.
+3. trigger mode에서 신규 진입 억제가 과한지 점검한다.
+4. regime별로 성과를 나눠 보고, 추세장에서만 별도 정책을 둘지 검토한다.
+
+### 4. 특정 심볼만 문제인 경우
+
+증상:
+
+- 전체 수익률이 낮은데, 실제로는 특정 심볼 하나가 대부분 손실을 만든다.
+
+해볼 것:
+
+1. 대시보드 `Symbol Report`로 심볼별 net pnl을 확인한다.
+2. 손실 심볼을 잠시 제외하고 나머지 심볼만으로 관찰한다.
+3. 그 심볼의 `spread_bps`, `funding_rate`, `open_interest` 변동이 다른 심볼보다 거친지 본다.
+4. 심볼별로 다른 threshold가 필요한지 검토한다.
+
+### 5. 시장 레짐이 바뀐 경우
+
+증상:
+
+- 과거에는 맞던 패턴이 최근 몇 주간 계속 안 맞는다.
+- memory rule은 그럴듯한데 최신 audit에서는 실패가 반복된다.
+
+해볼 것:
+
+1. replay로 예전 성공 audit와 최근 실패 audit를 나란히 비교한다.
+2. `trend_alignment`, `volatility_regime`, `risk_trigger_reasons`가 달라졌는지 확인한다.
+3. trigger threshold를 ATR/volatility 기준으로 더 강하게 정규화한다.
+4. 오래된 long-term memory rule을 약화하거나 manual pruning 한다.
+
+### 수익률 부진 시 권장 점검 순서
+
+1. 대시보드에서 `ledger net pnl`, `Symbol Report`, `Semantic Fallbacks`를 먼저 본다.
+2. 손실 audit 10~20개를 replay로 다시 돌려서 decision 변화와 evidence diff를 본다.
+3. journal에서 반복 손실 signal과 evidence quality 패턴을 확인한다.
+4. 정책 조정은 한 번에 하나씩만 한다.
+5. 변경 후에는 반드시 demo 또는 축소된 size로 재관찰한다.
 
 ## 권장 운영 순서
 

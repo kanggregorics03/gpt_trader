@@ -60,15 +60,116 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(snapshot["rejected_24h"], 2)
         self.assertEqual(snapshot["loop_errors_24h"], 1)
         self.assertEqual(snapshot["timeouts_unresolved_24h"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 0)
+        self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 0)
         self.assertEqual(len(snapshot["recent_memory"]), 1)
         self.assertEqual(snapshot["recent_memory"][0]["metrics"]["status"], "rule")
         hashed_log = next(log for log in snapshot["recent_logs"] if log["decision_input_hash"] == "abc123")
         self.assertEqual(hashed_log["risk_mode"], "cooldown")
 
+    def test_monitoring_snapshot_summarizes_semantic_validation_issues(self):
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "BUY"},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            execution_summary={
+                "ai_usage": {
+                    "model_name": "gemini-2.5-flash",
+                    "total_token_count": 123,
+                }
+            },
+        )
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            execution_summary={
+                "ai_usage": {
+                    "semantic_validation_error": True,
+                    "model_name": "gemini-2.5-flash",
+                    "issues": [
+                        "trade_implication_action_mismatch",
+                        "operator_condition_failed",
+                        "trade_implication_action_mismatch",
+                    ],
+                }
+            },
+        )
+
+        snapshot = self.store.get_monitoring_snapshot()
+
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_7d"]["failure_count"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 1)
+        self.assertEqual(
+            snapshot["semantic_validation_summary"]["last_24h"]["top_issues"][0],
+            {"issue": "trade_implication_action_mismatch", "count": 2},
+        )
+        self.assertEqual(
+            snapshot["semantic_validation_summary"]["last_24h"]["top_models"][0],
+            {
+                "model_name": "gemini-2.5-flash",
+                "count": 1,
+                "total_calls": 2,
+                "failure_rate": 0.5,
+            },
+        )
+
     def test_get_journal_entries_since_returns_new_fields(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"regime": {"trend_alignment": "aligned_up"}}}},
+            intent={"decision": "EXIT"},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            risk_mode="drawdown",
+            execution_summary={"ai_usage": {"total_token_count": 321}},
+        )
+        self.store.save_position_ledger_entries(
+            audit_id,
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "decision": "EXIT",
+                    "fill_count": 1,
+                    "total_amount": 0.1,
+                    "gross_realized_pnl": -15.0,
+                    "fee_cost": 1.0,
+                    "net_realized_pnl": -16.0,
+                }
+            ],
+        )
         self.store.save_journal(
             decision="EXIT",
             rationale=["Closed position"],
+            audit_log_id=audit_id,
+            rationale_items=[
+                {
+                    "summary": "Position invalidated",
+                    "why_it_matters": "Breakdown failed.",
+                    "trade_implication": "Exit remaining exposure.",
+                    "failure_mode": "Momentum reclaims prior support.",
+                    "evidence": [
+                        {
+                            "signal": "rsi_14",
+                            "symbol": "BTCUSDT",
+                            "timeframe": "15m",
+                            "operator": "lte",
+                            "observed_value": 39.5,
+                            "threshold": 40.0,
+                            "units": "index",
+                            "source": "market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                        }
+                    ],
+                }
+            ],
             confidence=0.9,
             risk_reason="Approved",
             estimated_pnl_pct=-1.5,
@@ -83,6 +184,103 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["decision"], "EXIT")
         self.assertEqual(rows[0]["loss_signal"], 1)
         self.assertAlmostEqual(rows[0]["estimated_pnl_pct"], -1.5)
+        self.assertEqual(rows[0]["rationale_json"][0]["evidence"][0]["signal"], "rsi_14")
+        self.assertEqual(rows[0]["risk_mode"], "drawdown")
+        self.assertEqual(rows[0]["ledger_net_realized_pnl"], -16.0)
+        self.assertEqual(rows[0]["execution_summary"]["ai_usage"]["total_token_count"], 321)
+
+    def test_get_recent_journals_includes_structured_evidence_summary(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={
+                "trigger_symbols": ["BTCUSDT"],
+                "risk_trigger_symbols": ["BTCUSDT"],
+                "market_snapshots": {
+                    "BTCUSDT": {
+                        "regime": {
+                            "trend_alignment": "aligned_up",
+                            "volatility_regime": "high",
+                        }
+                    }
+                },
+            },
+            intent={"decision": "BUY", "orders": [], "confidence": 0.7},
+            risk_ok=False,
+            reason="Entry blocked",
+            receipts=[],
+            risk_mode="trigger",
+            execution_summary={
+                "evidence_quality": {
+                    "factor": 0.7,
+                    "issues": ["low_signal_diversity"],
+                },
+                "entry_size_cap": {
+                    "base_cap_pct": 30.0,
+                    "effective_cap_pct": 21.0,
+                },
+            },
+        )
+        self.store.save_position_ledger_entries(
+            audit_id,
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "decision": "BUY",
+                    "fill_count": 1,
+                    "total_amount": 0.1,
+                    "gross_realized_pnl": 0.0,
+                    "fee_cost": 1.2,
+                    "net_realized_pnl": -1.2,
+                }
+            ],
+        )
+        self.store.save_journal(
+            decision="BUY",
+            rationale=["Momentum confirmed on BTC."],
+            audit_log_id=audit_id,
+            rationale_items=[
+                {
+                    "summary": "Momentum confirmed",
+                    "why_it_matters": "Trend and participation align.",
+                    "trade_implication": "Allow controlled long entry.",
+                    "failure_mode": "Breakout fails.",
+                    "evidence": [
+                        {
+                            "signal": "volume_ratio",
+                            "symbol": "BTCUSDT",
+                            "timeframe": "15m",
+                            "operator": "gte",
+                            "observed_value": 2.4,
+                            "threshold": 1.8,
+                            "units": "ratio",
+                            "source": "market_snapshots.BTCUSDT.timeframes.15m.volume_ratio",
+                        }
+                    ],
+                }
+            ],
+            confidence=0.7,
+            risk_reason="Approved",
+        )
+
+        recent = self.store.get_recent_journals(limit=1)
+
+        self.assertEqual(len(recent), 1)
+        self.assertIn("volume_ratio@15m=2.4 gte 1.8", recent[0])
+        self.assertIn("ledger_net=-1.2000", recent[0])
+        self.assertIn("fees=1.2000", recent[0])
+        self.assertIn("eq=0.70", recent[0])
+        self.assertIn("cap=30.0->21.0", recent[0])
+        self.assertIn("trigger=BTCUSDT", recent[0])
+        self.assertIn("risk_trigger=BTCUSDT", recent[0])
+
+        context = self.store.get_recent_journal_context(limit=1)
+
+        self.assertEqual(len(context), 1)
+        self.assertEqual(context[0]["journal_id"], 1)
+        self.assertEqual(context[0]["trigger_symbols"], ["BTCUSDT"])
+        self.assertEqual(context[0]["risk_trigger_symbols"], ["BTCUSDT"])
+        self.assertEqual(context[0]["evidence_quality"]["factor"], 0.7)
+        self.assertEqual(context[0]["entry_size_cap"]["effective_cap_pct"], 21.0)
 
     def test_get_audit_log_and_replay_candidates_decode_json_payloads(self):
         audit_id = self.store.save_audit(
@@ -177,6 +375,9 @@ class TestStateStore(unittest.TestCase):
                     "confidence_delta": -0.2,
                     "rationale_keywords_added": ["volatility"],
                     "rationale_keywords_removed": ["momentum"],
+                    "evidence_signals_added": ["ETHUSDT:spread_bps@microstructure"],
+                    "evidence_signals_removed": ["ETHUSDT:rsi_14@15m"],
+                    "evidence_signal_count_delta": 0,
                 }
             },
         )
@@ -219,6 +420,8 @@ class TestStateStore(unittest.TestCase):
         self.assertTrue(recent_replays[0]["decision_changed"])
         self.assertTrue(recent_replays[0]["side_changed"])
         self.assertEqual(recent_replays[0]["rationale_keywords_added"], ["volatility"])
+        self.assertEqual(recent_replays[0]["evidence_signals_added"], ["ETHUSDT:spread_bps@microstructure"])
+        self.assertEqual(recent_replays[0]["evidence_signals_removed"], ["ETHUSDT:rsi_14@15m"])
         self.assertEqual(audit["replay_runs"][0]["replayed_decision"], "REDUCE")
         self.assertEqual(audit["ledger_entries"][0]["symbol"], "ETHUSDT")
         self.assertEqual(audit["order_state_transitions"][0]["to_state"], "submitted")

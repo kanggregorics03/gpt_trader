@@ -41,7 +41,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             risk_profile={"allowed_actions": ["HOLD", "REDUCE", "EXIT"]},
         )
 
-        self.assertEqual(reason, "risk_profile_cooldown_blocks_entries")
+        self.assertEqual(reason, "cooldown_active")
 
     def test_deterministic_skip_does_not_apply_when_position_exists(self):
         orchestrator = TradingOrchestrator.__new__(TradingOrchestrator)

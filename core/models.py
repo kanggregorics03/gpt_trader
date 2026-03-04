@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class TimeframeSnapshot(BaseModel):
     timeframe: str
     last_close: float = 0.0
+    previous_values: Dict[str, Optional[float]] = Field(default_factory=dict)
     atr: float = 0.0
     atr_pct: float = 0.0
     realized_volatility_pct: float = 0.0
@@ -34,6 +35,7 @@ class TimeframeSnapshot(BaseModel):
 
 
 class OrderBookSnapshot(BaseModel):
+    previous_values: Dict[str, Optional[float]] = Field(default_factory=dict)
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
     spread_bps: Optional[float] = None
@@ -47,6 +49,7 @@ class OrderBookSnapshot(BaseModel):
 
 
 class DerivativesSnapshot(BaseModel):
+    previous_values: Dict[str, Optional[float]] = Field(default_factory=dict)
     mark_price: Optional[float] = None
     index_price: Optional[float] = None
     basis_pct: Optional[float] = None
@@ -159,13 +162,36 @@ class LongTermMemoryRecord(BaseModel):
     evidence_journal_ids: List[int] = Field(default_factory=list)
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
+
+class RecentJournalContext(BaseModel):
+    journal_id: int
+    audit_log_id: Optional[int] = None
+    timestamp: Optional[str] = None
+    decision: str
+    rationale: List[str] = Field(default_factory=list)
+    rationale_items: List["RationaleItem"] = Field(default_factory=list)
+    confidence: float = 0.0
+    risk_reason: str = ""
+    estimated_pnl_pct: Optional[float] = None
+    loss_signal: bool = False
+    ledger_net_realized_pnl: float = 0.0
+    ledger_fee_cost: float = 0.0
+    risk_approved: Optional[bool] = None
+    risk_mode: Optional[str] = None
+    trigger_symbols: List[str] = Field(default_factory=list)
+    risk_trigger_symbols: List[str] = Field(default_factory=list)
+    evidence_quality: Dict[str, Any] = Field(default_factory=dict)
+    entry_size_cap: Dict[str, Any] = Field(default_factory=dict)
+    summary: Optional[str] = None
+
+
 class DecisionRequest(BaseModel):
     policy_summary: str
     account_state: AccountState
     market_snapshot: Optional[MarketSnapshot] = None
     market_snapshots: Dict[str, MarketSnapshot] = Field(default_factory=dict)
     risk_state: RiskStateSnapshot
-    recent_journal_summaries: List[str]
+    recent_journal_context: List[RecentJournalContext] = Field(default_factory=list)
     long_term_memory: List[LongTermMemoryRecord | str]
     similar_past_cases: List[str] = Field(default_factory=list)
     is_trigger_mode: bool = False
@@ -182,9 +208,47 @@ class OrderIntent(BaseModel):
     take_profit: Optional[float] = Field(None, description="Take profit price")
     stop_loss: Optional[float] = Field(None, description="Stop loss price")
 
+
+class EvidenceItem(BaseModel):
+    signal: str = Field(description="Observed signal name, e.g. rsi_14 or volume_ratio")
+    symbol: Optional[str] = Field(default=None, description="Optional symbol when market_context contains multiple symbols")
+    timeframe: str = Field(description="Timeframe associated with the evidence, e.g. 15m, 1h, account, risk")
+    operator: Literal["gte", "lte", "gt", "lt", "eq", "cross_up", "cross_down", "delta_abs_gte", "note"] = Field(
+        description="Comparison operator connecting observed_value and threshold"
+    )
+    observed_value: float = Field(description="Measured numeric value from the request payload")
+    threshold: Optional[float] = Field(default=None, description="Numeric comparison threshold when applicable")
+    units: Optional[str] = Field(default=None, description="Optional units, e.g. pct, bps, usdt")
+    source: str = Field(description="Dot path to the source field in DecisionRequest, e.g. market_snapshots.BTCUSDT.timeframes.15m.rsi_14")
+    confidence_contribution: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional relative contribution of this evidence to the final confidence",
+    )
+
+
+class RationaleItem(BaseModel):
+    summary: str = Field(description="Short human-readable summary of this rationale item")
+    why_it_matters: str = Field(description="Why this evidence matters for the trade decision")
+    trade_implication: str = Field(description="How the evidence changes the proposed trade action")
+    failure_mode: Optional[str] = Field(
+        default=None,
+        description="What would invalidate or weaken this rationale item",
+    )
+    evidence: List[EvidenceItem] = Field(
+        default_factory=list,
+        description="Machine-checkable factual evidence backing this rationale item",
+    )
+
+
 class TradeIntent(BaseModel):
     decision: Literal["HOLD", "BUY", "SELL", "REDUCE", "EXIT"] = Field(description="Overall strategy decision")
     orders: List[OrderIntent] = Field(default_factory=list, description="List of proposed orders")
     rationale: List[str] = Field(description="Brief reasoning for the decision")
+    rationale_items: List[RationaleItem] = Field(
+        default_factory=list,
+        description="Structured rationale with machine-checkable evidence and human interpretation",
+    )
     risk_notes: List[str] = Field(description="Any identified market or strategy risks")
     confidence: float = Field(description="AI confidence score 0.0 to 1.0", ge=0.0, le=1.0)
