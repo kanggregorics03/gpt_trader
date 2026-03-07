@@ -10,6 +10,21 @@ risk_limits:
   drawdown_activate_pct: 1.5 # Enter drawdown mode before the hard daily kill-switch is hit
   max_consecutive_losses: 3  # Pause trading after 3 consecutive losing trades
   cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
+  dynamic_cooldown:
+    enabled: true
+    base_minutes: 15
+    medium_loss_pct: 0.5
+    medium_loss_add_minutes: 10
+    large_loss_pct: 1.0
+    large_loss_add_minutes: 15
+    severe_loss_pct: 2.0
+    severe_loss_add_minutes: 15
+    consecutive_loss_2_add_minutes: 15
+    consecutive_loss_3_plus_add_minutes: 30
+    repeated_failure_lookback: 5
+    repeated_failure_min_count: 2
+    repeated_failure_add_minutes: 15
+    max_minutes: 90
   max_open_positions: 2      # Maximum number of concurrent positions
   mode_profiles:
     normal:
@@ -28,6 +43,10 @@ risk_limits:
     drawdown:
       max_open_positions: 1
       max_order_notional_pct_balance: 20
+      entry_size_multiplier: 0.75
+      confidence_cap: 0.55
+      failure_pattern_size_multiplier: 0.75
+      risk_trigger_size_multiplier: 0.85
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
   
 intervals:

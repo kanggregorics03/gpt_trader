@@ -95,6 +95,9 @@ risk_engine
 
 정책(policy.yaml) 기반 검증: 손실한도/노출/레버리지/슬리피지/쿨다운 등
 
+최근 구현에서는 쿨다운도 고정 30분이 아니라 손실 강도, 연속 손실, 반복된 `thesis_failure_reason`을 같이 봐서 동적으로 늘어난다.
+또 `drawdown`은 BUY/SELL을 완전히 막지 않되 `confidence_cap`, `entry_size_multiplier`, `failure_pattern_score`로 추가 감쇠한다.
+
 execution_engine
 
 주문 실행/취소/정정 + 멱등성(clientOrderId) + 재시도 안전 처리

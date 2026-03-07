@@ -47,6 +47,10 @@ class RiskEngine:
             "drawdown": {
                 "max_open_positions": max(1, min(base_max_positions, 1)),
                 "max_order_notional_pct_balance": 20.0,
+                "entry_size_multiplier": 0.75,
+                "confidence_cap": 0.55,
+                "failure_pattern_size_multiplier": 0.75,
+                "risk_trigger_size_multiplier": 0.85,
                 "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
             },
         }
@@ -131,19 +135,83 @@ class RiskEngine:
         self,
         intent: TradeIntent,
         active_profile: Optional[Dict] = None,
+        risk_state: Optional[Dict] = None,
+        market_snapshots: Optional[Dict[str, MarketSnapshot]] = None,
     ) -> Dict[str, object]:
         active_profile = active_profile or {}
+        risk_state = risk_state or {}
+        market_snapshots = market_snapshots or {}
         base_cap_pct = float(active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0)
         evidence_quality = self.get_evidence_quality_summary(intent)
-        factor = float(evidence_quality.get("factor") or 1.0)
+        evidence_factor = float(evidence_quality.get("factor") or 1.0)
+        profile_factor = 1.0
+        profile_issues: List[str] = []
+        profile_adjustments: Dict[str, float] = {}
+
+        entry_size_multiplier = min(
+            1.0,
+            max(0.0, float(active_profile.get("entry_size_multiplier", 1.0) or 1.0)),
+        )
+        if entry_size_multiplier < 1.0:
+            profile_factor *= entry_size_multiplier
+            profile_adjustments["entry_size_multiplier"] = entry_size_multiplier
+            profile_issues.append("mode_entry_size_multiplier")
+
+        confidence_cap = active_profile.get("confidence_cap")
+        if confidence_cap is not None:
+            confidence_cap = float(confidence_cap or 0.0)
+            if confidence_cap > 0 and float(intent.confidence or 0.0) > confidence_cap:
+                confidence_factor = max(
+                    0.0,
+                    min(1.0, confidence_cap / float(intent.confidence or 1.0)),
+                )
+                profile_factor *= confidence_factor
+                profile_adjustments["confidence_factor"] = confidence_factor
+                profile_issues.append(f"confidence_cap:{confidence_cap:.2f}")
+
+        failure_pattern_score = min(
+            1.0,
+            max(0.0, float(risk_state.get("failure_pattern_score", 0.0) or 0.0)),
+        )
+        failure_pattern_size_multiplier = min(
+            1.0,
+            max(0.0, float(active_profile.get("failure_pattern_size_multiplier", 1.0) or 1.0)),
+        )
+        if failure_pattern_score > 0 and failure_pattern_size_multiplier < 1.0:
+            failure_pattern_factor = 1.0 - (
+                (1.0 - failure_pattern_size_multiplier) * failure_pattern_score
+            )
+            profile_factor *= failure_pattern_factor
+            profile_adjustments["failure_pattern_factor"] = failure_pattern_factor
+            profile_issues.append(f"failure_pattern_score:{failure_pattern_score:.2f}")
+
+        risk_trigger_size_multiplier = min(
+            1.0,
+            max(0.0, float(active_profile.get("risk_trigger_size_multiplier", 1.0) or 1.0)),
+        )
+        has_risk_trigger = any(
+            bool(getattr(snapshot, "is_risk_trigger", False))
+            for snapshot in market_snapshots.values()
+        )
+        if has_risk_trigger and risk_trigger_size_multiplier < 1.0:
+            profile_factor *= risk_trigger_size_multiplier
+            profile_adjustments["risk_trigger_factor"] = risk_trigger_size_multiplier
+            profile_issues.append("risk_trigger_size_penalty")
+
+        factor = evidence_factor * profile_factor
         effective_cap_pct = base_cap_pct
         if intent.rationale_items:
             effective_cap_pct *= factor
+        elif profile_factor != 1.0:
+            effective_cap_pct *= profile_factor
         return {
             "base_cap_pct": base_cap_pct,
             "effective_cap_pct": effective_cap_pct,
             "evidence_quality": evidence_quality,
-            "adjusted": bool(intent.rationale_items) and effective_cap_pct != base_cap_pct,
+            "profile_adjustments": profile_adjustments,
+            "profile_issues": profile_issues,
+            "failure_pattern_score": failure_pattern_score,
+            "adjusted": effective_cap_pct != base_cap_pct,
         }
 
     def evaluate_intent(
@@ -233,7 +301,15 @@ class RiskEngine:
 
             if bool(risk_state.get("cooldown_active")):
                 remaining = int(risk_state.get("cooldown_remaining_minutes", 0) or 0)
-                return False, f"Cooldown active for another {remaining} minute(s)."
+                effective_window = int(risk_state.get("cooldown_minutes_effective", 0) or 0)
+                pattern_reason = str(risk_state.get("dominant_failure_reason") or "").strip()
+                suffix = ""
+                if effective_window > 0:
+                    suffix = f" (window {effective_window} minute(s)"
+                    if pattern_reason:
+                        suffix += f", pattern={pattern_reason}"
+                    suffix += ")"
+                return False, f"Cooldown active for another {remaining} minute(s){suffix}."
 
         # 2. Max Open Positions
         max_positions = min(
@@ -343,6 +419,8 @@ class RiskEngine:
             cap_summary = self.get_effective_max_order_notional_pct_balance(
                 intent=intent,
                 active_profile=active_profile,
+                risk_state=risk_state,
+                market_snapshots=market_snapshots,
             )
             evidence_quality = cap_summary["evidence_quality"]
             adjusted_notional_pct_balance = float(cap_summary["effective_cap_pct"])
@@ -370,8 +448,13 @@ class RiskEngine:
             max_candidate_notional = account_state.total_balance * (adjusted_notional_pct_balance / 100.0)
             if candidate_notional > max_candidate_notional:
                 issue_suffix = ""
+                detail_parts: List[str] = []
                 if intent.rationale_items and evidence_quality.get("issues"):
-                    issue_suffix = f" evidence_quality={','.join(evidence_quality['issues'])}."
+                    detail_parts.append(f"evidence_quality={','.join(evidence_quality['issues'])}")
+                if cap_summary.get("profile_issues"):
+                    detail_parts.append(f"profile_adjustments={','.join(cap_summary['profile_issues'])}")
+                if detail_parts:
+                    issue_suffix = " " + " ".join(detail_parts) + "."
                 return False, (
                     f"Risk profile {active_mode} limits candidate size to "
                     f"{max_candidate_notional:.2f}, got {candidate_notional:.2f}."

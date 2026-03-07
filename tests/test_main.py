@@ -195,12 +195,35 @@ class TestTradingOrchestrator(unittest.TestCase):
             rows.sort(key=lambda row: str(row.get("trade_case_id") or ""), reverse=True)
             return rows[:limit]
 
+    class DummyAlertManager:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, title, message, level="warning"):
+            self.calls.append(
+                {
+                    "title": title,
+                    "message": message,
+                    "level": level,
+                }
+            )
+
+    class DummyDiagnosticsFeed:
+        def __init__(self, diagnostics):
+            self.diagnostics = dict(diagnostics)
+
+        def get_diagnostics(self):
+            return dict(self.diagnostics)
+
     def _make_orchestrator(self):
         orchestrator = TradingOrchestrator.__new__(TradingOrchestrator)
         orchestrator.risk_engine = DummyRiskEngine()
         orchestrator.rag_engine = self.DummyRagEngine()
         orchestrator.symbols = ["BTCUSDT"]
         orchestrator.state_store = self.DummyCaseStore()
+        orchestrator.alert_manager = self.DummyAlertManager()
+        orchestrator.public_feed = None
+        orchestrator.private_account_feed = None
         orchestrator._initialize_runtime_state()
         return orchestrator
 
@@ -929,3 +952,131 @@ class TestTradingOrchestrator(unittest.TestCase):
 
         self.assertEqual(effective_profile["cycle_role"], "trigger_response")
         self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "REDUCE", "EXIT"])
+
+    def test_risk_transition_alerts_cover_kill_switch_drawdown_and_cooldown_extension(self):
+        orchestrator = self._make_orchestrator()
+
+        orchestrator._maybe_alert_risk_state_transitions(
+            {
+                "daily_pnl_pct": -0.4,
+                "drawdown_active": False,
+                "drawdown_activate_pct": 1.5,
+                "cooldown_active": False,
+            }
+        )
+        self.assertEqual(orchestrator.alert_manager.calls, [])
+
+        orchestrator._maybe_alert_risk_state_transitions(
+            {
+                "daily_pnl_pct": -3.4,
+                "drawdown_active": True,
+                "drawdown_activate_pct": 1.5,
+                "cooldown_active": True,
+                "cooldown_minutes_effective": 55,
+                "cooldown_remaining_minutes": 42,
+                "cooldown_components": ["large_loss", "repeated_failure"],
+                "consecutive_losses": 3,
+                "dominant_failure_reason": "late_entry",
+                "last_loss_estimated_pnl_pct": -1.2,
+            }
+        )
+
+        self.assertEqual(
+            [call["title"] for call in orchestrator.alert_manager.calls],
+            [
+                "Daily Kill Switch Activated",
+                "Drawdown Mode Entered",
+                "Cooldown Extended",
+            ],
+        )
+
+        orchestrator._maybe_alert_risk_state_transitions(
+            {
+                "daily_pnl_pct": -3.4,
+                "drawdown_active": True,
+                "drawdown_activate_pct": 1.5,
+                "cooldown_active": True,
+                "cooldown_minutes_effective": 55,
+                "cooldown_remaining_minutes": 30,
+                "cooldown_components": ["large_loss", "repeated_failure"],
+                "consecutive_losses": 3,
+                "dominant_failure_reason": "late_entry",
+                "last_loss_estimated_pnl_pct": -1.2,
+            }
+        )
+        self.assertEqual(len(orchestrator.alert_manager.calls), 3)
+
+        orchestrator._maybe_alert_risk_state_transitions(
+            {
+                "daily_pnl_pct": -0.2,
+                "drawdown_active": False,
+                "drawdown_activate_pct": 1.5,
+                "cooldown_active": False,
+            }
+        )
+        self.assertEqual(orchestrator.alert_manager.calls[-1]["title"], "Drawdown Mode Cleared")
+
+    def test_websocket_transition_alerts_cover_stale_and_recovered(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.public_feed = self.DummyDiagnosticsFeed(
+            {
+                "started": True,
+                "available": True,
+                "ws_stale_after_ms": 35_000,
+                "last_message_age_ms": 2_000,
+                "stale_symbols": [],
+            }
+        )
+        orchestrator.private_account_feed = self.DummyDiagnosticsFeed(
+            {
+                "started": True,
+                "available": True,
+                "health_status": "healthy",
+                "ws_stale_after_ms": 35_000,
+                "last_ws_message_age_ms": 1_000,
+                "last_private_event_age_ms": 1_000,
+            }
+        )
+
+        orchestrator._maybe_alert_websocket_transitions()
+        self.assertEqual(orchestrator.alert_manager.calls, [])
+
+        orchestrator.public_feed.diagnostics.update(
+            {
+                "last_message_age_ms": 41_000,
+                "stale_symbols": ["BTCUSDT"],
+            }
+        )
+        orchestrator.private_account_feed.diagnostics.update(
+            {
+                "health_status": "stale",
+                "last_ws_message_age_ms": 40_000,
+                "last_private_event_age_ms": 42_000,
+            }
+        )
+
+        orchestrator._maybe_alert_websocket_transitions()
+        self.assertEqual(
+            [call["title"] for call in orchestrator.alert_manager.calls],
+            ["WebSocket Stale", "WebSocket Stale"],
+        )
+
+        orchestrator.public_feed.diagnostics.update(
+            {
+                "last_message_age_ms": 3_000,
+                "stale_symbols": [],
+            }
+        )
+        orchestrator.private_account_feed.diagnostics.update(
+            {
+                "health_status": "healthy",
+                "last_ws_message_age_ms": 2_000,
+                "last_private_event_age_ms": 2_000,
+            }
+        )
+
+        orchestrator._maybe_alert_websocket_transitions()
+        self.assertEqual(
+            [call["title"] for call in orchestrator.alert_manager.calls[-2:]],
+            ["WebSocket Recovered", "WebSocket Recovered"],
+        )

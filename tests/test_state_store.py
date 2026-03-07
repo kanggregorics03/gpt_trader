@@ -649,6 +649,121 @@ class TestStateStore(unittest.TestCase):
         self.assertTrue(risk_state["drawdown_active"])
         self.assertAlmostEqual(risk_state["daily_pnl_pct"], -2.0)
 
+    def test_get_risk_state_uses_dynamic_cooldown_and_failure_pattern(self):
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        now = datetime(2026, 3, 7, 10, 0, 0)
+        with self.store.conn:
+            self.store.conn.execute(
+                """
+                INSERT INTO journal (
+                    timestamp,
+                    decision,
+                    rationale,
+                    confidence,
+                    risk_reason,
+                    estimated_pnl_pct,
+                    loss_signal,
+                    trade_case_ids,
+                    case_statuses,
+                    case_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-03-07 09:10:00",
+                    "EXIT",
+                    "loss 1",
+                    0.6,
+                    "setup_invalidated:breakout",
+                    -1.2,
+                    1,
+                    "[]",
+                    "{}",
+                    "BTCUSDT:closed",
+                ),
+            )
+            self.store.conn.execute(
+                """
+                INSERT INTO journal (
+                    timestamp,
+                    decision,
+                    rationale,
+                    confidence,
+                    risk_reason,
+                    estimated_pnl_pct,
+                    loss_signal,
+                    trade_case_ids,
+                    case_statuses,
+                    case_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-03-07 09:40:00",
+                    "EXIT",
+                    "loss 2",
+                    0.6,
+                    "setup_invalidated:breakout",
+                    -0.8,
+                    1,
+                    "[]",
+                    "{}",
+                    "BTCUSDT:closed",
+                ),
+            )
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-1",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "closed_at": "2026-03-07 09:10:00",
+                "estimated_pnl_pct": -1.2,
+                "thesis_failure_reason": "setup_invalidated:breakout",
+            }
+        )
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-2",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "closed_at": "2026-03-07 09:40:00",
+                "estimated_pnl_pct": -0.8,
+                "thesis_failure_reason": "setup_invalidated:breakout",
+            }
+        )
+
+        risk_state = self.store.get_risk_state(
+            current_balance=985,
+            cooldown_minutes=30,
+            cooldown_config={
+                "base_minutes": 15,
+                "medium_loss_pct": 0.5,
+                "medium_loss_add_minutes": 10,
+                "large_loss_pct": 1.0,
+                "large_loss_add_minutes": 15,
+                "consecutive_loss_2_add_minutes": 15,
+                "repeated_failure_add_minutes": 15,
+                "repeated_failure_lookback": 5,
+                "repeated_failure_min_count": 2,
+                "max_minutes": 90,
+            },
+            drawdown_activate_pct=1.5,
+            now=now,
+        )
+
+        self.assertTrue(risk_state["drawdown_active"])
+        self.assertTrue(risk_state["cooldown_active"])
+        self.assertEqual(risk_state["consecutive_losses"], 2)
+        self.assertEqual(risk_state["dominant_failure_reason"], "setup_invalidated:breakout")
+        self.assertEqual(risk_state["cooldown_minutes_effective"], 55)
+        self.assertEqual(risk_state["cooldown_remaining_minutes"], 35)
+        self.assertGreater(risk_state["failure_pattern_score"], 0.6)
+
     def test_symbol_and_daily_reports_aggregate_ledger_rows(self):
         audit_id = self.store.save_audit(
             account={"total_balance": 1000},

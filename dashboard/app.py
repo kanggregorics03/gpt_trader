@@ -1,4 +1,5 @@
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
@@ -9,6 +10,100 @@ from tools.replay_audit import replay_and_optionally_save
 app = Flask(__name__)
 DB_PATH = str(Path(__file__).resolve().parents[1] / "data" / "gpt_trader.db")
 state_store = StateStore(DB_PATH)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_trade_case_summary(rows):
+    total = len(rows)
+    closed = [row for row in rows if str(row.get("status") or "").lower() == "closed"]
+    active = [row for row in rows if str(row.get("status") or "").lower() != "closed"]
+    wins = [
+        row for row in closed
+        if _safe_float(row.get("realized_pnl"), default=_safe_float(row.get("estimated_pnl_pct"))) > 0
+    ]
+    avg_holding = 0.0
+    holding_values = [_safe_float(row.get("holding_minutes"), default=None) for row in closed]
+    holding_values = [value for value in holding_values if value is not None]
+    if holding_values:
+        avg_holding = sum(holding_values) / len(holding_values)
+    return {
+        "total_count": total,
+        "closed_count": len(closed),
+        "active_count": len(active),
+        "win_count": len(wins),
+        "win_rate": round((len(wins) / len(closed) * 100), 2) if closed else 0.0,
+        "avg_holding_minutes": round(avg_holding, 2),
+    }
+
+
+def _build_retrieval_summary(rows):
+    total = len(rows)
+    settled = [row for row in rows if row.get("outcome_status") or row.get("outcome_trade_case_id")]
+    aligned = [row for row in rows if bool(row.get("decision_symbol_aligned"))]
+    positive = [
+        row for row in settled
+        if _safe_float(
+            row.get("outcome_realized_pnl"),
+            default=_safe_float(row.get("outcome_estimated_pnl_pct")),
+        ) > 0
+    ]
+    similarity_values = [_safe_float(row.get("similarity"), default=None) for row in rows]
+    similarity_values = [value for value in similarity_values if value is not None]
+    final_score_values = [_safe_float(row.get("final_score"), default=None) for row in rows]
+    final_score_values = [value for value in final_score_values if value is not None]
+    return {
+        "total_count": total,
+        "settled_count": len(settled),
+        "aligned_count": len(aligned),
+        "positive_count": len(positive),
+        "avg_similarity": round(sum(similarity_values) / len(similarity_values), 4) if similarity_values else 0.0,
+        "avg_final_score": round(sum(final_score_values) / len(final_score_values), 4) if final_score_values else 0.0,
+    }
+
+
+def _build_memory_summary(rows):
+    total = len(rows)
+    retired = [row for row in rows if bool(row.get("retired"))]
+    active = [row for row in rows if not bool(row.get("retired"))]
+    high_confidence = [row for row in active if _safe_float(row.get("confidence_score")) >= 0.6]
+    revived = [row for row in rows if int(row.get("revive_count") or 0) > 0]
+    return {
+        "total_count": total,
+        "active_count": len(active),
+        "retired_count": len(retired),
+        "high_confidence_count": len(high_confidence),
+        "revived_count": len(revived),
+    }
+
+
+def _build_dashboard_snapshot():
+    now = datetime.now(UTC).replace(tzinfo=None)
+    snapshot = state_store.get_monitoring_snapshot(now=now)
+    snapshot["symbol_report"] = state_store.get_symbol_performance_report(hours=24, now=now)
+    snapshot["daily_report"] = state_store.get_daily_ledger_report(days=7, now=now)
+    snapshot["recent_trade_cases"] = state_store.get_recent_trade_cases(limit=10)
+    snapshot["active_trade_cases"] = state_store.get_all_active_trade_cases()
+    retrieval_rows = state_store.get_retrieval_evaluations_since(
+        now - timedelta(hours=24),
+        limit=400,
+    )
+    snapshot["recent_retrieval_evaluations"] = list(reversed(retrieval_rows[-12:]))
+    recent_memory = state_store.get_recent_long_term_memory(limit=12)
+    snapshot["recent_memory"] = recent_memory
+    snapshot["trade_case_summary"] = _build_trade_case_summary(
+        state_store.get_trade_cases_since(now - timedelta(hours=24), limit=500)
+    )
+    snapshot["retrieval_summary"] = _build_retrieval_summary(retrieval_rows)
+    snapshot["memory_summary"] = _build_memory_summary(recent_memory)
+    return snapshot
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -119,7 +214,7 @@ HTML_TEMPLATE = """
         <div class="header">
             <div>
                 <h1>Trader Control Room</h1>
-                <p>Operational health, replay controls, cost drag, symbol reports, and full audit drill-down for execution review.</p>
+                <p>Operational health, trade cases, retrieval outcomes, memory lifecycle, and full audit drill-down for execution review.</p>
             </div>
             <button class="refresh" onclick="window.location.reload();">Refresh</button>
         </div>
@@ -161,6 +256,21 @@ HTML_TEMPLATE = """
                 <p class="value" id="val-ledger-pnl">-</p>
                 <p class="sub">Net realized pnl aggregated from fill ledger rows.</p>
             </article>
+            <article class="card">
+                <p class="eyebrow">Trade Cases 24h</p>
+                <p class="value" id="val-trade-cases">-</p>
+                <p class="sub" id="val-trade-cases-meta">Closed - • Win rate -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Retrieval 24h</p>
+                <p class="value" id="val-retrieval">-</p>
+                <p class="sub" id="val-retrieval-meta">Settled - • Aligned -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Memory Health</p>
+                <p class="value" id="val-memory">-</p>
+                <p class="sub" id="val-memory-meta">High confidence - • Retired -</p>
+            </article>
         </section>
 
         <section class="layout">
@@ -186,6 +296,14 @@ HTML_TEMPLATE = """
                     <div id="memory-list">Loading...</div>
                 </article>
                 <article class="panel">
+                    <p class="eyebrow">Recent Trade Cases</p>
+                    <div id="trade-case-list">Loading...</div>
+                </article>
+                <article class="panel">
+                    <p class="eyebrow">Retrieval Evaluations</p>
+                    <div id="retrieval-list">Loading...</div>
+                </article>
+                <article class="panel">
                     <p class="eyebrow">Recent Fills</p>
                     <div id="fill-list">Loading...</div>
                 </article>
@@ -200,6 +318,14 @@ HTML_TEMPLATE = """
                 <article class="panel">
                     <p class="eyebrow">Recent Replays</p>
                     <div id="replay-list">Loading...</div>
+                </article>
+                <article class="panel">
+                    <p class="eyebrow">Recent Order States</p>
+                    <div id="order-state-list">Loading...</div>
+                </article>
+                <article class="panel">
+                    <p class="eyebrow">Recent Position States</p>
+                    <div id="position-state-list">Loading...</div>
                 </article>
                 <article class="panel">
                     <p class="eyebrow">Symbol Report</p>
@@ -219,7 +345,7 @@ HTML_TEMPLATE = """
                 <span class="sub" id="replay-status">Select an audit row to inspect and replay.</span>
             </div>
             <div id="audit-detail">
-                <p class="sub">Select an audit row to inspect stored request, AI response, ledger rows, execution summary, and synced fills.</p>
+                <p class="sub">Select an audit row to inspect stored request, AI response, trade case links, retrieval evaluations, ledger rows, execution summary, and synced fills.</p>
             </div>
         </section>
     </div>
@@ -254,6 +380,62 @@ HTML_TEMPLATE = """
                 .replaceAll('>', '&gt;')
                 .replaceAll('"', '&quot;')
                 .replaceAll("'", '&#39;');
+        }
+
+        function formatSigned(value, digits = 2) {
+            const numeric = Number(value || 0);
+            if (!Number.isFinite(numeric)) return '0';
+            return numeric > 0 ? `+${numeric.toFixed(digits)}` : numeric.toFixed(digits);
+        }
+
+        function summarizeReplayCounterfactual(run) {
+            const payload = parseJson((run || {}).payload, {});
+            const comparison = ((((payload || {}).retrieval_counterfactual || {}).with_vs_without_comparison) || {});
+            if (!Object.keys(comparison).length) {
+                return 'counterfactual n/a';
+            }
+            const better = comparison.with_retrieval_better === true
+                ? 'with retrieval better'
+                : comparison.without_retrieval_better === true
+                    ? 'without retrieval better'
+                    : 'no outcome verdict';
+            const utilityDelta = comparison.outcome_utility_delta;
+            const utilityText = utilityDelta === null || utilityDelta === undefined
+                ? 'utility n/a'
+                : `utility ${formatSigned(utilityDelta, 3)}`;
+            return `${better} • ${utilityText}`;
+        }
+
+        function renderTradeCaseSnapshot(caseRow) {
+            const realized = caseRow.realized_pnl;
+            const estimated = caseRow.estimated_pnl_pct;
+            const pnlLabel = realized !== null && realized !== undefined
+                ? `realized ${formatSigned(realized, 4)}`
+                : `est ${formatSigned(estimated, 2)}%`;
+            return `
+                <div class="fill-item">
+                    <strong>${caseRow.symbol || 'UNKNOWN'} • ${caseRow.status || 'unknown'} • ${caseRow.trade_case_id || '-'}</strong>
+                    <div class="fill-meta">
+                        ${pnlLabel} • hold ${caseRow.holding_minutes ?? 'n/a'}m • mfe ${caseRow.observed_mfe_pct ?? 'n/a'} • mae ${caseRow.observed_mae_pct ?? 'n/a'}
+                        <br>slippage ${caseRow.slippage_bps ?? 'n/a'} bps • failure ${caseRow.thesis_failure_reason || 'n/a'}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderRetrievalEvaluationRow(row) {
+            const outcome = row.outcome_status || (row.outcome_trade_case_id ? 'linked' : 'pending');
+            const pnl = row.outcome_realized_pnl;
+            const pnlLabel = pnl === null || pnl === undefined ? 'pnl n/a' : `pnl ${formatSigned(pnl, 4)}`;
+            return `
+                <div class="fill-item">
+                    <strong>${row.context_type || 'context'} • ${row.case_symbol || row.matched_symbol || 'UNKNOWN'} • rank ${row.rank_index ?? '-'}</strong>
+                    <div class="fill-meta">
+                        sim ${row.similarity ?? 'n/a'} • score ${row.final_score ?? 'n/a'} • source ${row.retrieval_source || 'n/a'} • aligned ${row.decision_symbol_aligned ? 'yes' : 'no'}
+                        <br>outcome ${outcome} • ${pnlLabel} • bands ${row.matched_band_count ?? 0}
+                    </div>
+                </div>
+            `;
         }
 
         function summarizeCandidateLessons(metrics) {
@@ -539,6 +721,9 @@ HTML_TEMPLATE = """
             const fills = detail.fills || [];
             const replayRuns = detail.replay_runs || [];
             const ledgerEntries = detail.ledger_entries || [];
+            const symbolJournalEntries = detail.symbol_journal_entries || [];
+            const tradeCases = detail.trade_cases || [];
+            const retrievalEvaluations = detail.retrieval_evaluations || [];
             const riskProfile = parseJson(detail.risk_profile, {});
             const orderStateTransitions = detail.order_state_transitions || [];
             const positionStateTransitions = detail.position_state_transitions || [];
@@ -568,6 +753,18 @@ HTML_TEMPLATE = """
                     <div class="detail-box">
                         <p class="eyebrow">Execution Summary</p>
                         <pre>${pretty(executionSummary)}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Symbol Journal Entries</p>
+                        <pre>${pretty(symbolJournalEntries)}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Linked Trade Cases</p>
+                        <pre>${pretty(tradeCases)}</pre>
+                    </div>
+                    <div class="detail-box">
+                        <p class="eyebrow">Retrieval Evaluations</p>
+                        <pre>${pretty(retrievalEvaluations)}</pre>
                     </div>
                     <div class="detail-box">
                         <p class="eyebrow">AI Raw Response</p>
@@ -678,6 +875,18 @@ HTML_TEMPLATE = """
                     `${semantic24h.failure_count || 0} / ${semantic7d.failure_count || 0} / ${semanticLatest50.failure_count || 0}`;
                 document.getElementById('val-fees').innerText = Number(data.fee_cost_24h || 0).toFixed(4);
                 document.getElementById('val-ledger-pnl').innerText = Number(data.ledger_net_pnl_24h || 0).toFixed(4);
+                const tradeCaseSummary = data.trade_case_summary || {};
+                const retrievalSummary = data.retrieval_summary || {};
+                const memorySummary = data.memory_summary || {};
+                document.getElementById('val-trade-cases').innerText = tradeCaseSummary.total_count || 0;
+                document.getElementById('val-trade-cases-meta').innerText =
+                    `Closed ${tradeCaseSummary.closed_count || 0} • Win rate ${(tradeCaseSummary.win_rate || 0).toFixed(1)}%`;
+                document.getElementById('val-retrieval').innerText = retrievalSummary.total_count || 0;
+                document.getElementById('val-retrieval-meta').innerText =
+                    `Settled ${retrievalSummary.settled_count || 0} • Aligned ${retrievalSummary.aligned_count || 0}`;
+                document.getElementById('val-memory').innerText = memorySummary.active_count || 0;
+                document.getElementById('val-memory-meta').innerText =
+                    `High confidence ${memorySummary.high_confidence_count || 0} • Retired ${memorySummary.retired_count || 0}`;
                 const rejectRate = data.total_audits_24h > 0
                     ? ((data.rejected_24h / data.total_audits_24h) * 100).toFixed(1) + '%'
                     : '0%';
@@ -700,7 +909,7 @@ HTML_TEMPLATE = """
                 const headerDescription = document.querySelector('.header p');
                 if (headerDescription) {
                     headerDescription.innerText =
-                        `Operational health, replay controls, cost drag, symbol reports, and full audit drill-down for execution review. Models: ${renderModelRouting(data.models)}`;
+                        `Operational health, trade cases, retrieval outcomes, memory lifecycle, and full audit drill-down for execution review. Models: ${renderModelRouting(data.models)}`;
                 }
 
                 const tbody = document.getElementById('audit-table-body');
@@ -730,21 +939,25 @@ HTML_TEMPLATE = """
                 }
 
                 renderList('memory-list', 'No memory rules saved yet.', data.recent_memory, item => {
-                    const metrics = item.metrics || {};
-                    const badgeClass = metrics.status === 'rule' ? 'ok' : 'warn';
+                    const badgeClass = item.retired ? 'bad' : ((item.confidence_score || 0) >= 0.6 ? 'ok' : 'warn');
                     const applyWhen = item.apply_when || {};
                     const ignoreWhen = item.ignore_when || [];
                     return `
                         <div class="memory-item">
-                            <span class="badge ${badgeClass}">${metrics.status || 'unknown'}</span>
+                            <span class="badge ${badgeClass}">${item.lifecycle_status || item.status || 'unknown'}</span>
                             <strong>${item.rule}</strong>
                             <div class="memory-meta">
-                                support ${metrics.support || 0} • regime ${metrics.regime || 'general'} • apply ${((applyWhen.trend || []).join('/') || 'n/a')} • ignore ${ignoreWhen[0] || 'n/a'}
-                                <br>candidates ${summarizeCandidateLessons(metrics)}
+                                support ${item.support || 0} • confidence ${(item.confidence_score || 0).toFixed(2)} • validity ${(item.validity_score || 0).toFixed(2)}
+                                <br>regime ${item.regime || 'general'} • apply ${((applyWhen.trend || []).join('/') || 'n/a')} • ignore ${ignoreWhen[0] || 'n/a'}
+                                <br>merge ${item.merge_count || 0} • revive ${item.revive_count || 0} • retirement ${item.retirement_reason || 'n/a'}
                             </div>
                         </div>
                     `;
                 });
+
+                renderList('trade-case-list', 'No trade cases saved yet.', data.recent_trade_cases || [], renderTradeCaseSnapshot);
+
+                renderList('retrieval-list', 'No retrieval evaluations saved yet.', data.recent_retrieval_evaluations || [], renderRetrievalEvaluationRow);
 
                 renderList('fill-list', 'No synced fills yet.', data.recent_fills, fill => `
                     <div class="fill-item">
@@ -780,6 +993,25 @@ HTML_TEMPLATE = """
                         <div class="fill-meta">
                             changed ${run.decision_changed ? 'yes' : 'no'} • side ${run.side_changed ? 'changed' : 'same'} • size ${run.size_delta || 0} • confidence ${run.confidence_delta || 0}
                             <br>${summarizeEvidenceDiff(run)}
+                            <br>${summarizeReplayCounterfactual(run)}
+                        </div>
+                    </div>
+                `);
+
+                renderList('order-state-list', 'No order state transitions yet.', data.recent_order_states || [], row => `
+                    <div class="fill-item">
+                        <strong>${row.symbol || 'UNKNOWN'} • ${row.from_state || 'unknown'} -> ${row.to_state || 'unknown'}</strong>
+                        <div class="fill-meta">
+                            ${row.event_type || 'event'} • client ${row.client_order_id || '-'} • exchange ${row.exchange_order_id || '-'}
+                        </div>
+                    </div>
+                `);
+
+                renderList('position-state-list', 'No position state transitions yet.', data.recent_position_states || [], row => `
+                    <div class="fill-item">
+                        <strong>${row.symbol || 'UNKNOWN'} • ${row.from_state || 'unknown'} -> ${row.to_state || 'unknown'}</strong>
+                        <div class="fill-meta">
+                            ${row.event_type || 'event'} • audit ${row.audit_log_id || '-'}
                         </div>
                     </div>
                 `);
@@ -816,9 +1048,7 @@ def index():
 @app.route("/api/stats")
 def api_stats():
     try:
-        snapshot = state_store.get_monitoring_snapshot()
-        snapshot["symbol_report"] = state_store.get_symbol_performance_report(hours=24)
-        snapshot["daily_report"] = state_store.get_daily_ledger_report(days=7)
+        snapshot = _build_dashboard_snapshot()
         default_model = (os.getenv("GEMINI_DEFAULT_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip())
         trigger_model = (os.getenv("GEMINI_TRIGGER_MODEL", "").strip() or default_model)
         memory_model = (

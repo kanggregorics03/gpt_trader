@@ -29,6 +29,7 @@ from utils.logger import log
 load_dotenv()
 
 class TradingOrchestrator:
+    ALERT_STATE_UNSET = object()
     DEFAULT_EXECUTION_GUARDS = {
         "loop_lock_ttl_seconds": 240,
         "decision_cooldown_minutes": 10,
@@ -348,6 +349,192 @@ class TradingOrchestrator:
         self.last_daily_batch_date = None
         self.last_trade_case_snapshot_at = 0.0
         self.last_similar_case_matches = []
+        self._daily_kill_switch_active = None
+        self._drawdown_mode_active = None
+        self._cooldown_extension_signature = self.ALERT_STATE_UNSET
+        self._public_ws_stale = None
+        self._private_ws_stale = None
+
+    def _is_daily_kill_switch_active(self, risk_state: dict | None) -> bool:
+        risk_limits = self.risk_engine.policy.get("risk_limits", {})
+        daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
+        if daily_max_loss_pct <= 0:
+            return False
+        daily_pnl_pct = float((risk_state or {}).get("daily_pnl_pct", 0.0) or 0.0)
+        return daily_pnl_pct <= -abs(daily_max_loss_pct)
+
+    def _is_daily_kill_switch_reason(self, reason: str) -> bool:
+        return "Kill switch active: daily pnl" in str(reason or "")
+
+    def _build_cooldown_extension_signature(self, risk_state: dict | None):
+        risk_state = risk_state or {}
+        if not bool(risk_state.get("cooldown_active")):
+            return None
+        risk_limits = self.risk_engine.policy.get("risk_limits", {})
+        dynamic_config = risk_limits.get("dynamic_cooldown", {}) or {}
+        base_minutes = int(dynamic_config.get("base_minutes", risk_limits.get("cooldown_minutes", 0)) or 0)
+        effective_minutes = int(risk_state.get("cooldown_minutes_effective", 0) or 0)
+        if effective_minutes <= max(0, base_minutes):
+            return None
+        return (
+            base_minutes,
+            effective_minutes,
+            tuple(str(component) for component in (risk_state.get("cooldown_components") or [])),
+            int(risk_state.get("consecutive_losses", 0) or 0),
+            str(risk_state.get("dominant_failure_reason") or "").strip(),
+            round(float(risk_state.get("last_loss_estimated_pnl_pct", 0.0) or 0.0), 4),
+        )
+
+    def _maybe_alert_risk_state_transitions(self, risk_state: dict | None):
+        risk_state = risk_state or {}
+        daily_kill_switch_active = self._is_daily_kill_switch_active(risk_state)
+        if daily_kill_switch_active and self._daily_kill_switch_active is not True:
+            daily_max_loss_pct = abs(
+                float(self.risk_engine.policy.get("risk_limits", {}).get("daily_max_loss_pct", 0.0) or 0.0)
+            )
+            daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+            self.alert_manager.send(
+                "Daily Kill Switch Activated",
+                (
+                    f"Daily pnl {daily_pnl_pct:.2f}% breached limit {-daily_max_loss_pct:.2f}%. "
+                    "New entries are blocked until the daily reset."
+                ),
+                level="error",
+            )
+        self._daily_kill_switch_active = daily_kill_switch_active
+
+        drawdown_active = bool(risk_state.get("drawdown_active"))
+        drawdown_activate_pct = risk_state.get("drawdown_activate_pct")
+        daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+        if drawdown_active and self._drawdown_mode_active is not True:
+            threshold_text = ""
+            if drawdown_activate_pct is not None:
+                threshold_text = f" (threshold {-abs(float(drawdown_activate_pct)):.2f}%)"
+            self.alert_manager.send(
+                "Drawdown Mode Entered",
+                f"Daily pnl {daily_pnl_pct:.2f}% entered drawdown mode{threshold_text}.",
+                level="warning",
+            )
+        elif not drawdown_active and self._drawdown_mode_active is True:
+            self.alert_manager.send(
+                "Drawdown Mode Cleared",
+                f"Daily pnl recovered to {daily_pnl_pct:.2f}%. Drawdown controls are cleared.",
+                level="info",
+            )
+        self._drawdown_mode_active = drawdown_active
+
+        cooldown_signature = self._build_cooldown_extension_signature(risk_state)
+        if cooldown_signature is not None and self._cooldown_extension_signature != cooldown_signature:
+            base_minutes, effective_minutes, components, losses, pattern_reason, last_loss_pct = cooldown_signature
+            detail_parts = [f"{base_minutes}m -> {effective_minutes}m"]
+            remaining_minutes = int(risk_state.get("cooldown_remaining_minutes", 0) or 0)
+            if remaining_minutes > 0:
+                detail_parts.append(f"{remaining_minutes}m remaining")
+            if losses > 0:
+                detail_parts.append(f"{losses} consecutive loss(es)")
+            if components:
+                detail_parts.append(f"reasons={', '.join(components)}")
+            if pattern_reason:
+                detail_parts.append(f"pattern={pattern_reason}")
+            if last_loss_pct != 0.0:
+                detail_parts.append(f"last_loss={last_loss_pct:.2f}%")
+            self.alert_manager.send(
+                "Cooldown Extended",
+                "Dynamic cooldown extended: " + "; ".join(detail_parts) + ".",
+                level="warning",
+            )
+        self._cooldown_extension_signature = cooldown_signature
+
+    def _get_public_ws_state(self):
+        feed = getattr(self, "public_feed", None)
+        if feed is None or not hasattr(feed, "get_diagnostics"):
+            return None
+        diagnostics = feed.get_diagnostics()
+        if not bool(diagnostics.get("started")) or not bool(diagnostics.get("available", True)):
+            return None
+        stale_after_ms = int(diagnostics.get("ws_stale_after_ms", 0) or 0)
+        last_message_age_ms = diagnostics.get("last_message_age_ms")
+        stale_symbols = [str(symbol) for symbol in (diagnostics.get("stale_symbols") or []) if symbol]
+        is_stale = bool(stale_symbols)
+        if not is_stale and last_message_age_ms is not None and stale_after_ms > 0:
+            is_stale = int(last_message_age_ms) > stale_after_ms
+        return {
+            "is_stale": is_stale,
+            "last_message_age_ms": last_message_age_ms,
+            "stale_after_ms": stale_after_ms,
+            "stale_symbols": stale_symbols,
+        }
+
+    def _get_private_ws_state(self):
+        feed = getattr(self, "private_account_feed", None)
+        if feed is None or not hasattr(feed, "get_diagnostics"):
+            return None
+        diagnostics = feed.get_diagnostics()
+        if not bool(diagnostics.get("started")) or not bool(diagnostics.get("available", True)):
+            return None
+        return {
+            "health_status": str(diagnostics.get("health_status") or "").lower(),
+            "last_ws_message_age_ms": diagnostics.get("last_ws_message_age_ms"),
+            "last_private_event_age_ms": diagnostics.get("last_private_event_age_ms"),
+            "stale_after_ms": int(diagnostics.get("ws_stale_after_ms", 0) or 0),
+        }
+
+    def _maybe_alert_websocket_transitions(self):
+        public_state = self._get_public_ws_state()
+        if public_state is not None:
+            if public_state["is_stale"] and self._public_ws_stale is not True:
+                age_seconds = round(float(public_state.get("last_message_age_ms") or 0.0) / 1000.0, 1)
+                threshold_seconds = round(float(public_state.get("stale_after_ms") or 0.0) / 1000.0, 1)
+                stale_symbols = public_state.get("stale_symbols") or []
+                symbol_suffix = (
+                    f" Stale symbols: {', '.join(stale_symbols)}."
+                    if stale_symbols
+                    else ""
+                )
+                self.alert_manager.send(
+                    "WebSocket Stale",
+                    (
+                        f"Public market WebSocket exceeded freshness threshold "
+                        f"({age_seconds}s > {threshold_seconds}s).{symbol_suffix}"
+                    ),
+                    level="warning",
+                )
+            elif not public_state["is_stale"] and self._public_ws_stale is True:
+                age_seconds = round(float(public_state.get("last_message_age_ms") or 0.0) / 1000.0, 1)
+                self.alert_manager.send(
+                    "WebSocket Recovered",
+                    f"Public market WebSocket recovered. Latest message age is {age_seconds}s.",
+                    level="info",
+                )
+            self._public_ws_stale = bool(public_state["is_stale"])
+
+        private_state = self._get_private_ws_state()
+        if private_state is not None:
+            is_stale = private_state["health_status"] == "stale"
+            if is_stale and self._private_ws_stale is not True:
+                ws_age_seconds = round(float(private_state.get("last_ws_message_age_ms") or 0.0) / 1000.0, 1)
+                event_age_seconds = round(float(private_state.get("last_private_event_age_ms") or 0.0) / 1000.0, 1)
+                threshold_seconds = round(float(private_state.get("stale_after_ms") or 0.0) / 1000.0, 1)
+                self.alert_manager.send(
+                    "WebSocket Stale",
+                    (
+                        "Private account WebSocket entered stale state "
+                        f"(ws_age={ws_age_seconds}s, event_age={event_age_seconds}s, threshold={threshold_seconds}s)."
+                    ),
+                    level="warning",
+                )
+            elif (
+                not is_stale
+                and self._private_ws_stale is True
+                and private_state["health_status"] == "healthy"
+            ):
+                ws_age_seconds = round(float(private_state.get("last_ws_message_age_ms") or 0.0) / 1000.0, 1)
+                self.alert_manager.send(
+                    "WebSocket Recovered",
+                    f"Private account WebSocket recovered to healthy state. Latest message age is {ws_age_seconds}s.",
+                    level="info",
+                )
+            self._private_ws_stale = is_stale
 
     def _loop_minutes_for_mode(self, mode: str) -> int:
         mapping = {
@@ -2228,23 +2415,54 @@ class TradingOrchestrator:
     def _build_skip_rationale_items(self, skip_reason: str, risk_state, market_snapshots, risk_profile):
         if skip_reason == "cooldown_active":
             remaining = float(risk_state.get("cooldown_remaining_minutes", 0) or 0.0)
+            effective_minutes = float(risk_state.get("cooldown_minutes_effective", 0) or 0.0)
+            failure_pattern_score = float(risk_state.get("failure_pattern_score", 0.0) or 0.0)
+            dominant_failure_reason = str(risk_state.get("dominant_failure_reason") or "").strip()
+            evidence = [
+                EvidenceItem(
+                    signal="cooldown_remaining_minutes",
+                    timeframe="risk",
+                    operator="gt",
+                    observed_value=remaining,
+                    threshold=0.0,
+                    units="minutes",
+                    source="risk_state.cooldown_remaining_minutes",
+                )
+            ]
+            if effective_minutes > 0:
+                evidence.append(
+                    EvidenceItem(
+                        signal="cooldown_minutes_effective",
+                        timeframe="risk",
+                        operator="gte",
+                        observed_value=effective_minutes,
+                        threshold=effective_minutes,
+                        units="minutes",
+                        source="risk_state.cooldown_minutes_effective",
+                    )
+                )
+            if failure_pattern_score > 0:
+                evidence.append(
+                    EvidenceItem(
+                        signal="failure_pattern_score",
+                        timeframe="risk",
+                        operator="gt",
+                        observed_value=failure_pattern_score,
+                        threshold=0.0,
+                        units="score",
+                        source="risk_state.failure_pattern_score",
+                    )
+                )
+            why_it_matters = "The strategy is in mandatory cooldown after recent losses."
+            if dominant_failure_reason:
+                why_it_matters += f" Repeated failure pattern: {dominant_failure_reason}."
             return [
                 RationaleItem(
                     summary="Cooldown blocks new entries.",
-                    why_it_matters="The strategy is in mandatory cooldown after recent losses.",
-                    trade_implication="Keep the portfolio flat until cooldown expires.",
+                    why_it_matters=why_it_matters,
+                    trade_implication="Keep the portfolio flat until cooldown expires and risk pressure normalizes.",
                     failure_mode="Cooldown expires and no other blocking risk state remains.",
-                    evidence=[
-                        EvidenceItem(
-                            signal="cooldown_remaining_minutes",
-                            timeframe="risk",
-                            operator="gt",
-                            observed_value=remaining,
-                            threshold=0.0,
-                            units="minutes",
-                            source="risk_state.cooldown_remaining_minutes",
-                        )
-                    ],
+                    evidence=evidence,
                 )
             ]
         if skip_reason.startswith("risk_profile_"):
@@ -2349,6 +2567,8 @@ class TradingOrchestrator:
             is_trigger_mode = snapshot_bundle.is_trigger_mode
             risk_mode = snapshot_bundle.risk_mode
             risk_profile = snapshot_bundle.risk_profile
+            self._maybe_alert_risk_state_transitions(risk_state)
+            self._maybe_alert_websocket_transitions()
             effective_risk_profile = self._build_effective_risk_profile(
                 loop_mode,
                 account_state=account_state,
@@ -2482,6 +2702,8 @@ class TradingOrchestrator:
             entry_size_cap_summary = self.risk_engine.get_effective_max_order_notional_pct_balance(
                 intent=intent,
                 active_profile=effective_risk_profile,
+                risk_state=risk_state,
+                market_snapshots=market_snapshots,
             )
 
             # 5. Execution
@@ -2652,10 +2874,13 @@ class TradingOrchestrator:
             if not is_approved:
                 log.warning(f"Risk Rejected: {reason}")
                 if (
-                    "Kill switch" in reason
-                    or "Cooldown" in reason
-                    or "unresolved order lifecycle" in reason.lower()
-                    or "decision cooldown active" in reason.lower()
+                    not self._is_daily_kill_switch_reason(reason)
+                    and (
+                        "Kill switch" in reason
+                        or "Cooldown" in reason
+                        or "unresolved order lifecycle" in reason.lower()
+                        or "decision cooldown active" in reason.lower()
+                    )
                 ):
                     self.alert_manager.send(
                         "Risk Engine Blocked Trade",
@@ -2919,8 +3144,10 @@ class TradingOrchestrator:
             now_epoch = time.time()
             self._run_due_maintenance_tasks(now_epoch)
             self._sample_trade_case_paths_if_due(now_epoch)
+            self._maybe_alert_websocket_transitions()
             if now_epoch >= next_snapshot_at:
-                self.snapshot_service.materialize(now_epoch=now_epoch)
+                snapshot_bundle = self.snapshot_service.materialize(now_epoch=now_epoch)
+                self._maybe_alert_risk_state_transitions(snapshot_bundle.risk_state)
                 next_snapshot_at = self.snapshot_service.next_materialization_epoch(now_epoch)
             if now_epoch >= next_cycle_at:
                 current_mode = self.active_loop_mode

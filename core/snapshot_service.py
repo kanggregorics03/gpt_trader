@@ -70,6 +70,7 @@ class SnapshotService:
     def _build_risk_state(self, account_state: AccountState) -> Dict[str, Any]:
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         cooldown_minutes = risk_limits.get("cooldown_minutes", 0)
+        cooldown_config = risk_limits.get("dynamic_cooldown", {})
         drawdown_activate_pct = risk_limits.get("drawdown_activate_pct")
         if drawdown_activate_pct is None:
             daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
@@ -77,6 +78,7 @@ class SnapshotService:
         return self.state_store.get_risk_state(
             current_balance=account_state.total_balance,
             cooldown_minutes=cooldown_minutes,
+            cooldown_config=cooldown_config,
             drawdown_activate_pct=drawdown_activate_pct,
         )
 

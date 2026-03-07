@@ -221,7 +221,8 @@ gpt_trader/
 - `max_order_notional_pct_balance`
 - `allowed_actions`
 
-즉, 같은 `BUY`라도 지금이 `normal`인지 `drawdown`인지에 따라 허용 여부와 크기 제한이 달라질 수 있다.
+즉, 같은 `BUY`라도 지금이 `normal`인지 `drawdown`인지에 따라 허용 여부와 크기 제한이 달라질 수 있다.  
+최근 구현에서는 `drawdown`이 신규 진입을 완전히 막지는 않되, `entry_size_multiplier`, `confidence_cap`, `failure_pattern_score`를 이용해 size cap을 한 번 더 줄인다.
 
 ### 4. 단일 adaptive loop와 cadence 전환
 
@@ -326,7 +327,7 @@ gpt_trader/
 즉, 리스크 엔진이 나중에 막기만 하는 구조가 아니라, 애초에 더 보수적인 제안을 하도록 유도한다.
 
 둘째, AI는 `risk_state`의 구체 수치도 함께 받는다.  
-즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간까지 보고 위험도를 해석할 수 있다.
+즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간, 동적 쿨다운 길이, 반복 실패 패턴 점수까지 보고 위험도를 해석할 수 있다.
 
 셋째, 시장 스냅샷 안에서 `opportunity_trigger_reasons`와 `risk_trigger_reasons`를 분리해 전달한다.  
 즉, “시장이 움직였다”와 “지금 거래 품질이 나쁘다”를 같은 신호로 취급하지 않는다.
@@ -497,6 +498,10 @@ risk_limits:
   drawdown_activate_pct: 1.5
   max_consecutive_losses: 3
   cooldown_minutes: 30
+  dynamic_cooldown:
+    enabled: true
+    base_minutes: 15
+    repeated_failure_add_minutes: 15
   max_open_positions: 2
   mode_profiles:
     normal:
@@ -514,6 +519,8 @@ risk_limits:
     drawdown:
       max_open_positions: 1
       max_order_notional_pct_balance: 20
+      entry_size_multiplier: 0.75
+      confidence_cap: 0.55
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
 
 intervals:
@@ -548,6 +555,8 @@ context_budget:
   - 변동성 이벤트 구간에서는 주문 후보 총 노출을 잔고의 35% 이내로 제한한다.
 - `cooldown.allowed_actions`
   - 쿨다운 구간에서는 신규 진입 없이 축소/청산 위주 행동만 허용할 수 있다.
+- `dynamic_cooldown`
+  - 작은 손실 1회는 짧게, 큰 손실이나 반복 실패 패턴은 더 길게 쉬도록 쿨다운 시간을 자동으로 늘린다.
 - `execution_guards`
   - 루프 전역 락, 심볼별 entry mutex, 반복 판단 쿨다운, unknown 주문 상태 감시/복구 주기를 정책에서 조정한다.
 - `context_budget`

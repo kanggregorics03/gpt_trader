@@ -218,6 +218,52 @@ class TestRiskEngine(unittest.TestCase):
         self.assertEqual(mode, "drawdown")
         self.assertEqual(profile["max_open_positions"], 1)
 
+    def test_drawdown_profile_reduces_entry_size_for_confidence_and_failure_pattern(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.006)],
+            rationale=["Drawdown recovery attempt"],
+            risk_notes=[],
+            confidence=0.8,
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            risk_state={"drawdown_active": True, "failure_pattern_score": 0.8},
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("candidate size", reason.lower())
+        self.assertIn("profile_adjustments", reason.lower())
+
+    def test_drawdown_size_cap_summary_exposes_profile_adjustments(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.002)],
+            rationale=["Recovery entry"],
+            risk_notes=[],
+            confidence=0.78,
+        )
+        profile = self.engine.get_active_risk_profile(
+            risk_state={"drawdown_active": True},
+            is_trigger_mode=False,
+        )
+
+        summary = self.engine.get_effective_max_order_notional_pct_balance(
+            intent=intent,
+            active_profile=profile,
+            risk_state={"failure_pattern_score": 0.75},
+        )
+
+        self.assertTrue(summary["adjusted"])
+        self.assertLess(summary["effective_cap_pct"], summary["base_cap_pct"])
+        self.assertIn("mode_entry_size_multiplier", summary["profile_issues"])
+        self.assertIn("confidence_cap:0.55", summary["profile_issues"])
+        self.assertIn("failure_pattern_score:0.75", summary["profile_issues"])
+
     def test_exit_is_still_safe_during_kill_switch(self):
         intent = TradeIntent(
             decision="EXIT",
