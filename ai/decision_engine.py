@@ -4,11 +4,16 @@ import json
 import os
 from typing import Any, Optional
 
-from google import genai
-from google.genai import types
 from loguru import logger
 from pydantic import ValidationError
 
+from ai.llm_provider import (
+    create_llm_provider,
+    normalize_provider_name,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_decision_models,
+)
 from core.intent_validator import StructuredIntentValidator
 from core.models import DecisionRequest, LongTermMemoryRecord, TradeIntent
 
@@ -25,13 +30,24 @@ class DecisionResult:
 class DecisionEngine:
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         cache_store: Optional[object] = None,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
         default_model: Optional[str] = None,
         trigger_model: Optional[str] = None,
     ):
-        self.client = genai.Client(api_key=api_key)
-        self.flash_model, self.pro_model = self._resolve_models(
+        self.provider_name = normalize_provider_name(provider)
+        resolved_api_key = resolve_api_key(self.provider_name, explicit_api_key=api_key)
+        resolved_base_url = resolve_base_url(self.provider_name, explicit_base_url=base_url)
+        self.llm_provider = create_llm_provider(
+            self.provider_name,
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
+        )
+        self.client = getattr(self.llm_provider, "client", None)
+        self.flash_model, self.pro_model = resolve_decision_models(
+            self.provider_name,
             default_model=default_model,
             trigger_model=trigger_model,
         )
@@ -43,19 +59,12 @@ class DecisionEngine:
         default_model: Optional[str] = None,
         trigger_model: Optional[str] = None,
     ) -> tuple[str, str]:
-        legacy_model = os.getenv("GEMINI_MODEL", "").strip()
-        resolved_default = (
-            (default_model or "").strip()
-            or (os.getenv("GEMINI_DEFAULT_MODEL", "").strip())
-            or legacy_model
-            or "gemini-3.0-pro"
+        provider_name = getattr(self, "provider_name", normalize_provider_name())
+        return resolve_decision_models(
+            provider_name,
+            default_model=default_model,
+            trigger_model=trigger_model,
         )
-        resolved_trigger = (
-            (trigger_model or "").strip()
-            or (os.getenv("GEMINI_TRIGGER_MODEL", "").strip())
-            or resolved_default
-        )
-        return resolved_default, resolved_trigger
 
     def _compact_json(self, payload) -> str:
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
@@ -404,7 +413,10 @@ OUTPUT EXAMPLE
         input_hash = self._build_candidate_input_hash(request)
         model_to_use = self.pro_model if request.is_trigger_mode else self.flash_model
         prompt_hash = self._build_prompt_cache_key(prompt, model_to_use)
-        logger.debug(f"Prompt generated for Gemini. Using model: {model_to_use}, input_hash={input_hash}")
+        logger.debug(
+            f"Prompt generated for {getattr(self, 'provider_name', 'unknown')}. "
+            f"Using model: {model_to_use}, input_hash={input_hash}"
+        )
 
         if self.cache_store is not None:
             cached = self.cache_store.get_cached_decision(prompt_hash)
@@ -421,21 +433,22 @@ OUTPUT EXAMPLE
                 )
         
         try:
-            response = self.client.models.generate_content(
-                model=model_to_use,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=TradeIntent,
-                    temperature=0.2, # Low temp for consistency
-                ),
+            provider = getattr(self, "llm_provider", None)
+            if provider is None:
+                raise RuntimeError("DecisionEngine is missing llm_provider.")
+            response = provider.generate_json(
+                prompt=prompt,
+                model_name=model_to_use,
+                schema=TradeIntent,
+                temperature=0.2,
             )
             raw_text = response.text
             intent = TradeIntent.model_validate_json(raw_text)
             validation_result = self.intent_validator.validate(request, intent)
             if not validation_result.is_valid:
                 logger.warning(
-                    "Gemini structured rationale validation failed: {}",
+                    "{} structured rationale validation failed: {}",
+                    getattr(self, "provider_name", "unknown"),
                     ", ".join(validation_result.issues),
                 )
                 return DecisionResult(
@@ -458,7 +471,7 @@ OUTPUT EXAMPLE
                         "issues": validation_result.issues,
                     },
                 )
-            usage_metadata = self._extract_usage_metadata(response)
+            usage_metadata = dict(response.usage_metadata or {})
             if self.cache_store is not None:
                 self.cache_store.save_cached_decision(
                     prompt_hash=prompt_hash,
@@ -469,11 +482,15 @@ OUTPUT EXAMPLE
                 )
             if usage_metadata:
                 logger.info(
-                    f"Gemini Decision: {intent.decision} (confidence: {intent.confidence}, "
+                    f"{getattr(self, 'provider_name', 'AI').upper()} Decision: "
+                    f"{intent.decision} (confidence: {intent.confidence}, "
                     f"tokens={usage_metadata.get('total_token_count', 'unknown')})"
                 )
             else:
-                logger.info(f"Gemini Decision: {intent.decision} (confidence: {intent.confidence})")
+                logger.info(
+                    f"{getattr(self, 'provider_name', 'AI').upper()} Decision: "
+                    f"{intent.decision} (confidence: {intent.confidence})"
+                )
             return DecisionResult(
                 intent=intent,
                 prompt=prompt,
@@ -483,9 +500,11 @@ OUTPUT EXAMPLE
                 cache_hit=False,
                 usage_metadata=usage_metadata,
             )
-            
+             
         except ValidationError as ve:
-            logger.error(f"Gemini output failed validation: {ve}")
+            logger.error(
+                f"{getattr(self, 'provider_name', 'AI').upper()} output failed validation: {ve}"
+            )
             # Fallback safe intent
             return DecisionResult(
                 intent=TradeIntent(
@@ -502,5 +521,7 @@ OUTPUT EXAMPLE
                 usage_metadata={"validation_error": True, "model_name": model_to_use},
             )
         except Exception as e:
-            logger.error(f"Failed to call Gemini API: {e}")
+            logger.error(
+                f"Failed to call {getattr(self, 'provider_name', 'AI').upper()} API: {e}"
+            )
             raise

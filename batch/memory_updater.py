@@ -5,11 +5,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Literal
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from ai.llm_provider import (
+    create_llm_provider,
+    normalize_provider_name,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_memory_model_name,
+)
 from core.models import MemoryCondition
 from db.state_store import StateStore
 
@@ -37,21 +42,40 @@ class MemoryUpdater:
     def __init__(self, db_path: str = "data/gpt_trader.db"):
         self.db_path = db_path
         self.state_store = StateStore(db_path)
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            logger.error("Missing GEMINI_API_KEY")
+        self.provider_name = normalize_provider_name(os.getenv("MEMORY_PROVIDER"))
+        self.shared_ai_api_key = os.getenv("AI_API_KEY")
+        self.shared_ai_base_url = os.getenv("AI_BASE_URL")
+        try:
+            self.api_key = resolve_api_key(
+                self.provider_name,
+                explicit_api_key=os.getenv("MEMORY_API_KEY"),
+                shared_api_key=self.shared_ai_api_key,
+            )
+            self.base_url = resolve_base_url(
+                self.provider_name,
+                explicit_base_url=os.getenv("MEMORY_BASE_URL"),
+                shared_base_url=self.shared_ai_base_url,
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
             raise SystemExit(1)
-        self.client = genai.Client(api_key=self.api_key)
+        self.llm_provider = create_llm_provider(
+            self.provider_name,
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+        self.client = getattr(self.llm_provider, "client", None)
         self.model_name = self._resolve_model_name()
 
     def _resolve_model_name(self) -> str:
-        legacy_model = os.getenv("GEMINI_MODEL", "").strip()
-        return (
-            os.getenv("GEMINI_MEMORY_MODEL", "").strip()
-            or os.getenv("GEMINI_TRIGGER_MODEL", "").strip()
-            or os.getenv("GEMINI_DEFAULT_MODEL", "").strip()
-            or legacy_model
-            or "gemini-3.0-pro"
+        provider_name = getattr(
+            self,
+            "provider_name",
+            normalize_provider_name(os.getenv("MEMORY_PROVIDER")),
+        )
+        return resolve_memory_model_name(
+            provider_name,
+            explicit_model=os.getenv("MEMORY_MODEL"),
         )
 
     def _fetch_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
@@ -1681,14 +1705,14 @@ Computed statistics:
             for item in stats_package.get("candidate_lessons") or []
         ]
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=self._create_prompt(stats_package),
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=list[MemoryLesson],
-                    temperature=0.2,
-                ),
+            provider = getattr(self, "llm_provider", None)
+            if provider is None:
+                raise RuntimeError("MemoryUpdater is missing llm_provider.")
+            response = provider.generate_json(
+                prompt=self._create_prompt(stats_package),
+                model_name=self.model_name,
+                schema=list[MemoryLesson],
+                temperature=0.2,
             )
             raw_text = response.text
             lessons = json.loads(raw_text)
@@ -1697,7 +1721,9 @@ Computed statistics:
             generated_lessons = [MemoryLesson.model_validate(item) for item in lessons]
             return self._merge_candidate_lessons(candidate_lessons, generated_lessons)
         except Exception as e:
-            logger.error(f"Gemini failed to extract lessons: {e}")
+            logger.error(
+                f"{getattr(self, 'provider_name', 'AI').upper()} failed to extract lessons: {e}"
+            )
             return candidate_lessons
 
     def _merge_candidate_lessons(

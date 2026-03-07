@@ -1,5 +1,6 @@
 import unittest
 import time
+from unittest.mock import patch
 
 from main import TradingOrchestrator
 from core.models import AccountState, MarketSnapshot, PositionState
@@ -265,6 +266,20 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "open_interest": 45000,
             },
         )
+
+    def test_validate_ai_configuration_uses_gemini_default_and_requires_provider_key(self):
+        orchestrator = TradingOrchestrator.__new__(TradingOrchestrator)
+        orchestrator.ai_provider = "gemini"
+        orchestrator.ai_api_key = None
+        orchestrator.ai_default_model = "gemini-2.5-flash"
+        orchestrator.ai_trigger_model = "gemini-2.5-pro"
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "gemini-key"}, clear=False):
+            orchestrator._validate_ai_configuration()
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "", "AI_API_KEY": ""}, clear=False):
+            with self.assertRaises(ValueError):
+                orchestrator._validate_ai_configuration()
 
     def test_select_recent_journal_context_prioritizes_relevant_rows_and_compacts(self):
         orchestrator = self._make_orchestrator()

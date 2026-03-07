@@ -382,6 +382,7 @@ class TestDecisionEngine(unittest.TestCase):
 
     def test_resolve_models_uses_explicit_models_first(self):
         engine = DecisionEngine.__new__(DecisionEngine)
+        engine.provider_name = "gemini"
 
         default_model, trigger_model = engine._resolve_models(
             default_model="gemini-2.5-flash",
@@ -393,10 +394,13 @@ class TestDecisionEngine(unittest.TestCase):
 
     def test_resolve_models_uses_environment_and_legacy_fallback(self):
         engine = DecisionEngine.__new__(DecisionEngine)
+        engine.provider_name = "gemini"
 
         with patch.dict(
             "os.environ",
             {
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
                 "GEMINI_DEFAULT_MODEL": "gemini-2.5-flash",
                 "GEMINI_TRIGGER_MODEL": "gemini-2.5-pro",
                 "GEMINI_MODEL": "gemini-legacy-model",
@@ -410,6 +414,8 @@ class TestDecisionEngine(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
                 "GEMINI_DEFAULT_MODEL": "",
                 "GEMINI_TRIGGER_MODEL": "",
                 "GEMINI_MODEL": "gemini-legacy-model",
@@ -419,6 +425,24 @@ class TestDecisionEngine(unittest.TestCase):
             default_model, trigger_model = engine._resolve_models()
             self.assertEqual(default_model, "gemini-legacy-model")
             self.assertEqual(trigger_model, "gemini-legacy-model")
+
+    def test_resolve_models_supports_openai_style_envs(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        engine.provider_name = "openai"
+
+        with patch.dict(
+            "os.environ",
+            {
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
+                "OPENAI_DEFAULT_MODEL": "gpt-4.1-mini",
+                "OPENAI_TRIGGER_MODEL": "gpt-4.1",
+            },
+            clear=False,
+        ):
+            default_model, trigger_model = engine._resolve_models()
+            self.assertEqual(default_model, "gpt-4.1-mini")
+            self.assertEqual(trigger_model, "gpt-4.1")
 
     def test_extract_usage_metadata_from_response_object(self):
         class Usage:

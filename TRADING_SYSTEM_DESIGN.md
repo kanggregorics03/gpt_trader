@@ -1,9 +1,9 @@
-Bybit 기반 Gemini API 연동 자동매매 시스템 종합 기획서
+Bybit 기반 멀티 LLM provider 연동 자동매매 시스템 종합 기획서
 1) 목표
 
 Bybit에서 자동매매를 수행하는 시스템을 구축한다.
 
-Gemini API는 시장/계좌 상태를 바탕으로 “주문 후보(JSON)”를 생성하는 역할만 맡고,
+LLM provider는 시장/계좌 상태를 바탕으로 “주문 후보(JSON)”를 생성하는 역할만 맡고,
 
 사실 조회(포지션/잔고/주문)·리스크 통제·주문 실행은 코드가 전담한다.
 
@@ -13,15 +13,15 @@ Gemini API는 시장/계좌 상태를 바탕으로 “주문 후보(JSON)”를 
 
 2) 설계 원칙
 
-Gemini는 전략가, 시스템은 경찰
+LLM은 전략가, 시스템은 경찰
 
-Gemini는 추천 JSON을 생성
+LLM provider는 추천 JSON을 생성
 
 시스템은 규정 검증 후 실행/거절
 
 진실의 원천은 Bybit API/DB
 
-계좌/포지션/미체결은 Gemini가 “추정”하지 않는다.
+계좌/포지션/미체결은 LLM이 “추정”하지 않는다.
 
 생존률 최우선
 
@@ -87,9 +87,13 @@ account_reader / collector / state_store를 묶어 공용 스냅샷을 조립
 
 계좌 상태는 `SnapshotService -> AccountReader -> private WS cache`를 우선 사용하고, 주문 직후/WS 비정상/주기적 reconcile 시에만 REST 보정
 
-decision_engine (Gemini)
+decision_engine (provider adapter)
 
 입력 스냅샷+메모리를 받아 TradeIntent(JSON) 출력
+
+Gemini / OpenAI(GPT) / DeepSeek / Anthropic(Claude)를 adapter로 선택할 수 있다
+
+JSON mode가 가능한 provider는 native JSON 응답을 우선 사용하고, 그렇지 않은 경우에도 JSON-only 지시와 Pydantic 검증을 함께 사용한다
 
 risk_engine
 
@@ -226,7 +230,7 @@ risk_trigger: 스프레드 확대, 펀딩비 왜곡처럼 신규 진입 판단�
 fast_price_move_15m, volume_surge_15m, range_break_1h에는 ON/OFF 기준을 분리한 히스테리시스를 적용해 경계 구간 점멸을 줄임
 
 5) 입력/출력 표준화(JSON)
-5.1 Gemini 입력(DecisionRequest)
+5.1 LLM 입력(DecisionRequest)
 
 policy_summary: 현재 정책 핵심(레버리지/한도/쿨다운 등)
 
@@ -276,7 +280,7 @@ RAG vector는 시장 13차원만 쓰지 않고, 리스크/계좌/포지션 컨�
 
 유사도 계산 전에는 차원별 normalization, outlier clipping, weighting을 적용해 큰 스케일 축의 과도한 지배를 줄인다
 
-5.2 Gemini 출력(TradeIntent.json)
+5.2 LLM 출력(TradeIntent.json)
 
 decision: HOLD/BUY/SELL/REDUCE/EXIT
 
@@ -339,7 +343,7 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 
 통계(승률/손익비/낙폭 등)는 코드가 계산
 
-Gemini는 통계 해석과 교훈 구조화만 수행
+LLM provider는 통계 해석과 교훈 구조화만 수행
 
 “표본 수 부족”은 hypothesis, 충분하면 rule로 승격
 
@@ -426,7 +430,7 @@ Recovery Sweep Job
 
 정책 버전
 
-Gemini 요청/응답 원문
+LLM 요청/응답 원문
 
 스키마 검증/리스크 판정 결과(통과/거절 + 사유)
 
@@ -561,7 +565,7 @@ semantic validation fallback은 24h / 7d / latest 50 calls 기준으로 나눠 �
 
 daily memory batch는 evidence signal 반복뿐 아니라 evidence_quality.factor 버킷과 entry_size_cap 조정 패턴도 집계해, 낮은 근거 품질이 실제 손실과 묶이는지까지 heuristic candidate lesson에 반영한다
 
-memory batch 모델은 실시간 의사결정 모델과 분리할 수 있고, `GEMINI_MEMORY_MODEL`이 지정되면 장기 교훈 추출에 그 모델을 우선 사용한다
+memory batch 모델은 실시간 의사결정 모델과 분리할 수 있고, `MEMORY_PROVIDER` / `MEMORY_MODEL`이 지정되면 장기 교훈 추출에 그 설정을 우선 사용한다
 
 10) 정책 파일(policy.yaml) 운영
 
@@ -583,7 +587,7 @@ API 키는 출금 권한 OFF
 
 12) 비용(개요)
 
-Gemini API 비용은 호출 횟수보다 **입력/출력 토큰(추론 토큰 포함)**에 좌우됨.
+LLM API 비용은 호출 횟수보다 **입력/출력 토큰(추론 토큰 포함)**에 좌우됨.
 
 비용 최적화 핵심:
 

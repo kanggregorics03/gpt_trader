@@ -8,6 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from ai.decision_engine import DecisionEngine, DecisionResult
+from ai.llm_provider import normalize_provider_name, resolve_api_key, resolve_decision_models
 from ai.rag_engine import RagEngine
 from core.models import DecisionRequest, EvidenceItem, RationaleItem, TradeIntent
 from core.risk_engine import RiskEngine
@@ -93,13 +94,24 @@ class TradingOrchestrator:
             os.getenv("BYBIT_TRADING_MODE"),
             os.getenv("BYBIT_TESTNET"),
         )
-        self.gemini_key = os.getenv("GEMINI_API_KEY")
-        self.gemini_default_model = os.getenv("GEMINI_DEFAULT_MODEL") or os.getenv("GEMINI_MODEL")
-        self.gemini_trigger_model = os.getenv("GEMINI_TRIGGER_MODEL")
+        self.ai_provider = normalize_provider_name(os.getenv("AI_PROVIDER"))
+        self.ai_api_key = os.getenv("AI_API_KEY")
+        self.ai_base_url = os.getenv("AI_BASE_URL")
+        self.ai_default_model = (
+            os.getenv("AI_DEFAULT_MODEL")
+            or os.getenv("GEMINI_DEFAULT_MODEL")
+            or os.getenv("GEMINI_MODEL")
+        )
+        self.ai_trigger_model = os.getenv("AI_TRIGGER_MODEL") or os.getenv("GEMINI_TRIGGER_MODEL")
         self.db_path = os.getenv("DB_PATH", "data/gpt_trader.db")
 
-        if not all([self.api_key, self.api_secret, self.gemini_key]):
+        if not all([self.api_key, self.api_secret]):
             log.error("Missing required environment variables. Please check .env")
+            exit(1)
+        try:
+            self._validate_ai_configuration()
+        except ValueError as exc:
+            log.error(str(exc))
             exit(1)
 
         self.state_store = StateStore(self.db_path)
@@ -144,17 +156,19 @@ class TradingOrchestrator:
             private_feed=self.private_account_feed,
         )
         
-        if self.gemini_default_model or self.gemini_trigger_model:
-            self.ai_engine = DecisionEngine(
-                self.gemini_key,
-                cache_store=self.state_store,
-                default_model=self.gemini_default_model,
-                trigger_model=self.gemini_trigger_model,
-            )
-        else:
-            self.ai_engine = DecisionEngine(self.gemini_key, cache_store=self.state_store)
+        self.ai_engine = DecisionEngine(
+            api_key=self.ai_api_key,
+            cache_store=self.state_store,
+            provider=self.ai_provider,
+            base_url=self.ai_base_url,
+            default_model=self.ai_default_model,
+            trigger_model=self.ai_trigger_model,
+        )
         log.info(
-            f"Gemini models: default={self.ai_engine.flash_model}, trigger={self.ai_engine.pro_model}"
+            "AI routing: provider={} default={} trigger={}",
+            getattr(self.ai_engine, "provider_name", "unknown"),
+            self.ai_engine.flash_model,
+            self.ai_engine.pro_model,
         )
         self.alert_manager = AlertManager()
         materialization_minutes = int(
@@ -172,6 +186,17 @@ class TradingOrchestrator:
             materialization_minutes=materialization_minutes,
         )
         self._initialize_runtime_state()
+
+    def _validate_ai_configuration(self):
+        resolve_api_key(
+            self.ai_provider,
+            explicit_api_key=self.ai_api_key,
+        )
+        resolve_decision_models(
+            self.ai_provider,
+            default_model=self.ai_default_model,
+            trigger_model=self.ai_trigger_model,
+        )
 
     def _build_private_account_ws_config(self):
         configured = self.risk_engine.policy.get("private_account_ws", {})

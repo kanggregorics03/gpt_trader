@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 from datetime import UTC, datetime, timedelta
 
+from ai.llm_provider import resolve_api_key
 from batch.memory_updater import MemoryLesson, MemoryUpdater
 from core.models import MemoryCondition
 
@@ -9,11 +10,15 @@ from core.models import MemoryCondition
 class TestMemoryUpdater(unittest.TestCase):
     def setUp(self):
         self.updater = MemoryUpdater.__new__(MemoryUpdater)
+        self.updater.provider_name = "gemini"
 
     def test_resolve_model_name_prefers_memory_model(self):
         with patch.dict(
             "os.environ",
             {
+                "MEMORY_MODEL": "",
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
                 "GEMINI_MEMORY_MODEL": "gemini-2.5-pro",
                 "GEMINI_TRIGGER_MODEL": "gemini-2.5-flash",
                 "GEMINI_DEFAULT_MODEL": "gemini-2.5-flash-lite",
@@ -27,6 +32,9 @@ class TestMemoryUpdater(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
+                "MEMORY_MODEL": "",
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
                 "GEMINI_MEMORY_MODEL": "",
                 "GEMINI_TRIGGER_MODEL": "gemini-2.5-pro",
                 "GEMINI_DEFAULT_MODEL": "gemini-2.5-flash",
@@ -39,6 +47,9 @@ class TestMemoryUpdater(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
+                "MEMORY_MODEL": "",
+                "AI_DEFAULT_MODEL": "",
+                "AI_TRIGGER_MODEL": "",
                 "GEMINI_MEMORY_MODEL": "",
                 "GEMINI_TRIGGER_MODEL": "",
                 "GEMINI_DEFAULT_MODEL": "gemini-2.5-flash",
@@ -47,6 +58,29 @@ class TestMemoryUpdater(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(self.updater._resolve_model_name(), "gemini-2.5-flash")
+
+    def test_memory_provider_prefers_provider_specific_key_before_shared_ai_key(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "MEMORY_PROVIDER": "anthropic",
+                "MEMORY_API_KEY": "",
+                "AI_API_KEY": "shared-key",
+                "ANTHROPIC_API_KEY": "anthropic-key",
+            },
+            clear=False,
+        ):
+            updater = MemoryUpdater.__new__(MemoryUpdater)
+            updater.provider_name = "anthropic"
+            updater.shared_ai_api_key = "shared-key"
+            self.assertEqual(
+                resolve_api_key(
+                    updater.provider_name,
+                    explicit_api_key="",
+                    shared_api_key=updater.shared_ai_api_key,
+                ),
+                "anthropic-key",
+            )
 
     def test_build_stats_package_aggregates_pnl_and_reasons(self):
         class DummyStore:
@@ -657,13 +691,13 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(candidates[0]["trade_case_ids"], ["case-a", "case-b"])
 
     def test_generate_lessons_falls_back_to_candidate_lessons_on_failure(self):
-        class DummyClient:
-            class models:
-                @staticmethod
-                def generate_content(**kwargs):
-                    raise RuntimeError("boom")
+        class DummyProvider:
+            @staticmethod
+            def generate_json(**kwargs):
+                raise RuntimeError("boom")
 
-        self.updater.client = DummyClient()
+        self.updater.provider_name = "gemini"
+        self.updater.llm_provider = DummyProvider()
         self.updater.model_name = "gemini-2.5-flash"
         stats = {
             "journal_count": 2,

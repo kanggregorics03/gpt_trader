@@ -1,7 +1,8 @@
 # GPT Trader
 
-Bybit 선물 계정과 Gemini API를 연결해 자동매매를 수행하는 프로젝트다.  
-AI는 시장과 계좌 상태를 바탕으로 주문 후보를 생성하지만, 실제 리스크 통제, 주문 실행, 복구 판단, 감사 로그 저장은 애플리케이션 코드가 담당한다.
+Bybit 선물 계정과 LLM provider를 연결해 자동매매를 수행하는 프로젝트다.  
+AI는 시장과 계좌 상태를 바탕으로 주문 후보를 생성하지만, 실제 리스크 통제, 주문 실행, 복구 판단, 감사 로그 저장은 애플리케이션 코드가 담당한다.  
+현재 구조는 `Gemini / OpenAI(GPT) / DeepSeek / Anthropic(Claude)`를 provider adapter로 선택할 수 있다.
 
 이 프로젝트의 목적은 "AI에게 전권을 주는 자동매매"가 아니라, 아래 구조를 갖는 통제 가능한 자동매매 시스템을 만드는 데 있다.
 
@@ -19,8 +20,9 @@ AI는 시장과 계좌 상태를 바탕으로 주문 후보를 생성하지만, 
 
 ### 1. 의사결정 생성
 
-`DecisionEngine`이 Gemini에 구조화된 입력을 보내고 `TradeIntent`를 받는다.  
-AI는 전략 제안자 역할만 하며, 실제 주문 집행 권한은 없다.
+`DecisionEngine`이 provider adapter를 통해 구조화된 입력을 보내고 `TradeIntent`를 받는다.  
+AI는 전략 제안자 역할만 하며, 실제 주문 집행 권한은 없다.  
+JSON mode가 있는 provider는 native JSON 응답을 우선 사용하고, 없는 경우에도 JSON-only 프롬프트와 Pydantic 검증을 함께 써서 출력 안정성을 확보한다.
 
 ### 2. 정책 기반 리스크 통제
 
@@ -89,7 +91,8 @@ gpt_trader/
 ├─ policy.yaml                # 거래/리스크 정책
 ├─ .env.example               # 환경 변수 예시
 ├─ ai/
-│  ├─ decision_engine.py      # Gemini 의사결정 생성, 입력 해시 생성
+│  ├─ decision_engine.py      # provider-agnostic 의사결정 생성, 입력 해시 생성
+│  ├─ llm_provider.py         # Gemini / OpenAI / DeepSeek / Anthropic adapter
 │  └─ rag_engine.py           # 유사 과거 케이스 검색
 ├─ batch/
 │  └─ memory_updater.py       # 장기 메모리 일일 배치
@@ -761,8 +764,8 @@ context_budget:
 최근 구조에서는 journal도 단순 1회성 로그에 머무르지 않고, 같은 사이클에서 생성된 심볼별 `trade_case_id`와 `case_status` 요약을 함께 남긴다.  
 즉 포트폴리오 journal만 봐도 "이번 판단이 어떤 케이스를 열었는지, 줄였는지, 닫았는지"를 빠르게 복기할 수 있다.
 
-daily memory batch는 `rationale_json.evidence`의 반복 시그널에서 heuristic `candidate_lessons`를 먼저 만들고, Gemini는 이를 정제하거나 병합하는 역할을 한다.  
-Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
+daily memory batch는 `rationale_json.evidence`의 반복 시그널에서 heuristic `candidate_lessons`를 먼저 만들고, 선택된 LLM provider는 이를 정제하거나 병합하는 역할을 한다.  
+LLM 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
 
 이 배치는 signal 반복뿐 아니라 `evidence_quality.factor` 버킷과 `entry_size_cap` 조정 패턴도 같이 집계한다.  
 즉 근거 품질이 낮거나 size cap이 줄어든 상황이 실제 손실과 함께 반복되는지도 candidate lesson seed에 반영한다.
@@ -1139,7 +1142,7 @@ retrieval이 실제 성과와 반사실 비교 기준에서 얼마나 의미 있
 ### 기본 원칙
 
 - 통계 계산은 코드가 한다.
-- Gemini는 통계를 해석해 lesson을 만든다.
+- 선택된 LLM provider는 통계를 해석해 lesson을 만든다.
 - 근거 수가 적으면 `hypothesis`
 - 근거 수가 충분하면 `rule`
 - 모든 lesson은 적용 조건과 무시 조건을 가져야 한다.
@@ -1241,8 +1244,8 @@ Copy-Item .env.example .env
 - `BYBIT_API_KEY`
 - `BYBIT_API_SECRET`
 - `BYBIT_TRADING_MODE`
-- `GEMINI_API_KEY`
-- `GEMINI_DEFAULT_MODEL`
+- `AI_PROVIDER` 또는 provider-specific key (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`)
+- `AI_DEFAULT_MODEL` 또는 provider-specific default model
 - `DB_PATH`
 - `LOG_LEVEL`
 - `LOG_FORMAT`
@@ -1258,10 +1261,15 @@ BYBIT_API_KEY="your_bybit_api_key_here"
 BYBIT_API_SECRET="your_bybit_api_secret_here"
 BYBIT_TRADING_MODE="demo"
 BYBIT_TESTNET="False"
-GEMINI_API_KEY="your_gemini_api_key_here"
-GEMINI_DEFAULT_MODEL="gemini-2.5-flash"
-GEMINI_TRIGGER_MODEL="gemini-2.5-pro"
-GEMINI_MEMORY_MODEL="gemini-2.5-pro"
+AI_PROVIDER="gemini"
+AI_API_KEY=""
+AI_DEFAULT_MODEL="gemini-2.5-flash"
+AI_TRIGGER_MODEL="gemini-2.5-pro"
+MEMORY_MODEL="gemini-2.5-pro"
+GEMINI_API_KEY="your_gemini_api_key_here" # legacy/provider-specific fallback
+OPENAI_API_KEY=""
+DEEPSEEK_API_KEY=""
+ANTHROPIC_API_KEY=""
 DB_PATH="data/gpt_trader.db"
 LOG_LEVEL="INFO"
 LOG_FORMAT="text"
@@ -1269,16 +1277,27 @@ LOG_FORMAT="text"
 
 모델 선택:
 
-- `GEMINI_DEFAULT_MODEL`
+- `AI_PROVIDER`
+  - `gemini`, `openai`, `deepseek`, `anthropic`
+- `AI_DEFAULT_MODEL`
   - 일반 루프에서 사용하는 기본 모델
-- `GEMINI_TRIGGER_MODEL`
+- `AI_TRIGGER_MODEL`
   - trigger mode에서만 따로 쓰고 싶을 때 지정
-  - 비우면 `GEMINI_DEFAULT_MODEL`을 재사용
-- `GEMINI_MEMORY_MODEL`
+  - 비우면 `AI_DEFAULT_MODEL`을 재사용
+- `MEMORY_PROVIDER`
+  - 비우면 `AI_PROVIDER`를 재사용
+- `MEMORY_MODEL`
   - 일일 memory batch에서 사용하는 모델
-  - 비우면 `GEMINI_TRIGGER_MODEL -> GEMINI_DEFAULT_MODEL -> GEMINI_MODEL` 순서로 fallback
-- `GEMINI_MODEL`
-  - 레거시 단일 모델 fallback
+  - 비우면 provider-specific memory/trigger/default 순서로 fallback
+- provider-specific env (`GEMINI_*`, `OPENAI_*`, `DEEPSEEK_*`, `ANTHROPIC_*`)
+  - 공통 env를 쓰지 않을 때 개별 provider 설정용
+  - Gemini 단일 provider 구성을 계속 유지하고 싶을 때도 그대로 사용 가능
+
+구조화 출력:
+
+- Gemini는 native schema JSON 응답을 사용한다.
+- OpenAI와 DeepSeek는 chat completion의 `json_object` 모드를 우선 사용한다.
+- Anthropic은 JSON-only system prompt를 사용하고, 모든 provider는 마지막에 Pydantic 검증으로 `TradeIntent` 스키마를 다시 확인한다.
 
 ### 3. 정책 확인
 
