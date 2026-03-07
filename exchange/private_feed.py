@@ -53,6 +53,19 @@ class BybitPrivateAccountFeed:
         self._recovery_candidate_since = 0
         self._last_health_transition_at = 0
         self._last_error: Optional[str] = None
+        self._event_counts = {"total": 0, "wallet": 0, "position": 0, "order": 0, "execution": 0}
+        self._handler_stats = {
+            "wallet": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+            "position": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+            "order": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+            "execution": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+        }
+        self._exchange_lag_stats = {
+            "wallet": {"last_ms": None, "max_ms": 0.0},
+            "position": {"last_ms": None, "max_ms": 0.0},
+            "order": {"last_ms": None, "max_ms": 0.0},
+            "execution": {"last_ms": None, "max_ms": 0.0},
+        }
 
     @property
     def available(self) -> bool:
@@ -144,17 +157,45 @@ class BybitPrivateAccountFeed:
     def get_diagnostics(self) -> Dict[str, Any]:
         with self._lock:
             status = self._refresh_health_locked()
+            now_ms = self._now_ms()
+            handler_stats = {}
+            for stream, stats in self._handler_stats.items():
+                count = int(stats["count"])
+                avg_ms = (float(stats["total_ms"]) / count) if count > 0 else 0.0
+                handler_stats[stream] = {
+                    "count": count,
+                    "avg_ms": round(avg_ms, 3),
+                    "max_ms": round(float(stats["max_ms"]), 3),
+                }
             return {
                 "health_status": status,
                 "started": self._started,
                 "reconcile_required": self._reconcile_required,
                 "last_ws_message_at": self._last_ws_message_at,
+                "last_ws_message_age_ms": self._age_ms(now_ms, self._last_ws_message_at),
                 "last_private_event_at": self._last_private_event_at,
+                "last_private_event_age_ms": self._age_ms(now_ms, self._last_private_event_at),
                 "last_successful_subscribe_at": self._last_successful_subscribe_at,
                 "last_reconcile_ok_at": self._last_reconcile_ok_at,
+                "last_reconcile_ok_age_ms": self._age_ms(now_ms, self._last_reconcile_ok_at),
                 "recovery_candidate_since": self._recovery_candidate_since,
                 "last_health_transition_at": self._last_health_transition_at,
                 "last_error": self._last_error,
+                "ws_stale_after_ms": self.ws_stale_after_ms,
+                "event_counts": dict(self._event_counts),
+                "handler_stats": handler_stats,
+                "exchange_lag_ms": {
+                    stream: {
+                        "last_ms": value["last_ms"],
+                        "max_ms": round(float(value["max_ms"]), 3),
+                    }
+                    for stream, value in self._exchange_lag_stats.items()
+                },
+                "cache_sizes": {
+                    "positions": len(self._positions_by_symbol),
+                    "open_orders": len(self._open_orders_by_key),
+                    "execution_symbols": len(self._recent_executions_by_symbol),
+                },
             }
 
     def get_account_state(self, symbols: List[str]) -> Optional[AccountState]:
@@ -216,6 +257,7 @@ class BybitPrivateAccountFeed:
             ]
 
     def _handle_wallet_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         data = message.get("data") or []
         if isinstance(data, dict):
             data = [data]
@@ -229,7 +271,11 @@ class BybitPrivateAccountFeed:
             {},
         )
         with self._lock:
-            self._record_private_event_locked()
+            self._record_private_event_locked(
+                stream="wallet",
+                exchange_timestamp_ms=self._message_exchange_timestamp(message, wallet),
+                handler_started_at_ms=started_at,
+            )
             self._wallet_state = {
                 "snapshot_timestamp": self._now_ms(),
                 "total_balance": self._safe_float(
@@ -254,12 +300,17 @@ class BybitPrivateAccountFeed:
             self._refresh_health_locked()
 
     def _handle_position_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         data = message.get("data") or []
         if isinstance(data, dict):
             data = [data]
 
         with self._lock:
-            self._record_private_event_locked()
+            self._record_private_event_locked(
+                stream="position",
+                exchange_timestamp_ms=self._message_exchange_timestamp(message, *data),
+                handler_started_at_ms=started_at,
+            )
             for item in data:
                 normalized = self._normalize_position(item)
                 symbol = str(item.get("symbol") or normalized.symbol)
@@ -270,12 +321,17 @@ class BybitPrivateAccountFeed:
             self._refresh_health_locked()
 
     def _handle_order_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         data = message.get("data") or []
         if isinstance(data, dict):
             data = [data]
 
         with self._lock:
-            self._record_private_event_locked()
+            self._record_private_event_locked(
+                stream="order",
+                exchange_timestamp_ms=self._message_exchange_timestamp(message, *data),
+                handler_started_at_ms=started_at,
+            )
             for item in data:
                 normalized = self._normalize_order(item)
                 key = self._order_key(normalized)
@@ -286,12 +342,17 @@ class BybitPrivateAccountFeed:
             self._refresh_health_locked()
 
     def _handle_execution_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         data = message.get("data") or []
         if isinstance(data, dict):
             data = [data]
 
         with self._lock:
-            self._record_private_event_locked()
+            self._record_private_event_locked(
+                stream="execution",
+                exchange_timestamp_ms=self._message_exchange_timestamp(message, *data),
+                handler_started_at_ms=started_at,
+            )
             for item in data:
                 normalized = self._normalize_execution(item)
                 symbol = normalized.get("symbol") or "UNKNOWN"
@@ -300,11 +361,29 @@ class BybitPrivateAccountFeed:
                 del bucket[self.execution_cache_size :]
             self._refresh_health_locked()
 
-    def _record_private_event_locked(self):
+    def _record_private_event_locked(
+        self,
+        *,
+        stream: str,
+        exchange_timestamp_ms: Optional[int],
+        handler_started_at_ms: int,
+    ):
         now_ms = self._now_ms()
         previous_state = self._compute_health_status_locked(now_ms=now_ms)
         self._last_ws_message_at = now_ms
         self._last_private_event_at = now_ms
+        self._event_counts["total"] += 1
+        self._event_counts[stream] += 1
+        duration_ms = max(0.0, float(now_ms - handler_started_at_ms))
+        stats = self._handler_stats[stream]
+        stats["count"] += 1
+        stats["total_ms"] += duration_ms
+        stats["max_ms"] = max(float(stats["max_ms"]), duration_ms)
+        if exchange_timestamp_ms is not None:
+            lag_ms = max(0.0, float(now_ms - exchange_timestamp_ms))
+            lag_stats = self._exchange_lag_stats[stream]
+            lag_stats["last_ms"] = round(lag_ms, 3)
+            lag_stats["max_ms"] = max(float(lag_stats["max_ms"]), lag_ms)
         if previous_state in {"stale", "reconnecting", "down"}:
             self._recovery_candidate_since = now_ms
         self._last_error = None
@@ -445,3 +524,25 @@ class BybitPrivateAccountFeed:
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _message_exchange_timestamp(self, message: Dict[str, Any], *items: Dict[str, Any]) -> Optional[int]:
+        direct = self._safe_int(message.get("creationTime"), message.get("ts"))
+        if direct is not None:
+            return direct
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            timestamp = self._safe_int(
+                item.get("creationTime"),
+                item.get("updatedTime"),
+                item.get("execTime"),
+                item.get("createdTime"),
+            )
+            if timestamp is not None:
+                return timestamp
+        return None
+
+    def _age_ms(self, now_ms: int, timestamp_ms: int) -> Optional[int]:
+        if timestamp_ms <= 0:
+            return None
+        return max(0, int(now_ms - timestamp_ms))

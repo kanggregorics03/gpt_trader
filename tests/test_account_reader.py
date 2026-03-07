@@ -110,6 +110,9 @@ class HealthyPrivateFeed:
     def mark_reconcile_required(self):
         self.reconcile_required = True
 
+    def get_diagnostics(self):
+        return {"health_status": "healthy", "event_counts": {"total": 3}}
+
 
 class DegradedPrivateFeed(HealthyPrivateFeed):
     def __init__(self, health_status="degraded", reconcile_due=False):
@@ -279,6 +282,18 @@ class TestAccountReader(unittest.TestCase):
         self.assertEqual(exchange.balance_calls, 1)
         self.assertIsNotNone(private_feed.seeded)
         self.assertEqual(state.total_balance, 1500.0)
+
+    def test_runtime_diagnostics_expose_cache_and_private_feed_health(self):
+        exchange = DummyExchange()
+        private_feed = HealthyPrivateFeed()
+        reader = AccountReader(exchange, cache_ttl_ms=2000, private_feed=private_feed)
+
+        reader.get_account_state(["BTCUSDT"])
+        diagnostics = reader.get_runtime_diagnostics()
+
+        self.assertTrue(diagnostics["cache"]["has_cached_state"])
+        self.assertEqual(diagnostics["cache"]["cached_symbol_count"], 1)
+        self.assertEqual(diagnostics["private_feed"]["health_status"], "healthy")
 
 
 if __name__ == "__main__":

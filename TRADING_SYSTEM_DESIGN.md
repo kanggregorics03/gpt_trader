@@ -51,6 +51,8 @@ public WebSocket은 ticker/orderbook 위주로 유지하고, closed-candle 기�
 
 public REST fallback TTL도 늘려 ticker/orderbook/funding/open interest 재호출을 줄인다
 
+public WS는 latest-state overwrite를 유지하고, `get_diagnostics()`에서 stream age, symbol age, message count, handler timing, exchange lag를 노출해 지연을 감시한다
+
 account_reader
 
 잔고/포지션/미체결 주문을 Bybit에서 조회
@@ -68,6 +70,8 @@ WS health state는 `healthy / stale / degraded / reconnecting / down`
 `healthy`일 때만 WS를 primary로 사용하고, `stale / degraded / reconnecting / down`에서는 REST fallback
 
 WS 복구는 단순 재연결로 보지 않고, private 이벤트 수신 재개 + REST reconcile 성공 + 안정 구간 통과 후에만 `healthy`
+
+`AccountReader.get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 볼 수 있다
 
 state_store (DB)
 
@@ -192,7 +196,7 @@ WS recovery
 
 `1h or 15m -> 5m`
 
-opportunity_trigger가 켜지면 즉시 승격
+같은 심볼에서 strong opportunity trigger(`volume_surge_15m` 또는 `range_break_1h`)를 포함한 opportunity reason이 2개 이상일 때만 승격
 
 `5m -> 15m`
 
@@ -249,6 +253,11 @@ recent_journal_context: 같은 최근 일지 정보를 구조화 객체로 전�
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
 
 long_term_memory도 현재 risk_mode/시장 레짐/심볼 관련성이 높은 항목만 상위 N개를 전달
+
+최근에는 long_term_memory를 append-only 로그로 두지 않고,
+- confidence_score로 support / cluster quality / retrieval 효과를 함께 반영하고
+- decay_score + lifecycle_status로 오래 검증되지 않은 rule을 감쇠/은퇴시키고
+- canonical_key + rule similarity로 비슷한 lesson을 병합하는 방향으로 운영한다
 
 constraints: “JSON only”, 출력 최대 길이, 허용 행동 제한
 
@@ -464,6 +473,15 @@ trade_case_vector_index를 별도로 유지해 feature_vector를 retrieval 전�
 최근 버전에서는 coarse band-hash lookup으로 후보를 먼저 좁히고, 그 다음 cosine similarity와 규칙 점수로 rerank한다
 또한 retrieval_evaluations 테이블에 실제 prompt에 포함된 retrieval 결과를 남겨,
 trade_case_id / similarity / final_score / retrieval_source / decision_symbol_aligned를 나중에 성과와 연결해서 볼 수 있게 한다
+trade case가 닫히면 retrieval_evaluations에 outcome_realized_pnl / holding_minutes / observed MFE/MAE / slippage를 backfill한다
+또한 replay_audit는 같은 request를 similar_past_cases 포함/제거 두 버전으로 돌려 replay_runs.payload.retrieval_counterfactual에 반사실 비교를 남긴다
+memory batch는 replay_runs와 retrieval_evaluations를 audit_id로 연결해,
+with retrieval / without retrieval 중 어느 쪽 decision이 실제 종료 손익뿐 아니라 observed MFE/MAE, slippage, holding_minutes를 반영한 outcome utility 기준에 더 잘 맞았는지도 집계한다
+
+향후 짧은 개선 포인트:
+- trade_case path는 snapshot 기반이므로, active case 중 WS execution/ticker 이벤트를 바로 적재하면 observed MFE/MAE 정밀도를 더 높일 수 있다
+- retrieval candidate search는 SQLite coarse band index 기반이므로, 데이터가 커지면 ANN 전용 인덱스로 분리하는 것이 적절하다
+- cluster / retrieval 평가는 현재도 자동 집계되지만, 미래 holdout 성과와 portfolio-level utility까지 연결하면 lesson 품질 검증이 더 강해진다
 
 daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 market regime를 함께 읽어 장기 규칙을 만든다
 
@@ -497,6 +515,8 @@ signal failure, slippage, excursion 품질을 candidate lesson seed로 반영한
 최근 버전에서는 이 cluster를 단순 규칙 그룹핑이 아니라 numeric feature distance 기반 online centroid clustering으로 만든다
 또한 silhouette / nearest-cluster separation / temporal holdout consistency를 계산해 quality_score와 quality_label을 붙인다
 quality가 낮거나 holdout에서 손실 패턴이 더 이상 확인되지 않는 cluster는 retired 처리하고, lesson seed에서 자동 제외한다
+memory batch는 retrieval_evaluation_summary와 retrieval_counterfactual_summary도 함께 집계해 retrieval 품질을 장기적으로 평가한다
+`retrieval_counterfactual_summary.avg_outcome_utility_delta`는 with retrieval decision이 without retrieval 대비 path quality 기준으로 얼마나 나았는지 평균 gap을 보여준다
 
 입력 특징 예:
 

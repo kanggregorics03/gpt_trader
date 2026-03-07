@@ -116,3 +116,64 @@ class TestSnapshotService(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(len(service.market_collector.calls), 1)
+
+    def test_trigger_mode_requires_strong_reason_and_multiple_reasons_on_same_symbol(self):
+        service = SnapshotService(
+            state_store=DummyStateStore(),
+            account_reader=DummyAccountReader(),
+            market_collector=RecordingCollector(),
+            risk_engine=DummyRiskEngine(),
+            symbols=["BTCUSDT"],
+            materialization_minutes=5,
+        )
+
+        fast_only = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=100.0,
+                atr_15m=1.0,
+                atr_1h=2.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+                is_opportunity_trigger=True,
+                opportunity_trigger_reasons=["fast_price_move_15m"],
+            )
+        }
+        mixed_strong = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=100.0,
+                atr_15m=1.0,
+                atr_1h=2.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                is_opportunity_trigger=True,
+                opportunity_trigger_reasons=["fast_price_move_15m", "volume_surge_15m"],
+            )
+        }
+        split_across_symbols = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=100.0,
+                atr_15m=1.0,
+                atr_1h=2.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+                is_opportunity_trigger=True,
+                opportunity_trigger_reasons=["fast_price_move_15m"],
+            ),
+            "ETHUSDT": MarketSnapshot(
+                symbol="ETHUSDT",
+                current_price=200.0,
+                atr_15m=2.0,
+                atr_1h=4.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                is_opportunity_trigger=True,
+                opportunity_trigger_reasons=["volume_surge_15m"],
+            ),
+        }
+
+        self.assertFalse(service._should_enable_trigger_mode(fast_only))
+        self.assertTrue(service._should_enable_trigger_mode(mixed_strong))
+        self.assertFalse(service._should_enable_trigger_mode(split_across_symbols))

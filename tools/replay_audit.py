@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import re
@@ -142,6 +143,19 @@ def print_candidates(store: StateStore, limit: int):
         )
 
 
+def strip_retrieval_context(request_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = copy.deepcopy(request_payload or {})
+    payload["similar_past_cases"] = []
+    return payload
+
+
+def replay_request_payload(request_payload: Dict[str, Any], gemini_key: str):
+    engine = DecisionEngine(gemini_key)
+    request = DecisionRequest.model_validate(request_payload)
+    result = engine.generate_decision(request)
+    return result.intent.model_dump(), result.raw_response
+
+
 def replay_audit(store: StateStore, audit_id: int, gemini_key: str):
     audit = store.get_audit_log(audit_id)
     if audit is None:
@@ -151,11 +165,28 @@ def replay_audit(store: StateStore, audit_id: int, gemini_key: str):
     if not request_payload:
         raise SystemExit(f"audit_id={audit_id} has no stored decision_request")
 
-    engine = DecisionEngine(gemini_key)
-    request = DecisionRequest.model_validate(request_payload)
-    result = engine.generate_decision(request)
-
-    output = build_replay_payload(audit, audit_id, result.intent.model_dump(), result.raw_response)
+    replayed_intent, replayed_raw_response = replay_request_payload(request_payload, gemini_key=gemini_key)
+    without_retrieval_payload = strip_retrieval_context(request_payload)
+    without_retrieval_intent, without_retrieval_raw_response = replay_request_payload(
+        without_retrieval_payload,
+        gemini_key=gemini_key,
+    )
+    output = build_replay_payload(
+        audit,
+        audit_id,
+        replayed_intent,
+        replayed_raw_response,
+        retrieval_counterfactual={
+            "similar_past_case_count_with": len(request_payload.get("similar_past_cases") or []),
+            "similar_past_case_count_without": len(without_retrieval_payload.get("similar_past_cases") or []),
+            "with_retrieval_intent": replayed_intent,
+            "without_retrieval_intent": without_retrieval_intent,
+            "with_retrieval_raw_response": replayed_raw_response,
+            "without_retrieval_raw_response": without_retrieval_raw_response,
+            "with_vs_without_comparison": compare_intents(replayed_intent, without_retrieval_intent),
+            "original_vs_without_comparison": compare_intents(audit.get("intent", {}), without_retrieval_intent),
+        },
+    )
     print(json.dumps(output, indent=2))
     return output
 
@@ -177,6 +208,7 @@ def build_replay_payload(
     audit_id: int,
     replayed_intent: Dict[str, Any],
     replayed_raw_response: str,
+    retrieval_counterfactual: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return {
         "audit_id": audit_id,
@@ -187,6 +219,7 @@ def build_replay_payload(
         "original_raw_response": audit.get("ai_raw_response", ""),
         "replayed_raw_response": replayed_raw_response,
         "risk_reason": audit.get("risk_reason"),
+        "retrieval_counterfactual": retrieval_counterfactual or {},
     }
 
 

@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
 
 from batch.memory_updater import MemoryLesson, MemoryUpdater
 from core.models import MemoryCondition
@@ -456,6 +457,9 @@ class TestMemoryUpdater(unittest.TestCase):
                     "trade_case_id": "BTCUSDT-case-1",
                     "decision_symbol_aligned": True,
                     "estimated_pnl_pct": 0.8,
+                    "outcome_trade_case_id": "BTCUSDT-live-case-1",
+                    "outcome_status": "closed",
+                    "outcome_realized_pnl": 12.0,
                     "similarity": 0.92,
                     "final_score": 1.35,
                     "retrieval_source": "band_index",
@@ -477,9 +481,126 @@ class TestMemoryUpdater(unittest.TestCase):
 
         self.assertEqual(stats["retrieval_evaluation_count"], 2)
         self.assertEqual(stats["retrieval_evaluation_summary"]["aligned_count"], 1)
+        self.assertEqual(stats["retrieval_evaluation_summary"]["settled_count"], 1)
         self.assertEqual(stats["retrieval_evaluation_summary"]["source_counts"]["band_index"], 1)
         self.assertGreater(stats["retrieval_evaluation_summary"]["avg_similarity"], 0.0)
         self.assertEqual(len(stats["recent_retrieval_evaluations"]), 2)
+
+    def test_build_stats_package_includes_retrieval_counterfactual_summary(self):
+        class DummyStore:
+            def get_position_ledger_stats(self, hours):
+                return {"row_count": 0, "net_realized_pnl": 0.0, "gross_realized_pnl": 0.0, "fee_cost": 0.0}
+
+            def get_symbol_performance_report(self, hours):
+                return []
+
+            def get_daily_ledger_report(self, days):
+                return []
+
+        self.updater.state_store = DummyStore()
+        stats = self.updater._build_stats_package(
+            journals=[],
+            window_hours=24,
+            symbol_journals=[],
+            trade_cases=[],
+            retrieval_evaluations=[
+                {
+                    "audit_log_id": 9001,
+                    "outcome_trade_case_id": "BTCUSDT-live-case-1",
+                    "outcome_status": "closed",
+                    "outcome_realized_pnl": -1.2,
+                    "outcome_observed_mae_pct": -1.7,
+                    "outcome_slippage_bps": 6.5,
+                    "outcome_holding_minutes": 135,
+                }
+            ],
+            replay_runs=[
+                {
+                    "audit_log_id": 9001,
+                    "payload": {
+                        "retrieval_counterfactual": {
+                            "with_retrieval_intent": {"decision": "EXIT"},
+                            "without_retrieval_intent": {"decision": "BUY"},
+                            "with_vs_without_comparison": {
+                                "decision_changed": True,
+                                "side_changed": True,
+                                "confidence_delta": -0.12,
+                                "size_delta": -0.01,
+                            }
+                        }
+                    }
+                },
+                {
+                    "audit_log_id": 9002,
+                    "payload": {
+                        "retrieval_counterfactual": {
+                            "with_retrieval_intent": {"decision": "BUY"},
+                            "without_retrieval_intent": {"decision": "BUY"},
+                            "with_vs_without_comparison": {
+                                "decision_changed": False,
+                                "side_changed": False,
+                                "confidence_delta": 0.05,
+                                "size_delta": 0.0,
+                            }
+                        }
+                    }
+                },
+            ],
+        )
+
+        self.assertEqual(stats["replay_run_count"], 2)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["evaluation_count"], 2)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["decision_changed_count"], 1)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["side_changed_count"], 1)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["outcome_linked_count"], 1)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["with_retrieval_better_count"], 1)
+        self.assertEqual(stats["retrieval_counterfactual_summary"]["without_retrieval_better_count"], 0)
+        self.assertGreater(stats["retrieval_counterfactual_summary"]["avg_outcome_utility_delta"], 0.0)
+        self.assertEqual(len(stats["recent_retrieval_counterfactuals"]), 2)
+
+    def test_retrieval_counterfactual_summary_uses_path_utility_not_only_pnl_sign(self):
+        summary = self.updater._apply_retrieval_outcome_counterfactual_summary(
+            summary={
+                "evaluation_count": 1,
+                "decision_changed_count": 1,
+                "side_changed_count": 1,
+                "avg_confidence_delta": 0.0,
+                "avg_size_delta": 0.0,
+                "outcome_linked_count": 0,
+                "with_retrieval_better_count": 0,
+                "without_retrieval_better_count": 0,
+                "outcome_tie_count": 0,
+                "avg_outcome_utility_delta": 0.0,
+            },
+            retrieval_evaluations=[
+                {
+                    "audit_log_id": 9010,
+                    "outcome_trade_case_id": "BTCUSDT-live-case-2",
+                    "outcome_status": "closed",
+                    "outcome_realized_pnl": 4.0,
+                    "outcome_observed_mfe_pct": 5.0,
+                    "outcome_observed_mae_pct": -4.5,
+                    "outcome_slippage_bps": 28.0,
+                    "outcome_holding_minutes": 480,
+                }
+            ],
+            replay_runs=[
+                {
+                    "audit_log_id": 9010,
+                    "payload": {
+                        "retrieval_counterfactual": {
+                            "with_retrieval_intent": {"decision": "BUY"},
+                            "without_retrieval_intent": {"decision": "EXIT"},
+                        }
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(summary["outcome_linked_count"], 1)
+        self.assertEqual(summary["with_retrieval_better_count"], 0)
+        self.assertEqual(summary["without_retrieval_better_count"], 1)
+        self.assertLess(summary["avg_outcome_utility_delta"], 0.0)
 
     def test_build_trade_case_cluster_candidate_lessons_skips_retired_clusters(self):
         candidates = self.updater._build_trade_case_cluster_candidate_lessons(
@@ -601,6 +722,139 @@ class TestMemoryUpdater(unittest.TestCase):
             entries[0]["metrics"]["ignore_when"],
             ["Ignore when breakout retest holds with rising volume."],
         )
+        self.assertIn("confidence_score", entries[0]["metrics"])
+        self.assertEqual(entries[0]["metrics"]["lifecycle_status"], "active")
+        self.assertFalse(entries[0]["metrics"]["retired"])
+
+    def test_prepare_memory_entries_merges_similar_lessons(self):
+        stats = {
+            "window_hours": 24,
+            "journal_count": 8,
+            "evaluated_trade_count": 6,
+            "win_rate": 42.0,
+            "avg_estimated_pnl_pct": -0.3,
+            "trade_case_cluster_evaluation": {"avg_quality_score": 0.62},
+            "retrieval_counterfactual_summary": {
+                "with_retrieval_better_count": 3,
+                "without_retrieval_better_count": 1,
+                "outcome_tie_count": 1,
+            },
+        }
+        lessons = [
+            MemoryLesson(
+                rule="Avoid chasing weak breakouts after a loss.",
+                regime="high_volatility",
+                category="anti_pattern",
+                support_count=3,
+                evidence_journal_ids=[7, 8, 9],
+                hypothesis=False,
+                apply_when=MemoryCondition(
+                    regime=["high_volatility"],
+                    volatility=["high"],
+                    trend=["up"],
+                ),
+                ignore_when=["Ignore when breakout retest holds with rising volume."],
+            ),
+            MemoryLesson(
+                rule="Avoid chasing weak breakout after losses when confirmation is thin.",
+                regime="high_volatility",
+                category="anti_pattern",
+                support_count=4,
+                evidence_journal_ids=[8, 10, 11],
+                hypothesis=False,
+                apply_when=MemoryCondition(
+                    regime=["high_volatility"],
+                    volatility=["high"],
+                    trend=["up"],
+                ),
+                ignore_when=["Ignore when breakout retest holds with rising volume."],
+            ),
+        ]
+
+        entries = self.updater._prepare_memory_entries(stats, lessons)
+
+        self.assertEqual(len(entries), 1)
+        self.assertGreaterEqual(entries[0]["metrics"]["support"], 4)
+        self.assertGreaterEqual(entries[0]["metrics"]["merge_count"], 2)
+        self.assertGreaterEqual(len(entries[0]["metrics"]["evidence_journal_ids"]), 4)
+
+    def test_reconcile_long_term_memory_entries_retires_stale_and_revives_matching_memory(self):
+        now = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
+        stale_timestamp = (now - timedelta(days=95)).isoformat()
+        revive_timestamp = (now - timedelta(days=40)).isoformat()
+        existing = [
+            {
+                "id": 11,
+                "timestamp": stale_timestamp,
+                "rule": "Fade spikes only when trend is flat.",
+                "version": 2,
+                "metrics": {
+                    "category": "risk_control",
+                    "regime": "flat_medium",
+                    "apply_when": {"regime": ["flat_medium"], "volatility": ["medium"], "trend": ["flat"]},
+                    "ignore_when": ["Ignore in strong trend continuation."],
+                    "support": 2,
+                    "evidence_journal_ids": [1, 2],
+                    "confidence_score": 0.28,
+                    "validity_score": 0.31,
+                    "freshness_score": 0.15,
+                    "canonical_key": "risk_control|flat_medium|medium|flat|fade spikes only when trend is flat",
+                    "lifecycle_status": "active",
+                    "retired": False,
+                },
+            },
+            {
+                "id": 12,
+                "timestamp": revive_timestamp,
+                "rule": "Avoid thin-confirmation breakout chases.",
+                "version": 3,
+                "metrics": {
+                    "category": "anti_pattern",
+                    "regime": "high_volatility",
+                    "apply_when": {"regime": ["high_volatility"], "volatility": ["high"], "trend": ["up"]},
+                    "ignore_when": ["Ignore when volume confirms the retest."],
+                    "support": 3,
+                    "evidence_journal_ids": [3, 4, 5],
+                    "confidence_score": 0.44,
+                    "validity_score": 0.36,
+                    "canonical_key": "anti_pattern|high_volatility|high|up|avoid thin confirmation breakout chases",
+                    "lifecycle_status": "retired",
+                    "retired": True,
+                    "retirement_reason": "stale_low_confidence",
+                    "revive_count": 1,
+                },
+            },
+        ]
+        new_entries = [
+            {
+                "rule": "Avoid thin confirmation breakout chases after a loss.",
+                "version": 1,
+                "metrics": {
+                    "category": "anti_pattern",
+                    "regime": "high_volatility",
+                    "apply_when": {"regime": ["high_volatility"], "volatility": ["high"], "trend": ["up"]},
+                    "ignore_when": ["Ignore when volume confirms the retest."],
+                    "support": 5,
+                    "evidence_journal_ids": [9, 10, 11],
+                    "confidence_score": 0.74,
+                    "validity_score": 0.74,
+                    "canonical_key": "anti_pattern|high_volatility|high|up|avoid thin confirmation breakout chases",
+                    "lifecycle_status": "active",
+                    "retired": False,
+                },
+            }
+        ]
+
+        reconciled = self.updater._reconcile_long_term_memory_entries(new_entries, existing, now)
+
+        self.assertEqual(len(reconciled), 2)
+        revived = next(item for item in reconciled if item.get("id") == 12)
+        retired = next(item for item in reconciled if item.get("id") == 11)
+        self.assertFalse(revived["metrics"]["retired"])
+        self.assertEqual(revived["metrics"]["lifecycle_status"], "active")
+        self.assertGreaterEqual(revived["metrics"]["revive_count"], 2)
+        self.assertTrue(retired["metrics"]["retired"])
+        self.assertEqual(retired["metrics"]["retirement_reason"], "stale_timeout")
 
 
 if __name__ == "__main__":

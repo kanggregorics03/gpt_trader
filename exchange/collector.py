@@ -286,6 +286,20 @@ class MarketCollector:
         self._append_metric_value(symbol, "open_interest", self._safe_float(derivatives.open_interest, default=None))
         return metrics
 
+    def get_runtime_diagnostics(self) -> Dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        response_cache = getattr(self, "_response_cache", {}) or {}
+        return {
+            "public_feed": self.public_feed.get_diagnostics() if self.public_feed is not None else None,
+            "ohlcv_cache_streams": len(self._ohlcv_cache),
+            "response_cache_entries": len(response_cache),
+            "response_cache_ages_ms": {
+                f"{symbol}:{cache_type}": max(0, now_ms - int(entry.get("cached_at_ms", now_ms)))
+                for (symbol, cache_type), entry in response_cache.items()
+            },
+            "metric_history_symbols": len(self._metric_history),
+        }
+
     def _apply_hysteresis(
         self,
         current_value: float,

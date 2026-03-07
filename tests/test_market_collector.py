@@ -186,6 +186,13 @@ class DynamicMetricsPublicFeed:
     def get_ohlcv_rows(self, symbol, timeframe, limit=80):
         return None
 
+    def get_diagnostics(self):
+        return {
+            "started": True,
+            "message_counts": {"total": self.tick},
+            "stream_ages_ms": {"ticker": 0, "orderbook": 0, "kline": None},
+        }
+
 
 class TestMarketCollector(unittest.TestCase):
     def test_market_snapshot_contains_rich_multi_timeframe_context(self):
@@ -469,6 +476,17 @@ class TestMarketCollector(unittest.TestCase):
         self.assertIsNotNone(snapshot.distance_to_1h_breakout_level)
         self.assertIsNotNone(snapshot.distance_to_invalid_level)
         self.assertGreater(snapshot.distance_to_invalid_level, 0.0)
+
+    def test_runtime_diagnostics_include_public_feed_and_cache_ages(self):
+        collector = MarketCollector(RichExchange(), public_feed=DynamicMetricsPublicFeed())
+
+        collector.get_market_snapshot("BTCUSDT")
+        diagnostics = collector.get_runtime_diagnostics()
+
+        self.assertTrue(diagnostics["public_feed"]["started"])
+        self.assertGreaterEqual(diagnostics["ohlcv_cache_streams"], 4)
+        self.assertGreaterEqual(diagnostics["response_cache_entries"], 0)
+        self.assertGreaterEqual(diagnostics["metric_history_symbols"], 1)
 
 
 if __name__ == "__main__":

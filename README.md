@@ -167,6 +167,7 @@ gpt_trader/
   - WS health state는 `healthy / stale / degraded / reconnecting / down`
   - `healthy`일 때만 WS를 primary source로 사용하고, 나머지 상태에서는 REST fallback 사용
   - WS가 복구되더라도 바로 primary로 복귀하지 않고, private 이벤트 수신 재개 + REST reconcile 1회 성공 + 안정 구간을 통과해야 다시 `healthy`
+  - `get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 확인할 수 있다
 - `MarketCollector`
   - 현재가
   - ATR 15m / ATR 1h
@@ -182,6 +183,7 @@ gpt_trader/
   - 즉 `1h / 4h` 진행 중 봉을 계속 스트리밍하는 것보다, 봉 마감 시점과 5분 cadence에 맞춘 저빈도 fetch를 우선한다
   - ticker / order book / funding / open interest의 REST fallback TTL을 늘려 불필요한 재호출을 줄임
   - 이 구조에서는 높은 WS throttle 자체보다 `bounded lag + 정합성 + 적은 호출 수`가 더 중요하다
+  - public WS는 latest-state overwrite를 유지하고, `get_diagnostics()` / `get_runtime_diagnostics()`로 stream age, symbol age, handler timing, exchange lag를 노출해 큐잉 지연을 감시한다
 
 ### 2. 현재 리스크 상태 계산
 
@@ -275,12 +277,12 @@ gpt_trader/
   - 거래 품질이나 포지션 보유 비용이 나빠져 신규 진입을 줄이거나 막아야 하는 상황
   - 예: `wide_spread`, `elevated_funding`
 
-중요한 점은 `trigger mode` 자체는 기본적으로 `opportunity_trigger`를 기준으로 켜진다는 것이다.  
+중요한 점은 `trigger mode` 자체가 단순히 `opportunity_trigger` 하나로 켜지지는 않는다는 것이다.  
 반면 `risk_trigger`는 AI와 리스크 엔진에 전달되어 더 보수적인 행동을 유도한다.  
 현재 기본 구현에서는 `risk_trigger`를 신규 진입의 하드 차단으로 쓰기보다, 승인 사유에 advisory로 남겨 판단 맥락을 강화한다.
 
 현재 구현에서는 별도의 `Trigger (5m)` 작업이 따로 스케줄되지 않는다.  
-대신 공용 스냅샷에서 `opportunity_trigger`가 감지되면 다음 cadence가 `5m`로 승격되고, trigger가 해제될 때까지 짧은 주기로 더 자주 판단한다.
+대신 공용 스냅샷에서 같은 심볼에 대해 `opportunity_trigger_reasons`가 2개 이상이면서, 그 안에 `volume_surge_15m` 또는 `range_break_1h` 같은 strong trigger가 포함될 때만 다음 cadence가 `5m`로 승격된다. fast move 단독으로는 승격되지 않는다.
 
 `fast_price_move_15m`, `volume_surge_15m`, `range_break_1h`에는 심볼별 히스테리시스를 적용한다.  
 즉, 경계값 부근에서는 직전 상태를 참고해 매 루프마다 `trigger mode`가 깜빡이는 현상을 줄인다.
@@ -767,6 +769,9 @@ Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있�
 - 규칙 본문
 - 버전
 - 구조화 메트릭
+- `confidence_score` / `validity_score` / `decay_score`
+- `lifecycle_status` / `retirement_reason` / `revive_count`
+- `canonical_key` 기반 중복 병합 메타데이터
 
 샘플 row:
 
@@ -914,9 +919,21 @@ run cycle 때뿐 아니라 scheduler poll 구간에서도 active case를 경량 
 - `estimated_pnl_pct`
 - `similarity`, `final_score`
 - `retrieval_source`, `matched_band_count`
+- `outcome_trade_case_id`, `outcome_status`
+- `outcome_realized_pnl`, `outcome_holding_minutes`
+- `outcome_observed_mfe_pct`, `outcome_observed_mae_pct`, `outcome_slippage_bps`
 - `risk_mode`, `payload`
 
-즉 "무슨 유사 사례를 꺼냈는가"만이 아니라, 최종 결정 심볼과 정렬되었는지, 어떤 점수로 선택되었는지도 함께 남긴다.
+즉 "무슨 유사 사례를 꺼냈는가"만이 아니라, 최종 결정 심볼과 정렬되었는지, 어떤 점수로 선택되었는지, 그리고 나중에 실제 trade case 결과가 어땠는지도 함께 남긴다.
+
+추가로 `tools/replay_audit.py`는 같은 audit request를 `similar_past_cases` 포함/제거 두 버전으로 다시 돌려 `retrieval_counterfactual` 비교를 `replay_runs.payload`에 저장할 수 있다.
+memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`, `with_retrieval_better_count`, `without_retrieval_better_count`, `outcome_tie_count`, `avg_outcome_utility_delta`도 같이 들어가서,
+단순 손익 부호뿐 아니라 실제 trade case의 `MFE/MAE`, `slippage`, `holding_minutes`까지 반영한 outcome utility 기준으로 어느 쪽이 더 나았는지 볼 수 있다.
+
+짧은 개선 메모:
+- `MFE/MAE`는 여전히 tick/event 기반이 아니라 snapshot 경로 기반이라, WS 이벤트 단위 path 수집으로 더 올릴 여지가 있다.
+- retrieval은 SQLite coarse index + rerank 구조라, 케이스 수가 크게 늘면 FAISS 또는 `sqlite-vss` 같은 전용 ANN 인덱스로 옮길 수 있다.
+- cluster/retrieval 평가는 자동화됐지만, 미래 holdout 성과와 실포트폴리오 utility 검증을 더 붙이면 더 견고해진다.
 
 ### `replay_runs`
 
@@ -1107,6 +1124,8 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 최근 버전의 `trade_case_clusters`에는 `quality_score`, `quality_label`, `evaluation.silhouette_score`, `evaluation.consistency_score`가 같이 들어가서,
 군집을 그냥 묶는 데서 끝나지 않고 "이 군집이 실제로 반복성과 설명력이 있는가"를 자동 평가한다.
 또한 `retired`, `retirement_reason`을 함께 계산해, holdout에서 더 이상 같은 손실 패턴이 재현되지 않거나 품질이 너무 낮은 cluster는 candidate lesson seed에서 자동 제외한다.
+또한 memory batch는 `retrieval_evaluation_summary`와 `retrieval_counterfactual_summary`를 함께 읽어,
+retrieval이 실제 성과와 반사실 비교 기준에서 얼마나 의미 있었는지, 그리고 그 차이가 path quality 기준으로도 유지되는지 장기 메모리 판단 근거로 남긴다.
 
 ### 기본 원칙
 

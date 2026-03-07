@@ -256,6 +256,43 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertTrue(feed.needs_periodic_reconcile())
         self.assertIsNone(feed.get_account_state(["BTCUSDT"]))
 
+    def test_diagnostics_include_event_counts_lag_and_handler_stats(self):
+        feed = ControlledTimeFeed(
+            api_key="key",
+            api_secret="secret",
+            ws_factory=DummyPrivateWebSocket,
+            now_ms=1_000_000,
+        )
+        feed.start()
+        feed._handle_execution_message(
+            {
+                "creationTime": "999980",
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "execId": "exec-1",
+                        "orderId": "order-1",
+                        "orderLinkId": "client-1",
+                        "side": "Buy",
+                        "execPrice": "30010",
+                        "execQty": "0.1",
+                        "execValue": "3001",
+                        "execFee": "2.1",
+                        "execTime": "999980",
+                    }
+                ],
+            }
+        )
+
+        diagnostics = feed.get_diagnostics()
+
+        self.assertEqual(diagnostics["event_counts"]["total"], 1)
+        self.assertEqual(diagnostics["event_counts"]["execution"], 1)
+        self.assertEqual(diagnostics["last_private_event_age_ms"], 0)
+        self.assertEqual(diagnostics["exchange_lag_ms"]["execution"]["last_ms"], 20.0)
+        self.assertEqual(diagnostics["cache_sizes"]["execution_symbols"], 1)
+        self.assertEqual(diagnostics["handler_stats"]["execution"]["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

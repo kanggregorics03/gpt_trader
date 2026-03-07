@@ -145,6 +145,22 @@ class AccountReader:
         if private_feed is not None:
             private_feed.mark_reconcile_required()
 
+    def get_runtime_diagnostics(self) -> Dict[str, Any]:
+        cache_entry = getattr(self, "_account_state_cache", None) or {}
+        now_ms = int(time.time() * 1000)
+        cached_at_ms = int(cache_entry.get("cached_at_ms") or 0)
+        private_feed = getattr(self, "private_feed", None)
+        return {
+            "cache": {
+                "cache_ttl_ms": int(getattr(self, "cache_ttl_ms", 0) or 0),
+                "cached_at_ms": cached_at_ms or None,
+                "cache_age_ms": (now_ms - cached_at_ms) if cached_at_ms > 0 else None,
+                "cached_symbol_count": len(cache_entry.get("cache_key") or ()),
+                "has_cached_state": cache_entry.get("state") is not None,
+            },
+            "private_feed": private_feed.get_diagnostics() if private_feed is not None else None,
+        }
+
     def _get_cached_account_state(self, cache_key: tuple[str, ...]) -> Optional[AccountState]:
         ttl_ms = int(getattr(self, "cache_ttl_ms", 0) or 0)
         if ttl_ms <= 0:

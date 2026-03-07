@@ -22,6 +22,7 @@ class SnapshotBundle:
 class SnapshotService:
     DEFAULT_TIMEFRAME_LIMITS = {"5m": 80, "15m": 80, "1h": 80, "4h": 80}
     TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+    STRONG_TRIGGER_REASONS = {"volume_surge_15m", "range_break_1h"}
 
     def __init__(
         self,
@@ -79,6 +80,15 @@ class SnapshotService:
             drawdown_activate_pct=drawdown_activate_pct,
         )
 
+    def _should_enable_trigger_mode(self, market_snapshots: Dict[str, MarketSnapshot]) -> bool:
+        for snapshot in (market_snapshots or {}).values():
+            reasons = list(snapshot.opportunity_trigger_reasons or [])
+            if len(reasons) < 2:
+                continue
+            if any(reason in self.STRONG_TRIGGER_REASONS for reason in reasons):
+                return True
+        return False
+
     def materialize(self, now_epoch: float | None = None, force: bool = False) -> SnapshotBundle:
         now_epoch = time.time() if now_epoch is None else float(now_epoch)
         current_bucket = self._bucket(now_epoch, self.materialization_minutes)
@@ -117,9 +127,7 @@ class SnapshotService:
                 self.TIMEFRAME_MINUTES[timeframe],
             )
 
-        is_trigger_mode = any(
-            snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
-        )
+        is_trigger_mode = self._should_enable_trigger_mode(market_snapshots)
         risk_mode = self.risk_engine.get_active_risk_mode(
             risk_state=risk_state,
             is_trigger_mode=is_trigger_mode,

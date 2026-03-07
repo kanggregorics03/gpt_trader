@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from google import genai
 from google.genai import types
@@ -60,23 +60,220 @@ class DecisionEngine:
     def _compact_json(self, payload) -> str:
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
+    def _round_compact_value(self, value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 4)
+        if isinstance(value, list):
+            return [self._round_compact_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._round_compact_value(item) for key, item in value.items()}
+        return value
+
+    def _drop_empty(self, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            cleaned = {}
+            for key, value in payload.items():
+                compacted = self._drop_empty(value)
+                if compacted is None:
+                    continue
+                if compacted == {} or compacted == []:
+                    continue
+                cleaned[key] = compacted
+            return cleaned
+        if isinstance(payload, list):
+            cleaned = [self._drop_empty(item) for item in payload]
+            return [item for item in cleaned if item is not None and item != {} and item != []]
+        return payload
+
+    def _truncate_text(self, value: Any, limit: int = 220) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
+    def _compact_timeframe_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "timeframe": payload.get("timeframe"),
+            "last_close": payload.get("last_close"),
+            "atr_pct": payload.get("atr_pct"),
+            "realized_volatility_pct": payload.get("realized_volatility_pct"),
+            "rsi_14": payload.get("rsi_14"),
+            "trend": payload.get("trend"),
+            "change_1bar_pct": payload.get("change_1bar_pct"),
+            "change_3bar_pct": payload.get("change_3bar_pct"),
+            "change_6bar_pct": payload.get("change_6bar_pct"),
+            "distance_to_range_high_pct": payload.get("distance_to_range_high_pct"),
+            "distance_to_range_low_pct": payload.get("distance_to_range_low_pct"),
+            "range_position_pct": payload.get("range_position_pct"),
+            "breakout_up": payload.get("breakout_up"),
+            "breakout_down": payload.get("breakout_down"),
+            "volume_ratio": payload.get("volume_ratio"),
+            "volume_surge": payload.get("volume_surge"),
+            "close_vs_vwap_pct": payload.get("close_vs_vwap_pct"),
+        }
+        return self._drop_empty(self._round_compact_value(compact))
+
+    def _compact_market_snapshot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "symbol": payload.get("symbol"),
+            "current_price": payload.get("current_price"),
+            "mark_price": payload.get("mark_price"),
+            "index_price": payload.get("index_price"),
+            "atr_15m": payload.get("atr_15m"),
+            "atr_1h": payload.get("atr_1h"),
+            "trend_1h": payload.get("trend_1h"),
+            "price_change_24h_pct": payload.get("price_change_24h_pct"),
+            "distance_from_24h_high_pct": payload.get("distance_from_24h_high_pct"),
+            "distance_from_24h_low_pct": payload.get("distance_from_24h_low_pct"),
+            "recent_volume_surge": payload.get("recent_volume_surge"),
+            "volume_ratio_15m": payload.get("volume_ratio_15m"),
+            "volume_surge_15m_now": payload.get("volume_surge_15m_now"),
+            "fast_move_trigger_active": payload.get("fast_move_trigger_active"),
+            "volume_surge_trigger_active": payload.get("volume_surge_trigger_active"),
+            "range_break_trigger_active": payload.get("range_break_trigger_active"),
+            "oi_change_15m": payload.get("oi_change_15m"),
+            "oi_change_1h": payload.get("oi_change_1h"),
+            "funding_rate_change_1h": payload.get("funding_rate_change_1h"),
+            "basis_change_1h": payload.get("basis_change_1h"),
+            "spread_vs_1h_avg": payload.get("spread_vs_1h_avg"),
+            "spread_percentile_1h": payload.get("spread_percentile_1h"),
+            "depth_percentile_1h": payload.get("depth_percentile_1h"),
+            "distance_to_15m_breakout_level": payload.get("distance_to_15m_breakout_level"),
+            "distance_to_1h_breakout_level": payload.get("distance_to_1h_breakout_level"),
+            "distance_to_invalid_level": payload.get("distance_to_invalid_level"),
+            "is_opportunity_trigger": payload.get("is_opportunity_trigger"),
+            "is_risk_trigger": payload.get("is_risk_trigger"),
+            "opportunity_trigger_reasons": payload.get("opportunity_trigger_reasons"),
+            "risk_trigger_reasons": payload.get("risk_trigger_reasons"),
+            "trigger_reasons": payload.get("trigger_reasons"),
+            "timeframes": {
+                key: self._compact_timeframe_snapshot(value)
+                for key, value in (payload.get("timeframes") or {}).items()
+                if key in {"5m", "15m", "1h", "4h"} and isinstance(value, dict)
+            },
+            "order_book": {
+                "best_bid": ((payload.get("order_book") or {}).get("best_bid")),
+                "best_ask": ((payload.get("order_book") or {}).get("best_ask")),
+                "spread_bps": ((payload.get("order_book") or {}).get("spread_bps")),
+                "mid_price": ((payload.get("order_book") or {}).get("mid_price")),
+                "bid_depth_top5": ((payload.get("order_book") or {}).get("bid_depth_top5")),
+                "ask_depth_top5": ((payload.get("order_book") or {}).get("ask_depth_top5")),
+                "imbalance_top5": ((payload.get("order_book") or {}).get("imbalance_top5")),
+                "microprice": ((payload.get("order_book") or {}).get("microprice")),
+            },
+            "derivatives": {
+                "basis_pct": ((payload.get("derivatives") or {}).get("basis_pct")),
+                "funding_rate": ((payload.get("derivatives") or {}).get("funding_rate")),
+                "next_funding_rate": ((payload.get("derivatives") or {}).get("next_funding_rate")),
+                "open_interest": ((payload.get("derivatives") or {}).get("open_interest")),
+            },
+            "regime": {
+                "trend_alignment": ((payload.get("regime") or {}).get("trend_alignment")),
+                "volatility_regime": ((payload.get("regime") or {}).get("volatility_regime")),
+                "momentum_regime": ((payload.get("regime") or {}).get("momentum_regime")),
+                "liquidity_regime": ((payload.get("regime") or {}).get("liquidity_regime")),
+            },
+        }
+        return self._drop_empty(self._round_compact_value(compact))
+
     def _build_market_payload(self, request: DecisionRequest):
         if request.market_snapshots:
             return {
-                symbol: snapshot.model_dump(mode="json")
+                symbol: self._compact_market_snapshot_payload(snapshot.model_dump(mode="json"))
                 for symbol, snapshot in request.market_snapshots.items()
             }
         if request.market_snapshot is not None:
-            return request.market_snapshot.model_dump(mode="json")
+            return self._compact_market_snapshot_payload(request.market_snapshot.model_dump(mode="json"))
         return {}
 
     def _build_recent_journal_context_payload(self, request: DecisionRequest):
         payload = []
         for item in request.recent_journal_context:
-            if hasattr(item, "model_dump"):
-                payload.append(item.model_dump(mode="json"))
+            raw = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+            rationale = raw.get("rationale") or []
+            evidence_quality = raw.get("evidence_quality") or {}
+            entry_size_cap = raw.get("entry_size_cap") or {}
+            payload.append(
+                self._drop_empty(
+                    {
+                        "journal_id": raw.get("journal_id") or raw.get("id"),
+                        "audit_log_id": raw.get("audit_log_id"),
+                        "timestamp": raw.get("timestamp"),
+                        "decision": raw.get("decision"),
+                        "summary": self._truncate_text(raw.get("summary") or (rationale[0] if rationale else ""), limit=160),
+                        "case_summary": self._truncate_text(raw.get("case_summary"), limit=180),
+                        "confidence": raw.get("confidence"),
+                        "risk_reason": self._truncate_text(raw.get("risk_reason"), limit=120),
+                        "estimated_pnl_pct": raw.get("estimated_pnl_pct"),
+                        "loss_signal": raw.get("loss_signal"),
+                        "risk_mode": raw.get("risk_mode"),
+                        "trigger_symbols": (raw.get("trigger_symbols") or [])[:3],
+                        "risk_trigger_symbols": (raw.get("risk_trigger_symbols") or [])[:3],
+                        "trade_case_ids": (raw.get("trade_case_ids") or [])[:3],
+                        "case_statuses": raw.get("case_statuses") or {},
+                        "evidence_quality": {
+                            "factor": evidence_quality.get("factor"),
+                            "issues": (evidence_quality.get("issues") or [])[:2],
+                        },
+                        "entry_size_cap": {
+                            "adjusted": entry_size_cap.get("adjusted"),
+                            "effective_cap_pct": entry_size_cap.get("effective_cap_pct"),
+                            "base_cap_pct": entry_size_cap.get("base_cap_pct"),
+                        },
+                    }
+                )
+            )
+        return payload
+
+    def _build_long_term_memory_payload(self, request: DecisionRequest):
+        payload = []
+        for item in request.long_term_memory:
+            if isinstance(item, LongTermMemoryRecord):
+                raw = item.model_dump(mode="json")
+            elif isinstance(item, dict):
+                raw = dict(item)
             else:
-                payload.append(dict(item))
+                raw = {"rule": str(item)}
+            metrics = raw.get("metrics") or {}
+            payload.append(
+                self._drop_empty(
+                    self._round_compact_value(
+                        {
+                            "rule": self._truncate_text(raw.get("rule"), limit=220),
+                            "category": raw.get("category"),
+                            "status": raw.get("status"),
+                            "support": raw.get("support"),
+                            "regime": raw.get("regime"),
+                            "apply_when": raw.get("apply_when") or {},
+                            "ignore_when": (raw.get("ignore_when") or [])[:1],
+                            "metrics": {
+                                "confidence_score": metrics.get("confidence_score"),
+                                "validity_score": metrics.get("validity_score"),
+                                "freshness_score": metrics.get("freshness_score"),
+                                "lifecycle_status": metrics.get("lifecycle_status"),
+                            },
+                        }
+                    )
+                )
+            )
+        return payload
+
+    def _build_similar_past_cases_payload(self, request: DecisionRequest):
+        payload = []
+        for item in request.similar_past_cases:
+            if isinstance(item, str):
+                payload.append(self._truncate_text(item, limit=220))
+            elif isinstance(item, dict):
+                payload.append(
+                    self._drop_empty(
+                        {
+                            "symbol": item.get("symbol"),
+                            "summary": self._truncate_text(item.get("summary") or item.get("case"), limit=200),
+                            "outcome": self._truncate_text(item.get("outcome"), limit=120),
+                            "why_similar": self._truncate_text(item.get("why_similar"), limit=120),
+                        }
+                    )
+                )
         return payload
 
     def _build_stable_account_payload(self, request: DecisionRequest) -> dict:
@@ -86,11 +283,10 @@ class DecisionEngine:
         return payload
         
     def _create_prompt(self, request: DecisionRequest) -> str:
-        memory_payload = [
-            item.model_dump() if isinstance(item, LongTermMemoryRecord) else item
-            for item in request.long_term_memory
-        ]
         market_payload = self._build_market_payload(request)
+        memory_payload = self._build_long_term_memory_payload(request)
+        recent_journal_payload = self._build_recent_journal_context_payload(request)
+        similar_cases_payload = self._build_similar_past_cases_payload(request)
         prompt = f"""
 You are an expert crypto trading strategist.
 You are ONLY a strategist. Do not bypass risk limits.
@@ -110,15 +306,16 @@ risk_mode:
 risk_profile:
 {self._compact_json(request.risk_profile)}
 recent_journal_context:
-{self._compact_json(self._build_recent_journal_context_payload(request))}
+{self._compact_json(recent_journal_payload)}
 long_term_memory:
 {self._compact_json(memory_payload)}
 similar_past_cases:
-{self._compact_json(request.similar_past_cases)}
+{self._compact_json(similar_cases_payload)}
 trigger_mode_active:
 {str(request.is_trigger_mode).lower()}
 
 MARKET INTERPRETATION
+0. market_context, recent_journal_context, long_term_memory, and similar_past_cases are compact decision views. They intentionally remove low-value duplication while preserving decision-critical structure, trigger, execution, and outcome information.
 1. Prefer derived fields such as change, percentile, distance, and trigger-state over raw values when making decisions.
 2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_trigger_active is the stabilized trigger state after hysteresis. Do not treat them as interchangeable.
 3. fast_move_trigger_active, volume_surge_trigger_active, and range_break_trigger_active represent stabilized trigger states and matter more for cadence and follow-through than one-bar noise.
@@ -168,6 +365,8 @@ OUTPUT EXAMPLE
             "risk_mode": request.risk_mode,
             "risk_profile": request.risk_profile,
             "recent_journal_context": self._build_recent_journal_context_payload(request),
+            "long_term_memory": self._build_long_term_memory_payload(request),
+            "similar_past_cases": self._build_similar_past_cases_payload(request),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

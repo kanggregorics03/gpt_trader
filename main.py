@@ -999,6 +999,10 @@ class TradingOrchestrator:
             "status": row.get("status") or metrics.get("status") or "rule",
             "category": row.get("category") or metrics.get("category") or "lesson",
             "regime": row.get("regime") or metrics.get("regime") or "general",
+            "confidence_score": float(row.get("confidence_score") or metrics.get("confidence_score") or 0.0),
+            "validity_score": float(row.get("validity_score") or metrics.get("validity_score") or 0.0),
+            "freshness_score": float(row.get("freshness_score") or metrics.get("freshness_score") or 0.0),
+            "lifecycle_status": row.get("lifecycle_status") or metrics.get("lifecycle_status") or "active",
             "apply_when": apply_when,
             "ignore_when": ignore_when[:max_ignore_when],
             "evidence_journal_ids": evidence_ids[:10],
@@ -1028,17 +1032,28 @@ class TradingOrchestrator:
         scored = []
         for index, row in enumerate(rows):
             score = 0.0
+            metrics = row.get("metrics") or {}
             status = str(row.get("status") or "rule")
             support = int(row.get("support") or 0)
             category = str(row.get("category") or "lesson")
             rule_text = str(row.get("rule") or "")
             apply_when = row.get("apply_when") or {}
+            confidence_score = float(row.get("confidence_score") or metrics.get("confidence_score") or 0.0)
+            validity_score = float(row.get("validity_score") or metrics.get("validity_score") or 0.0)
+            freshness_score = float(row.get("freshness_score") or metrics.get("freshness_score") or 0.0)
+            lifecycle_status = str(row.get("lifecycle_status") or metrics.get("lifecycle_status") or "active")
+            retired = bool(row.get("retired") or metrics.get("retired"))
+            if retired or lifecycle_status == "retired":
+                continue
             apply_regimes = set(apply_when.get("regime") or [])
             apply_trends = set(apply_when.get("trend") or [])
             apply_volatility = set(apply_when.get("volatility") or [])
 
             score += 8.0 if status == "rule" else 3.0
             score += min(10.0, float(support))
+            score += confidence_score * 10.0
+            score += validity_score * 8.0
+            score += freshness_score * 4.0
             if category == "risk_control":
                 score += 4.0
             if str(risk_mode or "") in apply_regimes:
@@ -1194,12 +1209,18 @@ class TradingOrchestrator:
         intent,
         estimated_pnl_pct: float | None,
         risk_mode: str,
+        symbol_journal_entries: list[dict] | None = None,
     ) -> None:
         if not audit_log_id or not hasattr(self.state_store, "save_retrieval_evaluations"):
             return
         raw_matches = list(getattr(self, "last_similar_case_matches", []) or [])
         if not raw_matches:
             return
+        entry_lookup = {
+            str((entry or {}).get("symbol") or ""): (entry or {})
+            for entry in (symbol_journal_entries or [])
+            if str((entry or {}).get("symbol") or "").strip()
+        }
         decision_symbols = {
             str(getattr(order, "symbol", "") or "").strip()
             for order in (getattr(intent, "orders", []) or [])
@@ -1208,6 +1229,7 @@ class TradingOrchestrator:
         entries = []
         for index, match in enumerate(raw_matches, start=1):
             matched_symbol = str(match.get("matched_symbol") or match.get("case_symbol") or "").strip()
+            symbol_entry = entry_lookup.get(matched_symbol) or entry_lookup.get(str(match.get("case_symbol") or "").strip()) or {}
             entries.append(
                 {
                     "context_type": str(match.get("context_type") or "similar_past_cases"),
@@ -1223,10 +1245,44 @@ class TradingOrchestrator:
                     "retrieval_source": match.get("retrieval_source"),
                     "matched_band_count": match.get("matched_band_count") or 0,
                     "risk_mode": risk_mode,
+                    "outcome_trade_case_id": symbol_entry.get("trade_case_id"),
+                    "outcome_status": symbol_entry.get("case_status"),
+                    "outcome_realized_pnl": symbol_entry.get("net_realized_pnl"),
+                    "outcome_estimated_pnl_pct": symbol_entry.get("estimated_pnl_pct"),
+                    "outcome_holding_minutes": symbol_entry.get("holding_minutes"),
+                    "outcome_observed_mfe_pct": symbol_entry.get("observed_mfe_pct"),
+                    "outcome_observed_mae_pct": symbol_entry.get("observed_mae_pct"),
+                    "outcome_slippage_bps": symbol_entry.get("slippage_bps"),
+                    "outcome_updated_at": symbol_entry.get("case_closed_at") or symbol_entry.get("case_opened_at"),
                     "payload": match.get("payload") or {},
                 }
             )
         self.state_store.save_retrieval_evaluations(audit_log_id, entries)
+
+    def _backfill_retrieval_outcomes_for_symbol_entries(
+        self,
+        symbol_journal_entries: list[dict] | None,
+    ) -> None:
+        if not hasattr(self.state_store, "update_retrieval_evaluations_for_trade_case"):
+            return
+        for entry in symbol_journal_entries or []:
+            trade_case_id = str(entry.get("trade_case_id") or "").strip()
+            symbol = str(entry.get("symbol") or "").strip()
+            if not trade_case_id or not symbol:
+                continue
+            self.state_store.update_retrieval_evaluations_for_trade_case(
+                trade_case_id=trade_case_id,
+                case_symbol=symbol,
+                entry_audit_log_id=entry.get("audit_log_id"),
+                outcome_status=entry.get("case_status"),
+                outcome_realized_pnl=entry.get("net_realized_pnl"),
+                outcome_estimated_pnl_pct=entry.get("estimated_pnl_pct"),
+                outcome_holding_minutes=entry.get("holding_minutes"),
+                outcome_observed_mfe_pct=entry.get("observed_mfe_pct"),
+                outcome_observed_mae_pct=entry.get("observed_mae_pct"),
+                outcome_slippage_bps=entry.get("slippage_bps"),
+                outcome_updated_at=entry.get("case_closed_at") or entry.get("case_opened_at"),
+            )
 
     def _build_position_ledger_entries(self, intent, fills, execution_summary):
         if not fills:
@@ -2652,12 +2708,6 @@ class TradingOrchestrator:
                 ),
             )
             if audit_id is not None:
-                self._save_retrieval_evaluations_for_audit(
-                    audit_log_id=audit_id,
-                    intent=intent,
-                    estimated_pnl_pct=estimated_pnl_pct,
-                    risk_mode=risk_mode,
-                )
                 ledger_entries = []
                 position_state_transitions = []
                 if fills:
@@ -2705,6 +2755,14 @@ class TradingOrchestrator:
                     risk_state=risk_state,
                     observed_at=observed_at,
                 )
+                self._save_retrieval_evaluations_for_audit(
+                    audit_log_id=audit_id,
+                    intent=intent,
+                    estimated_pnl_pct=estimated_pnl_pct,
+                    risk_mode=risk_mode,
+                    symbol_journal_entries=symbol_journal_entries,
+                )
+                self._backfill_retrieval_outcomes_for_symbol_entries(symbol_journal_entries)
                 self.state_store.save_symbol_journal_entries(symbol_journal_entries)
                 trade_case_snapshot_entries = self._build_trade_case_snapshot_entries(
                     audit_log_id=audit_id,

@@ -251,6 +251,28 @@ class TestStateStore(unittest.TestCase):
         self.assertTrue(rows[0]["decision_symbol_aligned"])
         self.assertEqual(rows[0]["payload"]["thesis_failure_reason"], "execution_quality_degraded:wide_spread")
 
+        self.store.update_retrieval_evaluations_for_trade_case(
+            trade_case_id="BTCUSDT-live-case-1",
+            case_symbol="BTCUSDT",
+            entry_audit_log_id=audit_id,
+            outcome_status="closed",
+            outcome_realized_pnl=12.5,
+            outcome_estimated_pnl_pct=0.7,
+            outcome_holding_minutes=45.0,
+            outcome_observed_mfe_pct=1.8,
+            outcome_observed_mae_pct=-0.4,
+            outcome_slippage_bps=3.2,
+            outcome_updated_at="2026-03-07 11:00:00",
+        )
+
+        updated = self.store.get_retrieval_evaluations_since(
+            datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+        )
+        self.assertEqual(updated[0]["outcome_trade_case_id"], "BTCUSDT-live-case-1")
+        self.assertEqual(updated[0]["outcome_status"], "closed")
+        self.assertEqual(updated[0]["outcome_realized_pnl"], 12.5)
+        self.assertEqual(updated[0]["outcome_holding_minutes"], 45.0)
+
     def test_monitoring_snapshot_includes_recent_symbol_journal(self):
         audit_id = self.store.save_audit(
             account={"total_balance": 1000},
@@ -527,6 +549,7 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(recent_replays[0]["evidence_signals_added"], ["ETHUSDT:spread_bps@microstructure"])
         self.assertEqual(recent_replays[0]["evidence_signals_removed"], ["ETHUSDT:rsi_14@15m"])
         self.assertEqual(audit["replay_runs"][0]["replayed_decision"], "REDUCE")
+        self.assertIn("payload", recent_replays[0])
         self.assertEqual(audit["ledger_entries"][0]["symbol"], "ETHUSDT")
         self.assertEqual(audit["order_state_transitions"][0]["to_state"], "submitted")
         self.assertEqual(audit["position_state_transitions"][0]["to_state"], "closed")
@@ -559,6 +582,53 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(memory[0]["rule"], "Only fade spikes when higher timeframe trend is flat.")
         self.assertEqual(memory[0]["apply_when"]["trend"], ["flat"])
         self.assertEqual(memory[0]["ignore_when"], ["Ignore in strong breakout continuation."])
+
+    def test_save_long_term_memory_entries_updates_existing_rows(self):
+        self.store.save_long_term_memory_entries(
+            [
+                {
+                    "rule": "Keep size small during wide spreads.",
+                    "version": 1,
+                    "metrics": {
+                        "status": "rule",
+                        "support": 4,
+                        "category": "risk_control",
+                        "regime": "general",
+                        "confidence_score": 0.41,
+                        "validity_score": 0.41,
+                        "retired": False,
+                    },
+                }
+            ]
+        )
+        original = self.store.get_recent_long_term_memory(limit=5)[0]
+
+        self.store.save_long_term_memory_entries(
+            [
+                {
+                    "id": original["id"],
+                    "rule": "Keep size smaller during wide spreads.",
+                    "version": 2,
+                    "metrics": {
+                        "status": "rule",
+                        "support": 6,
+                        "category": "risk_control",
+                        "regime": "general",
+                        "confidence_score": 0.77,
+                        "validity_score": 0.73,
+                        "retired": False,
+                    },
+                }
+            ]
+        )
+
+        rows = self.store.get_recent_long_term_memory(limit=5)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], original["id"])
+        self.assertEqual(rows[0]["version"], 2)
+        self.assertEqual(rows[0]["rule"], "Keep size smaller during wide spreads.")
+        self.assertAlmostEqual(rows[0]["confidence_score"], 0.77)
 
     def test_get_risk_state_marks_drawdown_mode(self):
         self.store.save_audit(

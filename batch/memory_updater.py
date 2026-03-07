@@ -79,6 +79,13 @@ class MemoryUpdater:
             return fetcher(since)
         return []
 
+    def _fetch_replay_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
+        since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
+        fetcher = getattr(self.state_store, "get_replay_runs_since", None)
+        if callable(fetcher):
+            return fetcher(since)
+        return []
+
     def _build_stats_package(
         self,
         journals: List[Dict[str, Any]],
@@ -86,10 +93,12 @@ class MemoryUpdater:
         symbol_journals: List[Dict[str, Any]] | None = None,
         trade_cases: List[Dict[str, Any]] | None = None,
         retrieval_evaluations: List[Dict[str, Any]] | None = None,
+        replay_runs: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         symbol_journals = symbol_journals or []
         trade_cases = trade_cases or []
         retrieval_evaluations = retrieval_evaluations or []
+        replay_runs = replay_runs or []
         ledger_stats = self.state_store.get_position_ledger_stats(hours=window_hours)
         symbol_report = self.state_store.get_symbol_performance_report(hours=window_hours)
         daily_report = self.state_store.get_daily_ledger_report(days=max(1, round(window_hours / 24)))
@@ -140,6 +149,12 @@ class MemoryUpdater:
         trade_case_clusters = self._build_trade_case_clusters(trade_cases)
         trade_case_cluster_evaluation = self._summarize_trade_case_cluster_quality(trade_case_clusters)
         retrieval_evaluation_summary = self._build_retrieval_evaluation_summary(retrieval_evaluations)
+        retrieval_counterfactual_summary = self._build_retrieval_counterfactual_summary(replay_runs)
+        retrieval_counterfactual_summary = self._apply_retrieval_outcome_counterfactual_summary(
+            retrieval_counterfactual_summary,
+            replay_runs=replay_runs,
+            retrieval_evaluations=retrieval_evaluations,
+        )
         trade_case_candidate_lessons = self._build_trade_case_candidate_lessons(trade_case_patterns)
         trade_case_cluster_candidate_lessons = self._build_trade_case_cluster_candidate_lessons(trade_case_clusters)
         merged_candidate_lessons = self._merge_candidate_lesson_dicts(
@@ -160,6 +175,7 @@ class MemoryUpdater:
             "symbol_journal_count": len(symbol_journals),
             "trade_case_count": len(trade_cases),
             "retrieval_evaluation_count": len(retrieval_evaluations),
+            "replay_run_count": len(replay_runs),
             "closed_trade_case_count": len([case for case in trade_cases if str(case.get("status") or "") == "closed"]),
             "evaluated_trade_count": len(pnl_rows),
             "win_count": len(wins),
@@ -181,6 +197,7 @@ class MemoryUpdater:
             "trade_case_clusters": trade_case_clusters,
             "trade_case_cluster_evaluation": trade_case_cluster_evaluation,
             "retrieval_evaluation_summary": retrieval_evaluation_summary,
+            "retrieval_counterfactual_summary": retrieval_counterfactual_summary,
             "candidate_lessons": merged_candidate_lessons,
             "top_losses": [
                 {
@@ -280,6 +297,17 @@ class MemoryUpdater:
                     "matched_band_count": row.get("matched_band_count"),
                 }
                 for row in retrieval_evaluations[-20:]
+            ],
+            "recent_retrieval_counterfactuals": [
+                {
+                    "audit_log_id": row.get("audit_log_id"),
+                    "decision_changed": bool(((row.get("payload") or {}).get("retrieval_counterfactual") or {}).get("with_vs_without_comparison", {}).get("decision_changed")),
+                    "side_changed": bool(((row.get("payload") or {}).get("retrieval_counterfactual") or {}).get("with_vs_without_comparison", {}).get("side_changed")),
+                    "confidence_delta": ((row.get("payload") or {}).get("retrieval_counterfactual") or {}).get("with_vs_without_comparison", {}).get("confidence_delta"),
+                    "size_delta": ((row.get("payload") or {}).get("retrieval_counterfactual") or {}).get("with_vs_without_comparison", {}).get("size_delta"),
+                }
+                for row in replay_runs[-20:]
+                if ((row.get("payload") or {}).get("retrieval_counterfactual") or {})
             ],
         }
 
@@ -760,6 +788,7 @@ class MemoryUpdater:
             return {
                 "evaluation_count": 0,
                 "aligned_count": 0,
+                "settled_count": 0,
                 "avg_similarity": 0.0,
                 "avg_final_score": 0.0,
                 "avg_matched_band_count": 0.0,
@@ -770,6 +799,7 @@ class MemoryUpdater:
             }
         source_counts: Dict[str, int] = {}
         aligned_count = 0
+        settled_count = 0
         similarity_sum = 0.0
         similarity_count = 0
         final_score_sum = 0.0
@@ -809,9 +839,18 @@ class MemoryUpdater:
                 pass
             pnl = row.get("estimated_pnl_pct")
             try:
-                pnl_value = float(pnl) if pnl is not None else None
+                pnl_source = (
+                    row.get("outcome_realized_pnl")
+                    if row.get("outcome_realized_pnl") is not None
+                    else row.get("outcome_estimated_pnl_pct")
+                )
+                if pnl_source is None:
+                    pnl_source = pnl
+                pnl_value = float(pnl_source) if pnl_source is not None else None
             except (TypeError, ValueError):
                 pnl_value = None
+            if row.get("outcome_status") is not None or row.get("outcome_trade_case_id") is not None:
+                settled_count += 1
             if pnl_value is not None and pnl_value > 0:
                 win_count += 1
                 if aligned:
@@ -822,6 +861,7 @@ class MemoryUpdater:
         return {
             "evaluation_count": total,
             "aligned_count": aligned_count,
+            "settled_count": settled_count,
             "avg_similarity": round(similarity_sum / similarity_count, 4) if similarity_count else 0.0,
             "avg_final_score": round(final_score_sum / final_score_count, 4) if final_score_count else 0.0,
             "avg_matched_band_count": round(matched_band_sum / total, 4) if total else 0.0,
@@ -830,6 +870,206 @@ class MemoryUpdater:
             "unaligned_win_rate_pct": round((unaligned_win_count / unaligned_total) * 100, 2) if unaligned_total else 0.0,
             "source_counts": source_counts,
         }
+
+    def _build_retrieval_counterfactual_summary(self, replay_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rows = [
+            {
+                "audit_log_id": row.get("audit_log_id"),
+                "counterfactual": ((row.get("payload") or {}).get("retrieval_counterfactual") or {}),
+            }
+            for row in replay_runs or []
+        ]
+        rows = [row for row in rows if row.get("counterfactual")]
+        if not rows:
+            return {
+                "evaluation_count": 0,
+                "decision_changed_count": 0,
+                "side_changed_count": 0,
+                "avg_confidence_delta": 0.0,
+                "avg_size_delta": 0.0,
+                "outcome_linked_count": 0,
+                "with_retrieval_better_count": 0,
+                "without_retrieval_better_count": 0,
+                "outcome_tie_count": 0,
+                "avg_outcome_utility_delta": 0.0,
+            }
+        decision_changed = 0
+        side_changed = 0
+        confidence_delta_sum = 0.0
+        size_delta_sum = 0.0
+        for row in rows:
+            comparison = row.get("counterfactual", {}).get("with_vs_without_comparison") or {}
+            if bool(comparison.get("decision_changed")):
+                decision_changed += 1
+            if bool(comparison.get("side_changed")):
+                side_changed += 1
+            try:
+                confidence_delta_sum += float(comparison.get("confidence_delta") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                size_delta_sum += abs(float(comparison.get("size_delta") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        total = len(rows)
+        return {
+            "evaluation_count": total,
+            "decision_changed_count": decision_changed,
+            "side_changed_count": side_changed,
+            "avg_confidence_delta": round(confidence_delta_sum / total, 6) if total else 0.0,
+            "avg_size_delta": round(size_delta_sum / total, 6) if total else 0.0,
+            "outcome_linked_count": 0,
+            "with_retrieval_better_count": 0,
+            "without_retrieval_better_count": 0,
+            "outcome_tie_count": 0,
+            "avg_outcome_utility_delta": 0.0,
+        }
+
+    def _coerce_float(self, value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _build_retrieval_outcome_metrics(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        realized_pnl = self._coerce_float(row.get("outcome_realized_pnl"))
+        estimated_pnl = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+        pnl = realized_pnl if realized_pnl is not None else estimated_pnl
+        mfe = self._coerce_float(row.get("outcome_observed_mfe_pct"))
+        mae = self._coerce_float(row.get("outcome_observed_mae_pct"))
+        slippage_bps = self._coerce_float(row.get("outcome_slippage_bps"))
+        holding_minutes = self._coerce_float(row.get("outcome_holding_minutes"))
+        metrics = {
+            "pnl": pnl,
+            "mfe": max(0.0, mfe or 0.0) if mfe is not None else None,
+            "mae": abs(mae) if mae is not None else None,
+            "slippage_bps": max(0.0, slippage_bps or 0.0) if slippage_bps is not None else None,
+            "holding_minutes": max(0.0, holding_minutes or 0.0) if holding_minutes is not None else None,
+            "_has_realized_pnl": realized_pnl is not None,
+        }
+        metrics["_data_points"] = sum(
+            1 for key in ("pnl", "mfe", "mae", "slippage_bps", "holding_minutes") if metrics.get(key) is not None
+        )
+        return metrics
+
+    def _merge_retrieval_outcome_metrics(
+        self,
+        existing: Dict[str, Any] | None,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not existing:
+            return candidate
+        existing_rank = (1 if existing.get("_has_realized_pnl") else 0, int(existing.get("_data_points") or 0))
+        candidate_rank = (1 if candidate.get("_has_realized_pnl") else 0, int(candidate.get("_data_points") or 0))
+        merged = dict(candidate if candidate_rank > existing_rank else existing)
+        fallback = existing if merged is candidate else candidate
+        for key in ("pnl", "mfe", "mae", "slippage_bps", "holding_minutes"):
+            if merged.get(key) is None and fallback.get(key) is not None:
+                merged[key] = fallback.get(key)
+        merged["_has_realized_pnl"] = bool(existing.get("_has_realized_pnl") or candidate.get("_has_realized_pnl"))
+        merged["_data_points"] = sum(
+            1 for key in ("pnl", "mfe", "mae", "slippage_bps", "holding_minutes") if merged.get(key) is not None
+        )
+        return merged
+
+    def _score_decision_against_outcome_utility(self, decision: str, outcome_metrics: Dict[str, Any]) -> float:
+        decision_text = str(decision or "").upper().strip()
+        pnl = self._coerce_float(outcome_metrics.get("pnl"))
+        if pnl is None:
+            return 0.0
+        mfe = max(0.0, self._coerce_float(outcome_metrics.get("mfe")) or 0.0)
+        mae = max(0.0, self._coerce_float(outcome_metrics.get("mae")) or 0.0)
+        slippage_bps = max(0.0, self._coerce_float(outcome_metrics.get("slippage_bps")) or 0.0)
+        holding_minutes = max(0.0, self._coerce_float(outcome_metrics.get("holding_minutes")) or 0.0)
+
+        reward_signal = max(pnl, 0.0) + (mfe * 0.35)
+        holding_penalty = (
+            max(0.0, holding_minutes - 60.0) / 240.0
+            if pnl <= 0.0 or mae >= max(max(pnl, 0.0), 0.5)
+            else max(0.0, holding_minutes - 180.0) / 720.0
+        )
+        risk_signal = max(-pnl, 0.0) + (mae * 0.55) + (slippage_bps * 0.1) + holding_penalty
+
+        active_score = reward_signal - risk_signal
+        reduce_score = (risk_signal * 0.75) - (reward_signal * 0.15)
+        exit_score = risk_signal - (reward_signal * 0.3)
+        hold_score = (min(reward_signal, risk_signal) * 0.35) - (abs(reward_signal - risk_signal) * 0.4) - (
+            slippage_bps * 0.01
+        )
+
+        decision_scores = {
+            "BUY": active_score,
+            "SELL": active_score,
+            "HOLD": hold_score,
+            "REDUCE": reduce_score,
+            "EXIT": exit_score,
+        }
+        return decision_scores.get(decision_text, 0.0)
+
+    def _apply_retrieval_outcome_counterfactual_summary(
+        self,
+        summary: Dict[str, Any],
+        replay_runs: List[Dict[str, Any]],
+        retrieval_evaluations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        settled_outcomes: Dict[int, Dict[str, Any]] = {}
+        for row in retrieval_evaluations or []:
+            audit_log_id = row.get("audit_log_id")
+            if audit_log_id is None:
+                continue
+            try:
+                audit_key = int(audit_log_id)
+            except (TypeError, ValueError):
+                continue
+            candidate = self._build_retrieval_outcome_metrics(row)
+            if candidate.get("pnl") is None:
+                continue
+            settled_outcomes[audit_key] = self._merge_retrieval_outcome_metrics(
+                settled_outcomes.get(audit_key),
+                candidate,
+            )
+        outcome_linked_count = 0
+        with_better = 0
+        without_better = 0
+        tie_count = 0
+        utility_delta_sum = 0.0
+        for replay_row in replay_runs or []:
+            audit_log_id = replay_row.get("audit_log_id")
+            if audit_log_id is None:
+                continue
+            try:
+                outcome_metrics = settled_outcomes[int(audit_log_id)]
+            except (KeyError, TypeError, ValueError):
+                continue
+            counterfactual = ((replay_row.get("payload") or {}).get("retrieval_counterfactual") or {})
+            if not counterfactual:
+                continue
+            with_intent = counterfactual.get("with_retrieval_intent") or {}
+            without_intent = counterfactual.get("without_retrieval_intent") or {}
+            with_score = self._score_decision_against_outcome_utility(with_intent.get("decision"), outcome_metrics)
+            without_score = self._score_decision_against_outcome_utility(
+                without_intent.get("decision"),
+                outcome_metrics,
+            )
+            outcome_linked_count += 1
+            utility_delta_sum += with_score - without_score
+            if math.isclose(with_score, without_score, abs_tol=0.05):
+                tie_count += 1
+            elif with_score > without_score:
+                with_better += 1
+            else:
+                without_better += 1
+        enriched = dict(summary)
+        enriched["outcome_linked_count"] = outcome_linked_count
+        enriched["with_retrieval_better_count"] = with_better
+        enriched["without_retrieval_better_count"] = without_better
+        enriched["outcome_tie_count"] = tie_count
+        enriched["avg_outcome_utility_delta"] = (
+            round(utility_delta_sum / outcome_linked_count, 6) if outcome_linked_count else 0.0
+        )
+        return enriched
 
     def _build_trade_case_clusters(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         closed_cases = [row for row in trade_cases if str(row.get("status") or "") == "closed"]
@@ -1475,19 +1715,326 @@ Computed statistics:
             merged.append(lesson)
         return merged
 
+    def _normalize_memory_rule(self, rule: str) -> str:
+        text = " ".join(str(rule or "").lower().split())
+        normalized = "".join(char if char.isalnum() or char.isspace() else " " for char in text)
+        parts = []
+        for part in normalized.split():
+            if len(part) > 4 and part.endswith("s"):
+                part = part[:-1]
+            parts.append(part)
+        return " ".join(part for part in parts if part)
+
+    def _tokenize_memory_rule(self, rule: str) -> set[str]:
+        return {token for token in self._normalize_memory_rule(rule).split() if len(token) > 2}
+
+    def _memory_rule_similarity(self, left: str, right: str) -> float:
+        left_tokens = self._tokenize_memory_rule(left)
+        right_tokens = self._tokenize_memory_rule(right)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        union = left_tokens | right_tokens
+        if not union:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(union)
+
+    def _build_memory_canonical_key(self, rule: str, metrics: Dict[str, Any]) -> str:
+        category = str(metrics.get("category") or "lesson").strip().lower()
+        seed_signal = str(metrics.get("seed_signal") or "").strip().lower()
+        apply_when = metrics.get("apply_when") or {}
+        regime = str(metrics.get("regime") or "general").strip().lower()
+        volatility = "-".join(sorted(str(item).strip().lower() for item in (apply_when.get("volatility") or []) if item))
+        trend = "-".join(sorted(str(item).strip().lower() for item in (apply_when.get("trend") or []) if item))
+        normalized_rule = self._normalize_memory_rule(rule)
+        rule_anchor = " ".join(normalized_rule.split()[:5])
+        anchor = seed_signal or rule_anchor or "memory"
+        return "|".join(part for part in (category, regime, volatility, trend, anchor) if part)
+
+    def _compute_memory_confidence_score(
+        self,
+        *,
+        support_count: int,
+        evidence_count: int,
+        status: str,
+        category: str,
+        stats_package: Dict[str, Any],
+        hypothesis: bool,
+    ) -> float:
+        support_component = min(1.0, max(0.0, support_count) / 6.0)
+        evidence_component = min(1.0, max(0.0, evidence_count) / 6.0)
+        status_component = 1.0 if status == "rule" else 0.55
+        category_component = 1.0 if category in {"risk_control", "anti_pattern"} else 0.8
+        cluster_quality = float((stats_package.get("trade_case_cluster_evaluation") or {}).get("avg_quality_score") or 0.5)
+        retrieval_summary = stats_package.get("retrieval_counterfactual_summary") or {}
+        with_better = float(retrieval_summary.get("with_retrieval_better_count") or 0.0)
+        without_better = float(retrieval_summary.get("without_retrieval_better_count") or 0.0)
+        tie_count = float(retrieval_summary.get("outcome_tie_count") or 0.0)
+        retrieval_total = with_better + without_better + tie_count
+        retrieval_component = (
+            (with_better + (tie_count * 0.5)) / retrieval_total
+            if retrieval_total
+            else 0.5
+        )
+        confidence = (
+            support_component * 0.34
+            + evidence_component * 0.16
+            + status_component * 0.16
+            + category_component * 0.08
+            + cluster_quality * 0.16
+            + retrieval_component * 0.10
+        )
+        if hypothesis:
+            confidence *= 0.78
+        return round(max(0.05, min(0.99, confidence)), 4)
+
+    def _merge_unique_list(self, *values: List[Any], limit: int | None = None) -> List[Any]:
+        merged: List[Any] = []
+        seen = set()
+        for group in values:
+            for item in group or []:
+                key = json.dumps(item, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+                if limit is not None and len(merged) >= limit:
+                    return merged
+        return merged
+
+    def _merge_memory_entry_pair(self, base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        base_metrics = dict(base.get("metrics") or {})
+        incoming_metrics = dict(incoming.get("metrics") or {})
+        merged = dict(base if len(str(base.get("rule") or "")) >= len(str(incoming.get("rule") or "")) else incoming)
+        merged_metrics = dict(base_metrics)
+        evidence_ids = self._merge_unique_list(
+            base_metrics.get("evidence_journal_ids") or [],
+            incoming_metrics.get("evidence_journal_ids") or [],
+            limit=20,
+        )
+        support_floor = max(
+            int(base_metrics.get("support") or 0),
+            int(incoming_metrics.get("support") or 0),
+            len(evidence_ids),
+        )
+        merged_metrics.update(incoming_metrics)
+        merged_metrics["support"] = support_floor
+        merged_metrics["evidence_journal_ids"] = evidence_ids
+        merged_metrics["ignore_when"] = self._merge_unique_list(
+            base_metrics.get("ignore_when") or [],
+            incoming_metrics.get("ignore_when") or [],
+            limit=4,
+        )
+        merged_metrics["candidate_lessons"] = self._merge_unique_list(
+            base_metrics.get("candidate_lessons") or [],
+            incoming_metrics.get("candidate_lessons") or [],
+            limit=6,
+        )
+        merged_metrics["merged_rules"] = self._merge_unique_list(
+            base_metrics.get("merged_rules") or [base.get("rule")],
+            incoming_metrics.get("merged_rules") or [incoming.get("rule")],
+            limit=8,
+        )
+        merged_metrics["merge_count"] = max(
+            int(base_metrics.get("merge_count") or 1) + int(incoming_metrics.get("merge_count") or 1),
+            len(merged_metrics["merged_rules"]),
+        )
+        merged_metrics["confidence_score"] = round(
+            max(
+                float(base_metrics.get("confidence_score") or 0.0),
+                float(incoming_metrics.get("confidence_score") or 0.0),
+            ),
+            4,
+        )
+        merged_metrics["validity_score"] = round(
+            max(
+                float(base_metrics.get("validity_score") or merged_metrics["confidence_score"]),
+                float(incoming_metrics.get("validity_score") or merged_metrics["confidence_score"]),
+            ),
+            4,
+        )
+        merged_metrics["decay_score"] = round(
+            max(
+                float(base_metrics.get("decay_score") or 1.0),
+                float(incoming_metrics.get("decay_score") or 1.0),
+            ),
+            4,
+        )
+        merged["metrics"] = merged_metrics
+        merged["rule"] = str(merged.get("rule") or incoming.get("rule") or base.get("rule") or "")
+        merged["version"] = max(int(base.get("version", 1) or 1), int(incoming.get("version", 1) or 1))
+        return merged
+
+    def _merge_similar_memory_entries(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for entry in entries:
+            metrics = entry.setdefault("metrics", {})
+            metrics.setdefault("canonical_key", self._build_memory_canonical_key(entry.get("rule") or "", metrics))
+            candidate_category = str(metrics.get("category") or "lesson")
+            candidate_regime = str(metrics.get("regime") or "general")
+            matched_index = None
+            for index, existing in enumerate(merged):
+                existing_metrics = existing.get("metrics") or {}
+                if metrics.get("canonical_key") == existing_metrics.get("canonical_key"):
+                    matched_index = index
+                    break
+                if candidate_category != str(existing_metrics.get("category") or "lesson"):
+                    continue
+                if candidate_regime != str(existing_metrics.get("regime") or "general"):
+                    continue
+                if self._memory_rule_similarity(entry.get("rule") or "", existing.get("rule") or "") >= 0.55:
+                    matched_index = index
+                    break
+            if matched_index is None:
+                merged.append(entry)
+            else:
+                merged[matched_index] = self._merge_memory_entry_pair(merged[matched_index], entry)
+        return merged
+
+    def _safe_parse_timestamp(self, value: Any, fallback: datetime) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        for candidate in (text, text.replace("Z", "+00:00"), text.replace(" ", "T")):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            except ValueError:
+                continue
+        return fallback
+
+    def _build_decayed_memory_entry(self, row: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+        metrics = dict(row.get("metrics") or {})
+        timestamp = self._safe_parse_timestamp(row.get("timestamp"), fallback=now)
+        age_days = max(0.0, (now - timestamp).total_seconds() / 86400.0)
+        confidence = float(metrics.get("confidence_score") or 0.0)
+        prior_validity = float(metrics.get("validity_score") or confidence or 0.0)
+        decay_score = round(max(0.12, 1.0 - min(1.0, age_days / 90.0)), 4)
+        freshness_score = round(max(0.0, 1.0 - min(1.0, age_days / 45.0)), 4)
+        validity_score = round(max(0.0, min(0.99, (prior_validity * 0.65) + (decay_score * 0.35))), 4)
+        retired = bool(metrics.get("retired"))
+        retirement_reason = metrics.get("retirement_reason")
+        if not retired and age_days >= 90.0:
+            retired = True
+            retirement_reason = "stale_timeout"
+        elif not retired and age_days >= 30.0 and (confidence < 0.4 or validity_score < 0.35):
+            retired = True
+            retirement_reason = "stale_low_confidence"
+        metrics["confidence_score"] = round(confidence, 4)
+        metrics["validity_score"] = validity_score
+        metrics["decay_score"] = decay_score
+        metrics["freshness_score"] = freshness_score
+        metrics["lifecycle_status"] = "retired" if retired else "active"
+        metrics["retired"] = retired
+        metrics["retirement_reason"] = retirement_reason
+        metrics["last_decay_at"] = now.isoformat()
+        return {
+            "id": row.get("id"),
+            "rule": row.get("rule"),
+            "version": int(row.get("version") or 1) + 1,
+            "metrics": metrics,
+        }
+
+    def _merge_memory_entry_with_existing(
+        self,
+        entry: Dict[str, Any],
+        existing: Dict[str, Any],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        existing_metrics = dict(existing.get("metrics") or {})
+        merged = self._merge_memory_entry_pair(existing, entry)
+        metrics = merged.get("metrics") or {}
+        revived = bool(existing_metrics.get("retired"))
+        prior_confidence = float(existing_metrics.get("confidence_score") or 0.0)
+        new_confidence = float(metrics.get("confidence_score") or 0.0)
+        prior_validity = float(existing_metrics.get("validity_score") or prior_confidence or 0.0)
+        merged_validity = round(min(0.99, (prior_validity * 0.4) + (new_confidence * 0.6) + (0.05 if revived else 0.0)), 4)
+        metrics["confidence_score"] = round(max(prior_confidence, new_confidence), 4)
+        metrics["validity_score"] = merged_validity
+        metrics["decay_score"] = 1.0
+        metrics["freshness_score"] = 1.0
+        metrics["lifecycle_status"] = "active"
+        metrics["retired"] = False
+        metrics["retirement_reason"] = None
+        metrics["revive_count"] = int(existing_metrics.get("revive_count") or 0) + (1 if revived else 0)
+        metrics["last_revalidated_at"] = now.isoformat()
+        metrics["last_validated_at"] = now.isoformat()
+        metrics["merged_memory_ids"] = self._merge_unique_list(
+            existing_metrics.get("merged_memory_ids") or [existing.get("id")],
+            metrics.get("merged_memory_ids") or [],
+            limit=10,
+        )
+        merged["id"] = existing.get("id")
+        merged["version"] = max(int(existing.get("version") or 1) + 1, int(entry.get("version") or 1))
+        merged["metrics"] = metrics
+        return merged
+
+    def _reconcile_long_term_memory_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        existing_memories: List[Dict[str, Any]],
+        now: datetime,
+    ) -> List[Dict[str, Any]]:
+        consolidated = self._merge_similar_memory_entries(entries)
+        existing_rows = [row for row in (existing_memories or []) if row.get("rule")]
+        matched_existing_ids: set[int] = set()
+        reconciled: List[Dict[str, Any]] = []
+        for entry in consolidated:
+            metrics = entry.get("metrics") or {}
+            candidate_key = str(metrics.get("canonical_key") or "")
+            candidate_category = str(metrics.get("category") or "lesson")
+            candidate_regime = str(metrics.get("regime") or "general")
+            match = None
+            for row in existing_rows:
+                if row.get("id") in matched_existing_ids:
+                    continue
+                row_metrics = row.get("metrics") or {}
+                if candidate_key and candidate_key == str(row_metrics.get("canonical_key") or ""):
+                    match = row
+                    break
+                if candidate_category != str(row_metrics.get("category") or "lesson"):
+                    continue
+                if candidate_regime != str(row_metrics.get("regime") or "general"):
+                    continue
+                if self._memory_rule_similarity(entry.get("rule") or "", row.get("rule") or "") >= 0.65:
+                    match = row
+                    break
+            if match is None:
+                reconciled.append(entry)
+            else:
+                matched_existing_ids.add(match.get("id"))
+                reconciled.append(self._merge_memory_entry_with_existing(entry, match, now))
+        for row in existing_rows:
+            row_id = row.get("id")
+            if row_id in matched_existing_ids:
+                continue
+            reconciled.append(self._build_decayed_memory_entry(row, now))
+        return reconciled
+
     def _prepare_memory_entries(
         self,
         stats_package: Dict[str, Any],
         lessons: List[MemoryLesson],
+        existing_memories: List[Dict[str, Any]] | None = None,
     ) -> List[Dict[str, Any]]:
         entries = []
         ledger_stats = stats_package.get("ledger_stats", {})
+        now = datetime.now(UTC)
         for lesson in lessons:
             support_count = min(
                 lesson.support_count,
                 max(1, len(lesson.evidence_journal_ids) or lesson.support_count),
             )
             status = "hypothesis" if lesson.hypothesis or support_count < 3 else "rule"
+            confidence_score = self._compute_memory_confidence_score(
+                support_count=support_count,
+                evidence_count=len(lesson.evidence_journal_ids or []),
+                status=status,
+                category=lesson.category,
+                stats_package=stats_package,
+                hypothesis=bool(lesson.hypothesis or support_count < 3),
+            )
             metrics = {
                 "support": support_count,
                 "window_days": round(stats_package["window_hours"] / 24, 2),
@@ -1505,13 +2052,28 @@ Computed statistics:
                 "journal_count": stats_package["journal_count"],
                 "trade_case_count": stats_package.get("trade_case_count", 0),
                 "retrieval_evaluation_count": stats_package.get("retrieval_evaluation_count", 0),
+                "replay_run_count": stats_package.get("replay_run_count", 0),
                 "closed_trade_case_count": stats_package.get("closed_trade_case_count", 0),
                 "evaluated_trade_count": stats_package["evaluated_trade_count"],
                 "trade_case_patterns": stats_package.get("trade_case_patterns", {}),
                 "trade_case_clusters": stats_package.get("trade_case_clusters", [])[:6],
                 "trade_case_cluster_evaluation": stats_package.get("trade_case_cluster_evaluation", {}),
                 "retrieval_evaluation_summary": stats_package.get("retrieval_evaluation_summary", {}),
+                "retrieval_counterfactual_summary": stats_package.get("retrieval_counterfactual_summary", {}),
+                "confidence_score": confidence_score,
+                "validity_score": confidence_score,
+                "decay_score": 1.0,
+                "freshness_score": 1.0,
+                "lifecycle_status": "active",
+                "retired": False,
+                "retirement_reason": None,
+                "revive_count": 0,
+                "merge_count": 1,
+                "last_revalidated_at": now.isoformat(),
+                "last_validated_at": now.isoformat(),
             }
+            metrics["canonical_key"] = self._build_memory_canonical_key(lesson.rule, metrics)
+            metrics["merged_rules"] = [lesson.rule]
             entries.append(
                 {
                     "rule": lesson.rule,
@@ -1519,7 +2081,7 @@ Computed statistics:
                     "metrics": metrics,
                 }
             )
-        return entries
+        return self._reconcile_long_term_memory_entries(entries, existing_memories or [], now)
 
     def run(self, window_hours: int = 24):
         logger.info("Starting Daily Memory Update Batch with model: {}", self.model_name)
@@ -1531,12 +2093,14 @@ Computed statistics:
         symbol_journals = self._fetch_symbol_window_entries(window_hours=window_hours)
         trade_cases = self._fetch_trade_case_window_entries(window_hours=window_hours)
         retrieval_evaluations = self._fetch_retrieval_window_entries(window_hours=window_hours)
+        replay_runs = self._fetch_replay_window_entries(window_hours=window_hours)
         stats_package = self._build_stats_package(
             journals,
             window_hours=window_hours,
             symbol_journals=symbol_journals,
             trade_cases=trade_cases,
             retrieval_evaluations=retrieval_evaluations,
+            replay_runs=replay_runs,
         )
         logger.info(
             "Prepared stats for memory update: journals={}, symbol_rows={}, trade_cases={}, evaluated={}, win_rate={:.2f}%",
@@ -1547,7 +2111,8 @@ Computed statistics:
             stats_package["win_rate"],
         )
         lessons = self._generate_lessons(stats_package)
-        entries = self._prepare_memory_entries(stats_package, lessons)
+        existing_memories = self.state_store.get_recent_long_term_memory(limit=200)
+        entries = self._prepare_memory_entries(stats_package, lessons, existing_memories=existing_memories)
 
         if entries:
             self.state_store.save_long_term_memory_entries(entries)

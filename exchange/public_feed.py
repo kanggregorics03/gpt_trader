@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -34,6 +35,7 @@ class BybitPublicMarketFeed:
         stream_orderbook: bool = True,
         max_kline_rows: int = 240,
         ws_factory: Optional[Any] = None,
+        ws_stale_after_seconds: int = 30,
     ):
         self.symbols = sorted(set(symbols))
         self.timeframes = list(timeframes) if timeframes is not None else ["5m", "15m", "1h", "4h"]
@@ -42,12 +44,28 @@ class BybitPublicMarketFeed:
         self.stream_orderbook = bool(stream_orderbook)
         self.max_kline_rows = max(20, int(max_kline_rows or 240))
         self.ws_factory = ws_factory or BybitWebSocket
+        self.ws_stale_after_ms = max(1, int(ws_stale_after_seconds or 30)) * 1000
         self._lock = threading.RLock()
         self._started = False
         self._ws = None
         self._ticker_cache: Dict[str, Dict[str, Any]] = {}
         self._orderbook_cache: Dict[str, Dict[str, Dict[float, float]]] = {}
         self._kline_cache: Dict[tuple[str, str], Dict[int, List[float]]] = {}
+        self._started_at = 0
+        self._last_message_at = 0
+        self._last_message_by_stream = {"ticker": 0, "orderbook": 0, "kline": 0}
+        self._last_message_by_symbol: Dict[str, int] = {}
+        self._message_counts = {"total": 0, "ticker": 0, "orderbook": 0, "kline": 0}
+        self._handler_stats = {
+            "ticker": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+            "orderbook": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+            "kline": {"count": 0, "total_ms": 0.0, "max_ms": 0.0},
+        }
+        self._exchange_lag_stats = {
+            "ticker": {"last_ms": None, "max_ms": 0.0},
+            "orderbook": {"last_ms": None, "max_ms": 0.0},
+            "kline": {"last_ms": None, "max_ms": 0.0},
+        }
 
     @property
     def available(self) -> bool:
@@ -81,6 +99,7 @@ class BybitPublicMarketFeed:
                         callback=self._handle_kline_message,
                     )
             self._started = True
+            self._started_at = self._now_ms()
             logger.info(
                 f"Bybit public WebSocket feed started for {len(self.symbols)} symbols and "
                 f"{len(self.timeframes)} timeframes (ticker={self.stream_ticker}, "
@@ -119,7 +138,59 @@ class BybitPublicMarketFeed:
             ordered = [rows[key] for key in sorted(rows.keys())]
             return ordered[-limit:]
 
+    def get_diagnostics(self) -> Dict[str, Any]:
+        with self._lock:
+            now_ms = self._now_ms()
+            stream_ages = {
+                stream: self._age_ms(now_ms, timestamp)
+                for stream, timestamp in self._last_message_by_stream.items()
+            }
+            symbol_ages = {
+                symbol: self._age_ms(now_ms, timestamp)
+                for symbol, timestamp in self._last_message_by_symbol.items()
+            }
+            stale_symbols = sorted(
+                symbol
+                for symbol, age_ms in symbol_ages.items()
+                if age_ms is not None and age_ms > self.ws_stale_after_ms
+            )
+            handler_stats = {}
+            for stream, stats in self._handler_stats.items():
+                count = int(stats["count"])
+                avg_ms = (float(stats["total_ms"]) / count) if count > 0 else 0.0
+                handler_stats[stream] = {
+                    "count": count,
+                    "avg_ms": round(avg_ms, 3),
+                    "max_ms": round(float(stats["max_ms"]), 3),
+                }
+            return {
+                "started": self._started,
+                "available": self.available,
+                "started_at": self._started_at,
+                "ws_stale_after_ms": self.ws_stale_after_ms,
+                "last_message_at": self._last_message_at,
+                "last_message_age_ms": self._age_ms(now_ms, self._last_message_at),
+                "stream_ages_ms": stream_ages,
+                "symbol_ages_ms": symbol_ages,
+                "stale_symbols": stale_symbols,
+                "message_counts": dict(self._message_counts),
+                "handler_stats": handler_stats,
+                "exchange_lag_ms": {
+                    stream: {
+                        "last_ms": value["last_ms"],
+                        "max_ms": round(float(value["max_ms"]), 3),
+                    }
+                    for stream, value in self._exchange_lag_stats.items()
+                },
+                "cache_sizes": {
+                    "ticker_symbols": len(self._ticker_cache),
+                    "orderbook_symbols": len(self._orderbook_cache),
+                    "kline_streams": len(self._kline_cache),
+                },
+            }
+
     def _handle_ticker_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         data = message.get("data") or {}
         if isinstance(data, list):
             data = data[0] if data else {}
@@ -155,8 +226,15 @@ class BybitPublicMarketFeed:
                 if value not in (None, ""):
                     current[key] = value
             self._ticker_cache[symbol] = current
+            self._record_message_locked(
+                stream="ticker",
+                symbol=symbol,
+                exchange_timestamp_ms=self._safe_int(message.get("ts")),
+                handler_started_at_ms=started_at,
+            )
 
     def _handle_orderbook_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         payload = message.get("data") or {}
         symbol = payload.get("s") or self._topic_symbol(message.get("topic"))
         if not symbol:
@@ -173,8 +251,15 @@ class BybitPublicMarketFeed:
             state = self._orderbook_cache[symbol]
             self._apply_orderbook_side(state["bids"], bids)
             self._apply_orderbook_side(state["asks"], asks)
+            self._record_message_locked(
+                stream="orderbook",
+                symbol=symbol,
+                exchange_timestamp_ms=self._safe_int(message.get("ts"), payload.get("ts")),
+                handler_started_at_ms=started_at,
+            )
 
     def _handle_kline_message(self, message: Dict[str, Any]):
+        started_at = self._now_ms()
         topic = str(message.get("topic") or "")
         symbol = self._topic_symbol(topic)
         interval = self._topic_interval(topic)
@@ -201,6 +286,37 @@ class BybitPublicMarketFeed:
                     self._safe_float(item.get("volume"), 0.0),
                 ]
             self._trim_kline_cache(cache, max_items=self.max_kline_rows)
+            self._record_message_locked(
+                stream="kline",
+                symbol=symbol,
+                exchange_timestamp_ms=self._safe_int(message.get("ts")),
+                handler_started_at_ms=started_at,
+            )
+
+    def _record_message_locked(
+        self,
+        *,
+        stream: str,
+        symbol: str,
+        exchange_timestamp_ms: Optional[int],
+        handler_started_at_ms: int,
+    ):
+        now_ms = self._now_ms()
+        duration_ms = max(0.0, float(now_ms - handler_started_at_ms))
+        self._last_message_at = now_ms
+        self._last_message_by_stream[stream] = now_ms
+        self._last_message_by_symbol[symbol] = now_ms
+        self._message_counts["total"] += 1
+        self._message_counts[stream] += 1
+        stats = self._handler_stats[stream]
+        stats["count"] += 1
+        stats["total_ms"] += duration_ms
+        stats["max_ms"] = max(float(stats["max_ms"]), duration_ms)
+        if exchange_timestamp_ms is not None:
+            lag_ms = max(0.0, float(now_ms - exchange_timestamp_ms))
+            lag_stats = self._exchange_lag_stats[stream]
+            lag_stats["last_ms"] = round(lag_ms, 3)
+            lag_stats["max_ms"] = max(float(lag_stats["max_ms"]), lag_ms)
 
     def _apply_orderbook_side(self, side_state: Dict[float, float], deltas: List[List[Any]]):
         for level in deltas:
@@ -258,10 +374,20 @@ class BybitPublicMarketFeed:
         except (TypeError, ValueError):
             return default
 
-    def _safe_int(self, value: Any) -> Optional[int]:
-        if value in (None, ""):
+    def _safe_int(self, *values: Any) -> Optional[int]:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _age_ms(self, now_ms: int, timestamp_ms: int) -> Optional[int]:
+        if timestamp_ms <= 0:
             return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+        return max(0, int(now_ms - timestamp_ms))
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
