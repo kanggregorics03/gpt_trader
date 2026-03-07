@@ -59,8 +59,8 @@ def create_private_exchange(api_key: str, api_secret: str, trading_mode: str = "
     return exchange
 
 
-def create_public_market_feed(symbols: list[str]) -> Optional[BybitPublicMarketFeed]:
-    feed = BybitPublicMarketFeed(symbols)
+def create_public_market_feed(symbols: list[str], **feed_kwargs) -> Optional[BybitPublicMarketFeed]:
+    feed = BybitPublicMarketFeed(symbols, **feed_kwargs)
     if not feed.start():
         return None
     return feed
@@ -70,11 +70,13 @@ def create_private_account_feed(
     api_key: str,
     api_secret: str,
     trading_mode: str = "live",
+    **feed_kwargs,
 ) -> Optional[BybitPrivateAccountFeed]:
     feed = BybitPrivateAccountFeed(
         api_key=api_key,
         api_secret=api_secret,
         trading_mode=trading_mode,
+        **feed_kwargs,
     )
     if not feed.start():
         return None

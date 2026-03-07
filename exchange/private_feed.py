@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from loguru import logger
 
@@ -12,6 +12,9 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     BybitWebSocket = None
 
 
+WsHealthStatus = Literal["healthy", "stale", "degraded", "reconnecting", "down"]
+
+
 class BybitPrivateAccountFeed:
     def __init__(
         self,
@@ -19,15 +22,21 @@ class BybitPrivateAccountFeed:
         api_secret: str,
         trading_mode: str = "live",
         ws_factory: Optional[Any] = None,
-        reconcile_ttl_ms: int = 15_000,
+        reconcile_ttl_ms: int = 600_000,
         execution_cache_size: int = 200,
+        ws_stale_after_seconds: int = 35,
+        ws_recover_stability_seconds: int = 12,
+        forced_reconcile_on_recover: bool = True,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.trading_mode = trading_mode
         self.ws_factory = ws_factory or BybitWebSocket
-        self.reconcile_ttl_ms = reconcile_ttl_ms
-        self.execution_cache_size = execution_cache_size
+        self.reconcile_ttl_ms = max(1, int(reconcile_ttl_ms or 600_000))
+        self.execution_cache_size = max(1, int(execution_cache_size or 200))
+        self.ws_stale_after_ms = max(1, int(ws_stale_after_seconds or 35)) * 1000
+        self.ws_recover_stability_ms = max(1, int(ws_recover_stability_seconds or 12)) * 1000
+        self.forced_reconcile_on_recover = bool(forced_reconcile_on_recover)
         self._ws = None
         self._started = False
         self._lock = threading.RLock()
@@ -35,7 +44,15 @@ class BybitPrivateAccountFeed:
         self._positions_by_symbol: Dict[str, PositionState] = {}
         self._open_orders_by_key: Dict[str, OpenOrderState] = {}
         self._recent_executions_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-        self._last_reconcile_ms = 0
+        self._reconcile_required = False
+        self._health_state: WsHealthStatus = "down"
+        self._last_ws_message_at = 0
+        self._last_private_event_at = 0
+        self._last_successful_subscribe_at = 0
+        self._last_reconcile_ok_at = 0
+        self._recovery_candidate_since = 0
+        self._last_health_transition_at = 0
+        self._last_error: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -46,6 +63,8 @@ class BybitPrivateAccountFeed:
             return True
         if not self.available:
             logger.warning("pybit is not installed. Private WebSocket feed disabled; using REST reconcile.")
+            with self._lock:
+                self._transition_health_locked("down")
             return False
 
         try:
@@ -59,20 +78,32 @@ class BybitPrivateAccountFeed:
             self._ws.position_stream(callback=self._handle_position_message)
             self._ws.order_stream(callback=self._handle_order_message)
             self._ws.execution_stream(callback=self._handle_execution_message)
-            self._started = True
+            now_ms = self._now_ms()
+            with self._lock:
+                self._started = True
+                self._last_successful_subscribe_at = now_ms
+                self._recovery_candidate_since = 0
+                self._last_error = None
+                self._transition_health_locked("reconnecting", now_ms=now_ms)
             logger.info(f"Bybit private WebSocket feed started for trading mode: {self.trading_mode}")
             return True
         except Exception as exc:
             logger.warning(f"Failed to start Bybit private WebSocket feed: {exc}")
-            self._ws = None
-            self._started = False
+            with self._lock:
+                self._ws = None
+                self._started = False
+                self._last_error = str(exc)
+                self._transition_health_locked("down")
             return False
 
     def mark_reconcile_required(self):
         with self._lock:
-            self._last_reconcile_ms = 0
+            self._reconcile_required = True
+            if self._started:
+                self._transition_health_locked("degraded")
 
     def seed_from_account_state(self, account_state: AccountState):
+        now_ms = self._now_ms()
         with self._lock:
             self._wallet_state = {
                 "snapshot_timestamp": account_state.snapshot_timestamp,
@@ -88,11 +119,49 @@ class BybitPrivateAccountFeed:
                 self._order_key(order): order.model_copy(deep=True)
                 for order in account_state.open_orders
             }
-            self._last_reconcile_ms = int(time.time() * 1000)
+            reconcile_ok_at = now_ms
+            if self._recovery_candidate_since > 0 and reconcile_ok_at <= self._recovery_candidate_since:
+                reconcile_ok_at = self._recovery_candidate_since + 1
+            self._last_reconcile_ok_at = reconcile_ok_at
+            self._reconcile_required = False
+            self._refresh_health_locked(now_ms=now_ms)
+
+    def get_health_status(self) -> WsHealthStatus:
+        with self._lock:
+            return self._refresh_health_locked()
+
+    def should_use_websocket(self) -> bool:
+        return self.get_health_status() == "healthy"
+
+    def needs_periodic_reconcile(self) -> bool:
+        with self._lock:
+            if self._reconcile_required:
+                return True
+            if self._last_reconcile_ok_at <= 0:
+                return True
+            return (self._now_ms() - self._last_reconcile_ok_at) > self.reconcile_ttl_ms
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        with self._lock:
+            status = self._refresh_health_locked()
+            return {
+                "health_status": status,
+                "started": self._started,
+                "reconcile_required": self._reconcile_required,
+                "last_ws_message_at": self._last_ws_message_at,
+                "last_private_event_at": self._last_private_event_at,
+                "last_successful_subscribe_at": self._last_successful_subscribe_at,
+                "last_reconcile_ok_at": self._last_reconcile_ok_at,
+                "recovery_candidate_since": self._recovery_candidate_since,
+                "last_health_transition_at": self._last_health_transition_at,
+                "last_error": self._last_error,
+            }
 
     def get_account_state(self, symbols: List[str]) -> Optional[AccountState]:
         with self._lock:
-            if not self._wallet_state or self.needs_reconcile():
+            if not self._wallet_state:
+                return None
+            if self._refresh_health_locked() != "healthy":
                 return None
 
             allowed_symbols = set(symbols)
@@ -108,7 +177,7 @@ class BybitPrivateAccountFeed:
             ]
             total_unrealized_pnl = round(sum(position.unrealized_pnl for position in positions), 8)
             return AccountState(
-                snapshot_timestamp=int(time.time() * 1000),
+                snapshot_timestamp=self._now_ms(),
                 total_balance=float(self._wallet_state.get("total_balance") or 0.0),
                 available_balance=float(self._wallet_state.get("available_balance") or 0.0),
                 total_unrealized_pnl=total_unrealized_pnl,
@@ -117,10 +186,6 @@ class BybitPrivateAccountFeed:
                 open_orders=open_orders,
                 open_orders_count=len(open_orders),
             )
-
-    def needs_reconcile(self) -> bool:
-        now_ms = int(time.time() * 1000)
-        return (now_ms - int(self._last_reconcile_ms or 0)) > self.reconcile_ttl_ms
 
     def get_recent_executions(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
         with self._lock:
@@ -164,8 +229,9 @@ class BybitPrivateAccountFeed:
             {},
         )
         with self._lock:
+            self._record_private_event_locked()
             self._wallet_state = {
-                "snapshot_timestamp": int(time.time() * 1000),
+                "snapshot_timestamp": self._now_ms(),
                 "total_balance": self._safe_float(
                     wallet.get("totalEquity"),
                     usdt_wallet.get("equity"),
@@ -185,6 +251,7 @@ class BybitPrivateAccountFeed:
                     self._wallet_state.get("margin_ratio"),
                 ),
             }
+            self._refresh_health_locked()
 
     def _handle_position_message(self, message: Dict[str, Any]):
         data = message.get("data") or []
@@ -192,6 +259,7 @@ class BybitPrivateAccountFeed:
             data = [data]
 
         with self._lock:
+            self._record_private_event_locked()
             for item in data:
                 normalized = self._normalize_position(item)
                 symbol = str(item.get("symbol") or normalized.symbol)
@@ -199,6 +267,7 @@ class BybitPrivateAccountFeed:
                     self._positions_by_symbol.pop(symbol, None)
                 else:
                     self._positions_by_symbol[symbol] = normalized
+            self._refresh_health_locked()
 
     def _handle_order_message(self, message: Dict[str, Any]):
         data = message.get("data") or []
@@ -206,6 +275,7 @@ class BybitPrivateAccountFeed:
             data = [data]
 
         with self._lock:
+            self._record_private_event_locked()
             for item in data:
                 normalized = self._normalize_order(item)
                 key = self._order_key(normalized)
@@ -213,6 +283,7 @@ class BybitPrivateAccountFeed:
                     self._open_orders_by_key.pop(key, None)
                 else:
                     self._open_orders_by_key[key] = normalized
+            self._refresh_health_locked()
 
     def _handle_execution_message(self, message: Dict[str, Any]):
         data = message.get("data") or []
@@ -220,12 +291,64 @@ class BybitPrivateAccountFeed:
             data = [data]
 
         with self._lock:
+            self._record_private_event_locked()
             for item in data:
                 normalized = self._normalize_execution(item)
                 symbol = normalized.get("symbol") or "UNKNOWN"
                 bucket = self._recent_executions_by_symbol.setdefault(symbol, [])
                 bucket.insert(0, normalized)
                 del bucket[self.execution_cache_size :]
+            self._refresh_health_locked()
+
+    def _record_private_event_locked(self):
+        now_ms = self._now_ms()
+        previous_state = self._compute_health_status_locked(now_ms=now_ms)
+        self._last_ws_message_at = now_ms
+        self._last_private_event_at = now_ms
+        if previous_state in {"stale", "reconnecting", "down"}:
+            self._recovery_candidate_since = now_ms
+        self._last_error = None
+
+    def _refresh_health_locked(self, now_ms: Optional[int] = None) -> WsHealthStatus:
+        now_ms = self._now_ms() if now_ms is None else int(now_ms)
+        next_status = self._compute_health_status_locked(now_ms=now_ms)
+        self._transition_health_locked(next_status, now_ms=now_ms)
+        if next_status == "healthy":
+            self._recovery_candidate_since = 0
+        return self._health_state
+
+    def _compute_health_status_locked(self, now_ms: Optional[int] = None) -> WsHealthStatus:
+        now_ms = self._now_ms() if now_ms is None else int(now_ms)
+        if not self._started:
+            return "down"
+        if self._last_successful_subscribe_at <= 0:
+            return "reconnecting"
+        if self._last_ws_message_at <= 0 or self._last_private_event_at <= 0:
+            return "reconnecting"
+        if (now_ms - self._last_ws_message_at) > self.ws_stale_after_ms:
+            return "stale"
+        if (now_ms - self._last_private_event_at) > self.ws_stale_after_ms:
+            return "stale"
+        if self._reconcile_required:
+            return "degraded"
+        if self._last_reconcile_ok_at <= 0:
+            return "degraded"
+        if self._recovery_candidate_since > 0:
+            if (
+                self.forced_reconcile_on_recover
+                and self._last_reconcile_ok_at <= self._recovery_candidate_since
+            ):
+                return "degraded"
+            if (now_ms - self._recovery_candidate_since) < self.ws_recover_stability_ms:
+                return "reconnecting"
+        return "healthy"
+
+    def _transition_health_locked(self, next_status: WsHealthStatus, now_ms: Optional[int] = None):
+        now_ms = self._now_ms() if now_ms is None else int(now_ms)
+        if next_status == self._health_state:
+            return
+        self._health_state = next_status
+        self._last_health_transition_at = now_ms
 
     def _normalize_position(self, item: Dict[str, Any]) -> PositionState:
         side = str(item.get("side") or "").upper()
@@ -319,3 +442,6 @@ class BybitPrivateAccountFeed:
             except (TypeError, ValueError):
                 continue
         return None
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)

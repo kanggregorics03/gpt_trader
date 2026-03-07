@@ -33,3 +33,49 @@ intervals:
   strategy_loop_minutes: 60  # 1 hour
   position_loop_minutes: 15  # 15 minutes
   trigger_loop_minutes: 5    # 5 minutes
+
+adaptive_loop:
+  materialization_minutes: 5
+  trigger_min_duration_minutes: 15
+  trigger_clear_cycles: 3
+  position_min_duration_minutes: 30
+  flat_clear_cycles: 4
+  recent_execution_window_minutes: 20
+  recent_close_window_minutes: 20
+  poll_seconds: 1
+
+private_account_ws:
+  reconcile_ttl_ms: 600000
+  ws_stale_after_seconds: 35
+  ws_recover_stability_seconds: 12
+  forced_reconcile_on_recover: true
+  execution_cache_size: 200
+
+public_market_ws:
+  orderbook_depth: 10
+  stream_ticker: true
+  stream_orderbook: true
+  stream_timeframes: []
+  max_kline_rows: 120
+
+market_data_cache:
+  ticker_ttl_ms: 5000
+  order_book_ttl_ms: 5000
+  funding_ttl_ms: 300000
+  open_interest_ttl_ms: 30000
+
+execution_guards:
+  loop_lock_ttl_seconds: 240        # Global loop lock TTL to prevent overlapping loop execution.
+  decision_cooldown_minutes: 10     # Block repeated entry decisions for same symbol+action+size band.
+  entry_mutex_ttl_seconds: 180      # Per-symbol entry mutex TTL while entry execution is in-flight.
+  unknown_order_block_minutes: 30   # Block new entries when unresolved unknown order states exist.
+  recovery_sweep_minutes: 5         # Sweep interval to recover unknown/timeout order runtime states.
+
+context_budget:
+  journal_fetch_limit: 24
+  journal_keep_limit: 6
+  memory_keep_limit: 8
+  similar_case_keep_limit: 5
+  max_rationale_items_per_journal: 2
+  max_evidence_per_rationale_item: 2
+  max_ignore_when_per_memory: 2

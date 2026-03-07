@@ -78,6 +78,12 @@ class DecisionEngine:
             else:
                 payload.append(dict(item))
         return payload
+
+    def _build_stable_account_payload(self, request: DecisionRequest) -> dict:
+        # Exclude volatile fields so equivalent states can reuse cached AI decisions.
+        payload = request.account_state.model_dump(mode="json")
+        payload.pop("snapshot_timestamp", None)
+        return payload
         
     def _create_prompt(self, request: DecisionRequest) -> str:
         memory_payload = [
@@ -94,7 +100,7 @@ INPUTS
 policy_summary:
 {request.policy_summary}
 account_state:
-{request.account_state.model_dump_json()}
+{self._compact_json(self._build_stable_account_payload(request))}
 market_context:
 {self._compact_json(market_payload)}
 risk_state:
@@ -145,7 +151,7 @@ OUTPUT EXAMPLE
     def _build_candidate_input_hash(self, request: DecisionRequest) -> str:
         payload = {
             "policy_summary": request.policy_summary,
-            "account_state": request.account_state.model_dump(mode="json"),
+            "account_state": self._build_stable_account_payload(request),
             "market_context": self._build_market_payload(request),
             "risk_state": request.risk_state.model_dump(mode="json"),
             "risk_mode": request.risk_mode,

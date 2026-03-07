@@ -57,7 +57,20 @@ class MemoryUpdater:
         since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
         return self.state_store.get_journal_entries_since(since)
 
-    def _build_stats_package(self, journals: List[Dict[str, Any]], window_hours: int) -> Dict[str, Any]:
+    def _fetch_symbol_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
+        since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
+        fetcher = getattr(self.state_store, "get_symbol_journal_entries_since", None)
+        if callable(fetcher):
+            return fetcher(since)
+        return []
+
+    def _build_stats_package(
+        self,
+        journals: List[Dict[str, Any]],
+        window_hours: int,
+        symbol_journals: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        symbol_journals = symbol_journals or []
         ledger_stats = self.state_store.get_position_ledger_stats(hours=window_hours)
         symbol_report = self.state_store.get_symbol_performance_report(hours=window_hours)
         daily_report = self.state_store.get_daily_ledger_report(days=max(1, round(window_hours / 24)))
@@ -102,10 +115,22 @@ class MemoryUpdater:
             reverse=True,
         )[:5]
         evidence_quality_patterns = self._build_evidence_quality_patterns(pnl_rows)
+        symbol_evidence_signal_counts = self._build_symbol_evidence_signal_counts(symbol_journals)
+        symbol_candidate_lessons = self._build_symbol_candidate_lessons(symbol_journals)
+        merged_candidate_lessons = self._merge_candidate_lesson_dicts(
+            self._build_candidate_lessons(
+                journals=journals,
+                winning_evidence_signals=winning_evidence_signals,
+                losing_evidence_signals=losing_evidence_signals,
+                evidence_quality_patterns=evidence_quality_patterns,
+            ),
+            symbol_candidate_lessons,
+        )
 
         return {
             "window_hours": window_hours,
             "journal_count": len(journals),
+            "symbol_journal_count": len(symbol_journals),
             "evaluated_trade_count": len(pnl_rows),
             "win_count": len(wins),
             "loss_count": len(losses),
@@ -120,13 +145,9 @@ class MemoryUpdater:
             "evidence_signal_counts": evidence_signal_counts,
             "winning_evidence_signals": winning_evidence_signals,
             "losing_evidence_signals": losing_evidence_signals,
+            "symbol_evidence_signal_counts": symbol_evidence_signal_counts,
             "evidence_quality_patterns": evidence_quality_patterns,
-            "candidate_lessons": self._build_candidate_lessons(
-                journals=journals,
-                winning_evidence_signals=winning_evidence_signals,
-                losing_evidence_signals=losing_evidence_signals,
-                evidence_quality_patterns=evidence_quality_patterns,
-            ),
+            "candidate_lessons": merged_candidate_lessons,
             "top_losses": [
                 {
                     "id": row["id"],
@@ -176,7 +197,135 @@ class MemoryUpdater:
                 }
                 for row in journals[-10:]
             ],
+            "recent_symbol_examples": [
+                {
+                    "id": row.get("id"),
+                    "audit_log_id": row.get("audit_log_id"),
+                    "symbol": row.get("symbol"),
+                    "decision": row.get("decision"),
+                    "risk_mode": row.get("risk_mode"),
+                    "triggered": bool(row.get("triggered")),
+                    "risk_triggered": bool(row.get("risk_triggered")),
+                    "estimated_pnl_pct": row.get("estimated_pnl_pct"),
+                    "net_realized_pnl": row.get("net_realized_pnl"),
+                    "evidence_signals": row.get("evidence_signals") or [],
+                }
+                for row in symbol_journals[-20:]
+            ],
         }
+
+    def _build_symbol_evidence_signal_counts(self, symbol_journals: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for row in symbol_journals:
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            for signal in row.get("evidence_signals") or []:
+                key = f"{symbol}:{signal}"
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _resolve_symbol_row_pnl(self, row: Dict[str, Any]) -> float | None:
+        estimated = self._coerce_float(row.get("estimated_pnl_pct"))
+        if estimated is not None:
+            return estimated
+        net_realized = self._coerce_float(row.get("net_realized_pnl"))
+        return net_realized
+
+    def _build_symbol_candidate_lessons(self, symbol_journals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for row in symbol_journals:
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            pnl = self._resolve_symbol_row_pnl(row)
+            if pnl is None:
+                continue
+            evidence_signals = row.get("evidence_signals") or []
+            for signal in evidence_signals:
+                signal_key = f"{symbol}:{signal}"
+                bucket = outcomes.setdefault(
+                    signal_key,
+                    {"wins": 0, "losses": 0, "journal_ids": []},
+                )
+                if pnl > 0:
+                    bucket["wins"] += 1
+                elif pnl < 0:
+                    bucket["losses"] += 1
+                journal_id = row.get("id")
+                if isinstance(journal_id, int) and journal_id not in bucket["journal_ids"]:
+                    bucket["journal_ids"].append(journal_id)
+
+        candidates: List[Dict[str, Any]] = []
+        for signal_key, bucket in sorted(outcomes.items()):
+            wins = int(bucket.get("wins") or 0)
+            losses = int(bucket.get("losses") or 0)
+            support = wins + losses
+            if support < 2:
+                continue
+            symbol, signal = signal_key.split(":", 1)
+            signal_name, timeframe = (signal.split("@", 1) + ["context"])[:2] if "@" in signal else (signal, "context")
+            if wins > losses:
+                candidates.append(
+                    {
+                        "rule": (
+                            f"For {symbol}, favor setups with {signal_name} on {timeframe} when the same "
+                            "symbol-level evidence repeatedly aligns with positive outcomes."
+                        ),
+                        "regime": "symbol_specific_general",
+                        "category": "opportunity",
+                        "support_count": support,
+                        "evidence_journal_ids": (bucket.get("journal_ids") or [])[:10],
+                        "hypothesis": support < 3,
+                        "apply_when": {
+                            "regime": ["symbol_specific_general"],
+                            "volatility": ["unknown"],
+                            "trend": ["mixed"],
+                        },
+                        "ignore_when": [
+                            f"Ignore for {symbol} when {signal_name} on {timeframe} appears without supporting context."
+                        ],
+                        "seed_signal": signal_key,
+                        "seed_origin": "symbol_journal_candidate",
+                    }
+                )
+            elif losses > wins:
+                candidates.append(
+                    {
+                        "rule": (
+                            f"For {symbol}, avoid setups dominated by {signal_name} on {timeframe} when the same "
+                            "symbol-level evidence repeatedly aligns with losses."
+                        ),
+                        "regime": "symbol_specific_general",
+                        "category": "anti_pattern",
+                        "support_count": support,
+                        "evidence_journal_ids": (bucket.get("journal_ids") or [])[:10],
+                        "hypothesis": support < 3,
+                        "apply_when": {
+                            "regime": ["symbol_specific_general"],
+                            "volatility": ["unknown"],
+                            "trend": ["mixed"],
+                        },
+                        "ignore_when": [
+                            f"Ignore for {symbol} when broader evidence quality is strong and risk triggers are absent."
+                        ],
+                        "seed_signal": signal_key,
+                        "seed_origin": "symbol_journal_candidate",
+                    }
+                )
+        return candidates[:10]
+
+    def _merge_candidate_lesson_dicts(self, *groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for group in groups:
+            for item in group or []:
+                key = str(item.get("rule") or "").strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+        return merged[:15]
 
     def _build_candidate_lessons(
         self,
@@ -635,10 +784,16 @@ Computed statistics:
             logger.info("No journals found in the selected window. Skipping.")
             return
 
-        stats_package = self._build_stats_package(journals, window_hours=window_hours)
+        symbol_journals = self._fetch_symbol_window_entries(window_hours=window_hours)
+        stats_package = self._build_stats_package(
+            journals,
+            window_hours=window_hours,
+            symbol_journals=symbol_journals,
+        )
         logger.info(
-            "Prepared stats for memory update: journals={}, evaluated={}, win_rate={:.2f}%",
+            "Prepared stats for memory update: journals={}, symbol_rows={}, evaluated={}, win_rate={:.2f}%",
             stats_package["journal_count"],
+            stats_package["symbol_journal_count"],
             stats_package["evaluated_trade_count"],
             stats_package["win_rate"],
         )

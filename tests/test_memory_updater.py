@@ -295,6 +295,68 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(candidates[0]["evidence_journal_ids"], [10, 11])
         self.assertEqual(candidates[0]["apply_when"]["trend"], ["aligned_up"])
 
+    def test_build_stats_package_includes_symbol_journal_candidates(self):
+        class DummyStore:
+            def get_position_ledger_stats(self, hours):
+                return {"row_count": 1, "net_realized_pnl": 2.0, "gross_realized_pnl": 2.5, "fee_cost": 0.5}
+
+            def get_symbol_performance_report(self, hours):
+                return [{"symbol": "ETHUSDT", "net_realized_pnl": 2.0, "win_rate": 100.0}]
+
+            def get_daily_ledger_report(self, days):
+                return [{"day": "2026-03-05", "net_realized_pnl": 2.0, "row_count": 1}]
+
+        self.updater.state_store = DummyStore()
+        journals = [
+            {
+                "id": 31,
+                "decision": "HOLD",
+                "rationale_json": [],
+                "risk_reason": "Approved",
+                "estimated_pnl_pct": None,
+                "loss_signal": 0,
+                "market_state": {},
+            }
+        ]
+        symbol_journals = [
+            {
+                "id": 201,
+                "audit_log_id": 901,
+                "symbol": "ETHUSDT",
+                "decision": "BUY",
+                "estimated_pnl_pct": 0.7,
+                "net_realized_pnl": 5.0,
+                "evidence_signals": ["volume_ratio@15m", "spread_bps@microstructure"],
+            },
+            {
+                "id": 202,
+                "audit_log_id": 902,
+                "symbol": "ETHUSDT",
+                "decision": "BUY",
+                "estimated_pnl_pct": 0.5,
+                "net_realized_pnl": 3.0,
+                "evidence_signals": ["volume_ratio@15m"],
+            },
+        ]
+
+        stats = self.updater._build_stats_package(
+            journals=journals,
+            window_hours=24,
+            symbol_journals=symbol_journals,
+        )
+
+        self.assertEqual(stats["symbol_journal_count"], 2)
+        self.assertEqual(stats["symbol_evidence_signal_counts"]["ETHUSDT:volume_ratio@15m"], 2)
+        symbol_candidates = [
+            item for item in stats["candidate_lessons"]
+            if item.get("seed_origin") == "symbol_journal_candidate"
+        ]
+        self.assertTrue(symbol_candidates)
+        self.assertEqual(
+            symbol_candidates[0]["evidence_journal_ids"],
+            [201, 202],
+        )
+
     def test_generate_lessons_falls_back_to_candidate_lessons_on_failure(self):
         class DummyClient:
             class models:

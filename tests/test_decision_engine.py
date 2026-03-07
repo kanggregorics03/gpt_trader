@@ -9,6 +9,45 @@ from db.state_store import StateStore
 
 
 class TestDecisionEngine(unittest.TestCase):
+    def test_candidate_input_hash_ignores_account_snapshot_timestamp(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        base_request = DecisionRequest(
+            policy_summary="risk: normal",
+            account_state=AccountState(
+                snapshot_timestamp=1111111111,
+                total_balance=1000.0,
+                available_balance=900.0,
+            ),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            long_term_memory=[],
+        )
+        changed_request = base_request.model_copy(
+            update={
+                "account_state": base_request.account_state.model_copy(
+                    update={"snapshot_timestamp": 2222222222}
+                )
+            }
+        )
+
+        base_hash = engine._build_candidate_input_hash(base_request)
+        changed_hash = engine._build_candidate_input_hash(changed_request)
+
+        self.assertEqual(base_hash, changed_hash)
+
     def test_candidate_input_hash_changes_with_risk_state(self):
         engine = DecisionEngine.__new__(DecisionEngine)
         base_request = DecisionRequest(
@@ -109,6 +148,73 @@ class TestDecisionEngine(unittest.TestCase):
             self.assertTrue(result.cache_hit)
             self.assertEqual(result.intent.decision, "HOLD")
             self.assertEqual(result.raw_response, '{"decision":"HOLD","orders":[],"rationale":["Cached"],"risk_notes":[],"confidence":0.4}')
+        finally:
+            store.close()
+            tmpdir.cleanup()
+
+    def test_generate_decision_cache_hit_when_only_snapshot_timestamp_changes(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        store = StateStore(str(Path(tmpdir.name) / "state.db"))
+        try:
+            engine = DecisionEngine.__new__(DecisionEngine)
+            engine.client = None
+            engine.flash_model = "gemini-3.0-pro"
+            engine.pro_model = "gemini-3.0-pro"
+            engine.cache_store = store
+
+            base_request = DecisionRequest(
+                policy_summary="risk: normal",
+                account_state=AccountState(
+                    snapshot_timestamp=1111111111,
+                    total_balance=1000.0,
+                    available_balance=900.0,
+                ),
+                market_snapshot=MarketSnapshot(
+                    symbol="BTCUSDT",
+                    current_price=30000.0,
+                    atr_15m=120.0,
+                    atr_1h=240.0,
+                    trend_1h="UP",
+                    recent_volume_surge=False,
+                ),
+                risk_state=RiskStateSnapshot(
+                    daily_start_balance=1000.0,
+                    daily_pnl_pct=-0.5,
+                    drawdown_active=False,
+                    consecutive_losses=1,
+                    cooldown_active=False,
+                ),
+                long_term_memory=[],
+            )
+            changed_request = base_request.model_copy(
+                update={
+                    "account_state": base_request.account_state.model_copy(
+                        update={"snapshot_timestamp": 2222222222}
+                    )
+                }
+            )
+
+            prompt = engine._create_prompt(base_request)
+            prompt_hash = engine._build_prompt_cache_key(prompt, "gemini-3.0-pro")
+            input_hash = engine._build_candidate_input_hash(base_request)
+            store.save_cached_decision(
+                prompt_hash=prompt_hash,
+                model_name="gemini-3.0-pro",
+                input_hash=input_hash,
+                raw_response='{"decision":"HOLD","orders":[],"rationale":["Cached"],"risk_notes":[],"confidence":0.4}',
+                intent={
+                    "decision": "HOLD",
+                    "orders": [],
+                    "rationale": ["Cached"],
+                    "risk_notes": [],
+                    "confidence": 0.4,
+                },
+            )
+
+            result = engine.generate_decision(changed_request)
+
+            self.assertTrue(result.cache_hit)
+            self.assertEqual(result.intent.decision, "HOLD")
         finally:
             store.close()
             tmpdir.cleanup()

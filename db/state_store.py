@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -97,6 +98,25 @@ class StateStore:
                     payload JSON
                 );
 
+                CREATE TABLE IF NOT EXISTS symbol_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    audit_log_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    decision TEXT,
+                    risk_reason TEXT,
+                    risk_mode TEXT,
+                    risk_approved BOOLEAN,
+                    triggered BOOLEAN DEFAULT 0,
+                    risk_triggered BOOLEAN DEFAULT 0,
+                    net_realized_pnl REAL,
+                    fee_cost REAL,
+                    estimated_pnl_pct REAL,
+                    evidence_signals JSON,
+                    summary TEXT,
+                    payload JSON
+                );
+
                 CREATE TABLE IF NOT EXISTS replay_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     audit_log_id INTEGER NOT NULL,
@@ -156,6 +176,57 @@ class StateStore:
                     last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     hit_count INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_locks (
+                    lock_name TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    acquired_at_epoch REAL NOT NULL,
+                    expires_at_epoch REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS entry_mutex (
+                    symbol TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    acquired_at_epoch REAL NOT NULL,
+                    expires_at_epoch REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS decision_fingerprints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    size_band TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    audit_log_id INTEGER,
+                    status TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS order_runtime_state (
+                    order_key TEXT PRIMARY KEY,
+                    client_order_id TEXT,
+                    exchange_order_id TEXT,
+                    symbol TEXT,
+                    state TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_audit_log_id INTEGER,
+                    payload JSON
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_symbol_journal_symbol_id
+                ON symbol_journal(symbol, id);
+
+                CREATE INDEX IF NOT EXISTS idx_symbol_journal_timestamp_id
+                ON symbol_journal(timestamp, id);
+
+                CREATE INDEX IF NOT EXISTS idx_symbol_journal_audit_log_id
+                ON symbol_journal(audit_log_id);
+
+                CREATE INDEX IF NOT EXISTS idx_decision_fingerprint_lookup
+                ON decision_fingerprints(symbol, action, size_band, id);
+
+                CREATE INDEX IF NOT EXISTS idx_order_runtime_state_state_updated
+                ON order_runtime_state(state, updated_at);
             """)
         self._ensure_column("audit_logs", "policy_snapshot", "TEXT")
         self._ensure_column("audit_logs", "decision_input_hash", "TEXT")
@@ -526,6 +597,132 @@ class StateStore:
         except Exception as e:
             logger.error(f"Failed to save position ledger entries: {e}")
 
+    def save_symbol_journal_entries(self, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO symbol_journal (
+                        audit_log_id,
+                        symbol,
+                        decision,
+                        risk_reason,
+                        risk_mode,
+                        risk_approved,
+                        triggered,
+                        risk_triggered,
+                        net_realized_pnl,
+                        fee_cost,
+                        estimated_pnl_pct,
+                        evidence_signals,
+                        summary,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            int(entry.get("audit_log_id") or 0),
+                            entry.get("symbol"),
+                            entry.get("decision"),
+                            entry.get("risk_reason"),
+                            entry.get("risk_mode"),
+                            int(bool(entry.get("risk_approved"))),
+                            int(bool(entry.get("triggered"))),
+                            int(bool(entry.get("risk_triggered"))),
+                            entry.get("net_realized_pnl"),
+                            entry.get("fee_cost"),
+                            entry.get("estimated_pnl_pct"),
+                            json.dumps(entry.get("evidence_signals") or []),
+                            entry.get("summary"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                        if entry.get("symbol")
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save symbol journal entries: {e}")
+
+    def get_recent_symbol_journal(self, limit: int = 50, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                timestamp,
+                audit_log_id,
+                symbol,
+                decision,
+                risk_reason,
+                risk_mode,
+                risk_approved,
+                triggered,
+                risk_triggered,
+                net_realized_pnl,
+                fee_cost,
+                estimated_pnl_pct,
+                evidence_signals,
+                summary,
+                payload
+            FROM symbol_journal
+        """
+        params: List[Any] = []
+        if symbol:
+            query += " WHERE symbol = ?"
+            params.append(symbol)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_symbol_journal_entries_since(
+        self,
+        since: datetime,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                timestamp,
+                audit_log_id,
+                symbol,
+                decision,
+                risk_reason,
+                risk_mode,
+                risk_approved,
+                triggered,
+                risk_triggered,
+                net_realized_pnl,
+                fee_cost,
+                estimated_pnl_pct,
+                evidence_signals,
+                summary,
+                payload
+            FROM symbol_journal
+            WHERE timestamp >= ?
+            ORDER BY id ASC
+        """
+        params: List[Any] = [since.strftime("%Y-%m-%d %H:%M:%S")]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
     def save_replay_run(self, audit_log_id: int, payload: Dict[str, Any]):
         comparison = payload.get("comparison") or {}
         try:
@@ -574,35 +771,274 @@ class StateStore:
             return
         try:
             with self.conn:
-                self.conn.executemany(
-                    """
-                    INSERT INTO order_state_transitions (
-                        audit_log_id,
-                        symbol,
-                        client_order_id,
-                        exchange_order_id,
-                        from_state,
-                        to_state,
-                        event_type,
-                        payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
+                for entry in entries:
+                    client_order_id = entry.get("client_order_id")
+                    exchange_order_id = entry.get("exchange_order_id")
+                    order_key = client_order_id or exchange_order_id
+                    from_state = self._normalize_order_state(entry.get("from_state"))
+                    to_state = self._normalize_order_state(entry.get("to_state"))
+                    if order_key:
+                        runtime_row = self.conn.execute(
+                            """
+                            SELECT state
+                            FROM order_runtime_state
+                            WHERE order_key = ?
+                            LIMIT 1
+                            """,
+                            (order_key,),
+                        ).fetchone()
+                        if runtime_row and runtime_row["state"]:
+                            from_state = self._normalize_order_state(runtime_row["state"])
+                    if not self._is_valid_order_state_transition(from_state, to_state):
+                        logger.warning(
+                            "Invalid order state transition detected (audit_id={}): {} -> {}. Coercing to unknown.",
+                            audit_log_id,
+                            from_state,
+                            to_state,
+                        )
+                        to_state = "unknown"
+
+                    payload = entry.get("payload", {})
+                    self.conn.execute(
+                        """
+                        INSERT INTO order_state_transitions (
+                            audit_log_id,
+                            symbol,
+                            client_order_id,
+                            exchange_order_id,
+                            from_state,
+                            to_state,
+                            event_type,
+                            payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
                         (
                             audit_log_id,
                             entry.get("symbol"),
-                            entry.get("client_order_id"),
-                            entry.get("exchange_order_id"),
-                            entry.get("from_state"),
-                            entry.get("to_state"),
+                            client_order_id,
+                            exchange_order_id,
+                            from_state,
+                            to_state,
                             entry.get("event_type"),
-                            json.dumps(entry.get("payload", {})),
+                            json.dumps(payload),
+                        ),
+                    )
+                    self._upsert_order_runtime_state(
+                        order_key=order_key,
+                        client_order_id=client_order_id,
+                        exchange_order_id=exchange_order_id,
+                        symbol=entry.get("symbol"),
+                        state=to_state,
+                        audit_log_id=audit_log_id,
+                        payload=payload,
+                    )
+        except Exception as e:
+            logger.error(f"Failed to save order state transitions: {e}")
+
+    def try_acquire_runtime_lock(self, lock_name: str, owner: str, ttl_seconds: int = 240) -> bool:
+        now_epoch = time.time()
+        expires_epoch = now_epoch + max(1, int(ttl_seconds or 1))
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO runtime_locks (
+                        lock_name,
+                        owner,
+                        acquired_at_epoch,
+                        expires_at_epoch
+                    ) VALUES (?, '', 0, 0)
+                    """,
+                    (lock_name,),
+                )
+                updated = self.conn.execute(
+                    """
+                    UPDATE runtime_locks
+                    SET owner = ?, acquired_at_epoch = ?, expires_at_epoch = ?
+                    WHERE lock_name = ?
+                      AND (expires_at_epoch <= ? OR owner = ?)
+                    """,
+                    (
+                        owner,
+                        now_epoch,
+                        expires_epoch,
+                        lock_name,
+                        now_epoch,
+                        owner,
+                    ),
+                )
+                return updated.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to acquire runtime lock {lock_name}: {e}")
+            return False
+
+    def release_runtime_lock(self, lock_name: str, owner: str):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    UPDATE runtime_locks
+                    SET owner = '', acquired_at_epoch = 0, expires_at_epoch = 0
+                    WHERE lock_name = ? AND owner = ?
+                    """,
+                    (lock_name, owner),
+                )
+        except Exception as e:
+            logger.error(f"Failed to release runtime lock {lock_name}: {e}")
+
+    def acquire_entry_mutex(self, symbol: str, owner: str, ttl_seconds: int = 180) -> bool:
+        now_epoch = time.time()
+        expires_epoch = now_epoch + max(1, int(ttl_seconds or 1))
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO entry_mutex (
+                        symbol,
+                        owner,
+                        acquired_at_epoch,
+                        expires_at_epoch
+                    ) VALUES (?, '', 0, 0)
+                    """,
+                    (symbol,),
+                )
+                updated = self.conn.execute(
+                    """
+                    UPDATE entry_mutex
+                    SET owner = ?, acquired_at_epoch = ?, expires_at_epoch = ?
+                    WHERE symbol = ?
+                      AND (expires_at_epoch <= ? OR owner = ?)
+                    """,
+                    (
+                        owner,
+                        now_epoch,
+                        expires_epoch,
+                        symbol,
+                        now_epoch,
+                        owner,
+                    ),
+                )
+                return updated.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to acquire entry mutex {symbol}: {e}")
+            return False
+
+    def release_entry_mutex(self, symbol: str, owner: str):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    UPDATE entry_mutex
+                    SET owner = '', acquired_at_epoch = 0, expires_at_epoch = 0
+                    WHERE symbol = ? AND owner = ?
+                    """,
+                    (symbol, owner),
+                )
+        except Exception as e:
+            logger.error(f"Failed to release entry mutex {symbol}: {e}")
+
+    def save_decision_fingerprints(self, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO decision_fingerprints (
+                        symbol,
+                        action,
+                        size_band,
+                        fingerprint,
+                        audit_log_id,
+                        status
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(entry.get("symbol") or "").upper(),
+                            str(entry.get("action") or "").upper(),
+                            str(entry.get("size_band") or "unknown"),
+                            str(entry.get("fingerprint") or ""),
+                            entry.get("audit_log_id"),
+                            entry.get("status") or "planned",
                         )
                         for entry in entries
+                        if entry.get("symbol") and entry.get("action") and entry.get("fingerprint")
                     ],
                 )
         except Exception as e:
-            logger.error(f"Failed to save order state transitions: {e}")
+            logger.error(f"Failed to save decision fingerprints: {e}")
+
+    def has_recent_decision_fingerprint(
+        self,
+        symbol: str,
+        action: str,
+        size_band: str,
+        within_minutes: int = 10,
+    ) -> bool:
+        minutes = max(1, int(within_minutes or 1))
+        since = (self._utcnow() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM decision_fingerprints
+            WHERE symbol = ?
+              AND action = ?
+              AND size_band = ?
+              AND created_at >= ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                str(symbol or "").upper(),
+                str(action or "").upper(),
+                str(size_band or "unknown"),
+                since,
+            ),
+        ).fetchone()
+        return row is not None
+
+    def count_recent_unknown_orders(self, minutes: int = 30) -> int:
+        lookback_minutes = max(1, int(minutes or 1))
+        since = (self._utcnow() - timedelta(minutes=lookback_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM order_runtime_state
+            WHERE state = 'unknown'
+              AND updated_at >= ?
+            """,
+            (since,),
+        ).fetchone()
+        if row is None:
+            return 0
+        return int(row["count"] or 0)
+
+    def get_unknown_order_runtime_states(self, limit: int = 50) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                order_key,
+                client_order_id,
+                exchange_order_id,
+                symbol,
+                state,
+                updated_at,
+                last_audit_log_id,
+                payload
+            FROM order_runtime_state
+            WHERE state = 'unknown'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
 
     def save_position_state_transitions(self, audit_log_id: int, entries: List[Dict[str, Any]]):
         if not entries:
@@ -703,6 +1139,7 @@ class StateStore:
             "rejected_24h": int(stats.get("rejected_audits") or 0),
             "loop_errors_24h": int(stats.get("loop_errors") or 0),
             "timeouts_unresolved_24h": int((unresolved_timeouts or {})["count"] or 0),
+            "unknown_order_states_30m": self.count_recent_unknown_orders(minutes=30),
             "fee_cost_24h": fill_stats["fee_cost"],
             "fill_count_24h": fill_stats["fill_count"],
             "realized_pnl_24h": fill_stats["realized_pnl"],
@@ -712,6 +1149,7 @@ class StateStore:
             "recent_logs": recent_logs,
             "semantic_validation_summary": semantic_validation_summary,
             "recent_memory": self.get_recent_long_term_memory(limit=5),
+            "recent_symbol_journal": self.get_recent_symbol_journal(limit=10),
             "recent_fills": self.get_recent_fills(limit=10),
             "recent_ledger": self.get_recent_position_ledger(limit=10),
             "recent_replays": self.get_recent_replay_runs(limit=10),
@@ -871,6 +1309,7 @@ class StateStore:
                 id,
                 timestamp,
                 market_state,
+                account_state,
                 market_vectors,
                 intent,
                 risk_approved
@@ -885,6 +1324,7 @@ class StateStore:
         for row in cursor.fetchall():
             item = dict(row)
             item["market_state"] = self._safe_json_loads(item.get("market_state"), default={})
+            item["account_state"] = self._safe_json_loads(item.get("account_state"), default={})
             item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
             item["intent"] = self._safe_json_loads(item.get("intent"), default={})
             rows.append(item)
@@ -1510,6 +1950,84 @@ class StateStore:
             return datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return None
+
+    def _normalize_order_state(self, value: Any) -> str:
+        state = str(value or "unknown").strip().lower()
+        aliases = {
+            "none": "none",
+            "submitted": "submitted",
+            "partial": "partial_filled",
+            "partial_filled": "partial_filled",
+            "partially_filled": "partial_filled",
+            "partiallyfilled": "partial_filled",
+            "completed": "completed",
+            "filled": "completed",
+            "closed": "completed",
+            "cancelled": "cancelled",
+            "canceled": "cancelled",
+            "failed": "failed",
+            "rejected": "failed",
+            "unknown": "unknown",
+        }
+        return aliases.get(state, "unknown")
+
+    def _is_valid_order_state_transition(self, from_state: str, to_state: str) -> bool:
+        normalized_from = self._normalize_order_state(from_state)
+        normalized_to = self._normalize_order_state(to_state)
+        allowed = {
+            "none": {"submitted", "unknown"},
+            "submitted": {"submitted", "partial_filled", "completed", "cancelled", "failed", "unknown"},
+            "partial_filled": {"partial_filled", "completed", "cancelled", "failed", "unknown"},
+            "unknown": {"unknown", "submitted", "partial_filled", "completed", "cancelled", "failed"},
+            "cancelled": {"cancelled"},
+            "failed": {"failed"},
+            "completed": {"completed"},
+        }
+        return normalized_to in allowed.get(normalized_from, {"unknown"})
+
+    def _upsert_order_runtime_state(
+        self,
+        order_key: Optional[str],
+        client_order_id: Optional[str],
+        exchange_order_id: Optional[str],
+        symbol: Optional[str],
+        state: str,
+        audit_log_id: int,
+        payload: Dict[str, Any],
+    ):
+        if not order_key:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO order_runtime_state (
+                order_key,
+                client_order_id,
+                exchange_order_id,
+                symbol,
+                state,
+                updated_at,
+                last_audit_log_id,
+                payload
+            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            ON CONFLICT(order_key) DO UPDATE SET
+                client_order_id = excluded.client_order_id,
+                exchange_order_id = excluded.exchange_order_id,
+                symbol = excluded.symbol,
+                state = excluded.state,
+                updated_at = CURRENT_TIMESTAMP,
+                last_audit_log_id = excluded.last_audit_log_id,
+                payload = excluded.payload
+            """,
+            (
+                order_key,
+                client_order_id,
+                exchange_order_id,
+                symbol,
+                self._normalize_order_state(state),
+                audit_log_id,
+                json.dumps(payload or {}),
+            ),
+        )
 
     def _utcnow(self) -> datetime:
         return datetime.now(UTC).replace(tzinfo=None)

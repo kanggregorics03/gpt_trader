@@ -1,5 +1,5 @@
-import unittest
 import time
+import unittest
 
 from core.models import AccountState
 from exchange.account_reader import AccountReader
@@ -81,11 +81,55 @@ class DummyExchange:
         ]
 
 
+class HealthyPrivateFeed:
+    def __init__(self):
+        self.seeded = None
+        self.reconcile_required = False
+        self.account_state = AccountState(
+            total_balance=1600.0,
+            available_balance=950.0,
+            positions=[],
+            open_orders=[],
+            open_orders_count=0,
+        )
+
+    def get_health_status(self):
+        return "healthy"
+
+    def needs_periodic_reconcile(self):
+        return self.reconcile_required
+
+    def get_account_state(self, symbols):
+        if self.reconcile_required:
+            return None
+        return self.account_state.model_copy(deep=True)
+
+    def seed_from_account_state(self, state):
+        self.seeded = state
+
+    def mark_reconcile_required(self):
+        self.reconcile_required = True
+
+
+class DegradedPrivateFeed(HealthyPrivateFeed):
+    def __init__(self, health_status="degraded", reconcile_due=False):
+        super().__init__()
+        self.health_status = health_status
+        self.reconcile_due = reconcile_due
+
+    def get_health_status(self):
+        return self.health_status
+
+    def needs_periodic_reconcile(self):
+        return self.reconcile_due
+
+
 class TestAccountReader(unittest.TestCase):
     def test_get_account_state_includes_position_risk_and_open_order_details(self):
         reader = AccountReader.__new__(AccountReader)
         reader.exchange = DummyExchange()
         reader.cache_ttl_ms = 0
+        reader.private_feed = None
         reader.invalidate_cache()
 
         state = reader.get_account_state(["BTCUSDT", "ETHUSDT"])
@@ -150,6 +194,7 @@ class TestAccountReader(unittest.TestCase):
         reader = AccountReader.__new__(AccountReader)
         reader.exchange = BulkExchange()
         reader.cache_ttl_ms = 0
+        reader.private_feed = None
         reader.invalidate_cache()
 
         state = reader.get_account_state(["BTCUSDT"])
@@ -192,31 +237,9 @@ class TestAccountReader(unittest.TestCase):
         self.assertEqual(exchange.balance_calls, 2)
         self.assertEqual(exchange.position_calls, 2)
 
-    def test_private_feed_snapshot_is_used_before_rest_reconcile(self):
-        class DummyPrivateFeed:
-            def __init__(self):
-                self.seeded = None
-                self.reconcile_required = False
-
-            def get_account_state(self, symbols):
-                if self.reconcile_required:
-                    return None
-                return AccountState(
-                    total_balance=1600.0,
-                    available_balance=950.0,
-                    positions=[],
-                    open_orders=[],
-                    open_orders_count=0,
-                )
-
-            def seed_from_account_state(self, state):
-                self.seeded = state
-
-            def mark_reconcile_required(self):
-                self.reconcile_required = True
-
+    def test_healthy_private_feed_snapshot_is_used_before_rest_reconcile(self):
         exchange = DummyExchange()
-        private_feed = DummyPrivateFeed()
+        private_feed = HealthyPrivateFeed()
         reader = AccountReader(exchange, cache_ttl_ms=0, private_feed=private_feed)
 
         state = reader.get_account_state(["BTCUSDT"])
@@ -224,23 +247,31 @@ class TestAccountReader(unittest.TestCase):
         self.assertEqual(state.total_balance, 1600.0)
         self.assertEqual(exchange.balance_calls, 0)
 
-    def test_force_refresh_reconciles_rest_and_seeds_private_feed(self):
-        class DummyPrivateFeed:
-            def __init__(self):
-                self.seeded = None
-                self.reconcile_required = False
-
-            def get_account_state(self, symbols):
-                return None
-
-            def seed_from_account_state(self, state):
-                self.seeded = state
-
-            def mark_reconcile_required(self):
-                self.reconcile_required = True
-
+    def test_degraded_private_feed_falls_back_to_rest_and_seeds_feed(self):
         exchange = DummyExchange()
-        private_feed = DummyPrivateFeed()
+        private_feed = DegradedPrivateFeed(health_status="stale", reconcile_due=False)
+        reader = AccountReader(exchange, cache_ttl_ms=0, private_feed=private_feed)
+
+        state = reader.get_account_state(["BTCUSDT"])
+
+        self.assertEqual(exchange.balance_calls, 1)
+        self.assertIsNotNone(private_feed.seeded)
+        self.assertEqual(state.total_balance, 1500.0)
+
+    def test_reconcile_due_private_feed_uses_rest_even_when_ws_is_healthy(self):
+        exchange = DummyExchange()
+        private_feed = DegradedPrivateFeed(health_status="healthy", reconcile_due=True)
+        reader = AccountReader(exchange, cache_ttl_ms=0, private_feed=private_feed)
+
+        state = reader.get_account_state(["BTCUSDT"])
+
+        self.assertEqual(exchange.balance_calls, 1)
+        self.assertIsNotNone(private_feed.seeded)
+        self.assertEqual(state.total_balance, 1500.0)
+
+    def test_force_refresh_reconciles_rest_and_seeds_private_feed(self):
+        exchange = DummyExchange()
+        private_feed = HealthyPrivateFeed()
         reader = AccountReader(exchange, cache_ttl_ms=0, private_feed=private_feed)
 
         state = reader.get_account_state(["BTCUSDT"], force_refresh=True)

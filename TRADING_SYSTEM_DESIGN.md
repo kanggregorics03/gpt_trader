@@ -7,7 +7,7 @@ Gemini API는 시장/계좌 상태를 바탕으로 “주문 후보(JSON)”를 
 
 사실 조회(포지션/잔고/주문)·리스크 통제·주문 실행은 코드가 전담한다.
 
-15분/1시간 주기 실행 + 트리거 발생 시 더 자주 실행(예: 5분).
+단일 adaptive loop가 현재 상태에 따라 1시간 / 15분 / 5분 cadence를 선택해 실행한다.
 
 매매일지(원본+요약)와 장기 요약(LongTermMemory)을 유지해 맥락/통찰을 축적한다.
 
@@ -42,7 +42,11 @@ collector
 
 지표/특징 계산(ATR, 추세 기울기, 변동성 등)
 
-가능하면 Bybit public WebSocket으로 ticker/orderbook/kline을 수신하고, 부족한 데이터만 REST fallback
+public WebSocket은 ticker/orderbook 위주로 유지하고, closed-candle 기반 OHLCV는 5분 materialization 시점의 incremental REST fetch를 우선
+
+즉 진행 중인 1h/4h 봉을 계속 스트리밍하기보다, 필요한 시점에만 저빈도로 가져오는 쪽을 기본값으로 둔다
+
+public REST fallback TTL도 늘려 ticker/orderbook/funding/open interest 재호출을 줄인다
 
 account_reader
 
@@ -54,11 +58,27 @@ account_reader
 
 짧은 TTL 계좌 캐시를 사용하고, 주문 실행 직후에는 invalidate 후 재조회해 stale 상태를 방지
 
-가능하면 Bybit private WebSocket으로 wallet/position/order/execution을 유지하고, 일정 주기로 REST reconcile
+Bybit private WebSocket으로 wallet/position/order/execution을 메모리에 유지하고, REST는 fallback + reconcile 용도로만 사용
+
+WS health state는 `healthy / stale / degraded / reconnecting / down`
+
+`healthy`일 때만 WS를 primary로 사용하고, `stale / degraded / reconnecting / down`에서는 REST fallback
+
+WS 복구는 단순 재연결로 보지 않고, private 이벤트 수신 재개 + REST reconcile 성공 + 안정 구간 통과 후에만 `healthy`
 
 state_store (DB)
 
 상태(리스크 상태, 최근 트레이드 요약, 장기 메모리 버전 등) 저장
+
+snapshot_service
+
+account_reader / collector / state_store를 묶어 공용 스냅샷을 조립
+
+한 사이클에서 계좌 상태, 시장 상태, 리스크 상태, trigger / risk mode를 한 번에 계산
+
+5분 기준 공용 스냅샷을 materialize하고, 상위 타임프레임은 새 봉이 마감될 때만 선택적으로 refresh
+
+계좌 상태는 `SnapshotService -> AccountReader -> private WS cache`를 우선 사용하고, 주문 직후/WS 비정상/주기적 reconcile 시에만 REST 보정
 
 decision_engine (Gemini)
 
@@ -84,38 +104,112 @@ monitoring & alert
 
 알림(진입/청산/손절/정지/오류), 헬스체크(오류율/지연/거절률)
 
-4) 실행 스케줄과 트리거
-4.1 기본 스케줄(권장)
+4) 실행 모델과 트리거
+4.1 단일 adaptive loop
 
-1시간 루프: 방향성/전략 모드(공격/방어) 업데이트
+현재 구현은 `1시간 루프`, `15분 루프`, `5분 루프`를 각각 스케줄하지 않는다.
 
-15분 루프: 포지션 관리(손절/익절/정정), 신규 진입은 제한적으로
+대신 하나의 메인 루프가 매 사이클마다 다음 cadence를 선택한다.
 
-4.2 트리거 모드(예: 5분)
+우선순위:
 
-트리거 예:
+`5m > 15m > 1h`
 
-변동성 급증(ATR 급증)
+기본 규칙:
 
-손절/익절 근접
+1시간 cadence
 
-특정 레벨 돌파/이탈
+포지션 없음, 미체결 주문 없음, unknown order 없음, 최근 실행/청산 직후가 아님
 
-미체결 주문 장시간 유지
+역할: 전략 판단과 신규 진입 방향성 결정
 
-데이터/계좌 상태 불일치 감지
+15분 cadence
 
-트리거 모드 특징:
+포지션 보유 중
 
-호출은 잦지만, 더 강한 과매매 방지 규칙 적용
+또는 미체결 주문 존재
 
-신규 진입보다 리스크 관리(감축/청산/정정) 중심 운영
+또는 unknown order 상태 존재
 
-트리거는 두 부류로 분리:
+또는 최근 진입/청산 직후라 더 짧은 관리 주기가 필요한 경우
+
+역할: 포지션 관리, 주문 정리, 감축/청산 중심
+
+5분 cadence
+
+opportunity_trigger 활성화
+
+역할: trigger 대응과 빠른 재판단
+
+즉, trigger가 뜨면 무엇이 돌고 있든 5분 cadence가 선점하고, trigger가 사라지면 포지션/주문 상태에 따라 15분 또는 1시간으로 강등된다.
+
+4.1.1 스냅샷 materialization
+
+메인 루프의 decision cadence와 별개로, SnapshotService는 5분 기준 공용 스냅샷을 만든다.
+
+업데이트 원칙:
+
+현재가 / 오더북 / 파생상품 / 계좌 상태 / 리스크 상태
+
+5분 materialization 때마다 갱신
+
+5m timeframe snapshot
+
+매 materialization 때 갱신
+
+15m / 1h / 4h timeframe snapshot
+
+해당 봉이 실제로 마감된 시점에만 refresh
+
+즉, 상위 타임프레임 값은 직전 materialized 값을 재사용하고, 새 봉이 닫혔을 때만 계산을 다시 수행한다.
+
+계좌 상태 업데이트 원칙:
+
+WS `healthy`
+
+WS cache를 primary source로 사용
+
+WS `stale / degraded / reconnecting / down`
+
+REST fallback + reconcile 사용
+
+WS recovery
+
+`connected + subscribed + data flowing + state consistent`를 만족해야 다시 `healthy`
+
+4.2 히스테리시스와 강등 규칙
+
+승격은 빠르게, 강등은 천천히 한다.
+
+`1h -> 15m`
+
+포지션/주문/복구 필요 상태가 생기면 즉시 승격
+
+`1h or 15m -> 5m`
+
+opportunity_trigger가 켜지면 즉시 승격
+
+`5m -> 15m`
+
+trigger 해제 + 최소 유지 시간 충족 + clear streak 충족 + 포지션/주문/복구 대상 존재
+
+`5m -> 1h`
+
+trigger 해제 + 최소 유지 시간 충족 + clear streak 충족 + 포지션/주문/복구 대상 없음
+
+`15m -> 1h`
+
+flat 상태가 최소 유지 시간 이후 여러 사이클 연속 확인될 때만 강등
+
+이 히스테리시스는 cadence가 경계값 근처에서 `5m <-> 15m <-> 1h`로 흔들리는 현상을 줄이기 위한 것이다.
+
+4.3 트리거 분리 원칙
+
+트리거는 두 부류로 분리한다.
 
 opportunity_trigger: 급변/돌파/거래량 급증처럼 관찰 빈도를 높일 이유가 있는 이벤트
 
-risk_trigger: 스프레드 확대, 펀딩비 왜곡처럼 신규 진입을 줄이거나 막아야 하는 거래 품질 악화
+risk_trigger: 스프레드 확대, 펀딩비 왜곡처럼 신규 진입 판단을 더 보수적으로 만들어야 하는 거래 품질 악화
 
 fast_price_move_15m, volume_surge_15m, range_break_1h에는 ON/OFF 기준을 분리한 히스테리시스를 적용해 경계 구간 점멸을 줄임
 
@@ -138,15 +232,25 @@ recent_journal_context: 같은 최근 일지 정보를 구조화 객체로 전�
 
 문자열 파싱 대신 rationale_items, evidence_quality, entry_size_cap, trigger 정보를 직접 참조할 수 있게 함
 
+운영 시에는 context_budget으로 recent_journal_context를 점수 기반 상위 N개로 압축해 토큰을 제어
+
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
+
+long_term_memory도 현재 risk_mode/시장 레짐/심볼 관련성이 높은 항목만 상위 N개를 전달
 
 constraints: “JSON only”, 출력 최대 길이, 허용 행동 제한
 
 프롬프트는 compact JSON으로 직렬화하고, 완전히 동일한 prompt + model은 decision_cache에서 재사용
 
+캐시 키 안정성을 위해 account_state의 고변동 필드(예: snapshot_timestamp)는 canonicalization 단계에서 제외
+
 시장 데이터 수집은 OHLCV 롤링 캐시와 ticker/order book/funding/open interest TTL 캐시를 사용해 네트워크 부하를 줄임
 
-RAG는 audit 저장 시 시장 feature vector를 함께 저장하고, 조회 시에는 심볼별 반복 스캔 대신 배치 유사도 계산으로 DB 부하를 줄임
+RAG는 audit 저장 시 심볼별 feature vector를 함께 저장하고, 조회 시에는 심볼별 반복 스캔 대신 배치 유사도 계산으로 DB 부하를 줄임
+
+RAG vector는 시장 13차원만 쓰지 않고, 리스크/계좌/포지션 컨텍스트 13차원을 합쳐 26차원으로 구성한다
+
+유사도 계산 전에는 차원별 normalization, outlier clipping, weighting을 적용해 큰 스케일 축의 과도한 지배를 줄인다
 
 5.2 Gemini 출력(TradeIntent.json)
 
@@ -247,6 +351,50 @@ Gemini는 통계 해석과 교훈 구조화만 수행
 
 서버 시간 동기화(거래소 시간 기준)로 쿨다운/중복 방지 정확도 확보
 
+8.5 실행 동시성/중복 실행 가드
+
+전역 실행 락(loop_lock)
+
+루프 시작 시 DB 락(`runtime_locks`) 획득에 실패하면 해당 루프를 스킵
+
+다중 인스턴스/중복 실행 즉시 차단
+
+Decision Cooldown + Fingerprint
+
+최근 N분 내 같은 `symbol + action + size band` 결정이면 재실행 금지
+
+같은 판단 반복 주문 방지
+
+Pending Exposure Reserve
+
+미체결 진입 주문을 가상 포지션처럼 계산해 `max_open_positions`와 노출 한도에 포함
+
+상태 반영 지연 구간에서도 보수적으로 제한
+
+Order Lifecycle Runtime State
+
+`submitted/partial_filled/completed/cancelled/failed/unknown` 전이를 강제 검증
+
+유효하지 않은 전이는 `unknown`으로 강등하여 신규 진입 판단에 보수적으로 반영
+
+Pre-trade Reconciliation
+
+주문 직전 `positions/open_orders`를 강제 재조회하고 intent를 재검증
+
+stale snapshot 기반 실행 방지
+
+Per-symbol Entry Mutex
+
+심볼별 `entry in-flight` 락(`entry_mutex`)이 살아 있으면 신규 진입 금지
+
+동일 심볼 중복 진입 방지
+
+Recovery Sweep Job
+
+주기적으로 `unknown/timeout` 주문을 재탐색해 상태 정리
+
+추적 누락 장기화 방지
+
 9) 로그/매매일지/리플레이(재현)
 9.1 원본 감사 로그(audit)
 
@@ -274,9 +422,17 @@ Gemini 요청/응답 원문
 
 audit에도 같은 구조화 근거를 원본 그대로 남겨 당시 판단 근거를 재현 가능하게 유지
 
+또한 symbol_journal을 별도로 저장해, 같은 의사결정 사이클에서도 심볼별 trigger/evidence/pnl을 분리 추적한다
+
 daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 market regime를 함께 읽어 장기 규칙을 만든다
 
 또한 evidence signal 반복에서 heuristic candidate lesson을 먼저 만들고, LLM은 이를 정제/병합하는 역할로 사용한다
+
+최근 구조에서는 symbol_journal도 함께 집계해 심볼 단위 evidence signal 반복 패턴을 별도로 반영한다
+
+symbol 기반 candidate lesson의 evidence_journal_ids는 audit_log_id가 아니라 symbol_journal.id를 근거로 기록한다
+
+symbol_journal 조회 효율을 위해 symbol+id, timestamp+id, audit_log_id 인덱스를 유지한다
 
 9.3 리플레이(강력 권장)
 
@@ -286,7 +442,7 @@ daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 
 
 리플레이 비교에는 rationale 키워드뿐 아니라 rationale_items.evidence signal 추가/삭제도 포함해, 어떤 근거 변화가 decision 변화로 이어졌는지 추적한다
 
-운영 대시보드는 최근 replay의 evidence diff와 최근 memory의 heuristic candidate lesson seed를 함께 노출한다
+운영 대시보드는 최근 replay evidence diff, 최근 memory candidate seed, 최근 symbol_journal을 함께 노출한다
 
 audit detail에서는 raw JSON뿐 아니라 rationale_items 요약과 evidence quality / entry size cap 요약도 카드 형태로 노출한다
 
@@ -315,6 +471,8 @@ memory batch 모델은 실시간 의사결정 모델과 분리할 수 있고, `G
 심볼/레버리지/손실한도/주문 타입/주문 빈도 제한/트리거 조건을 외부 파일로 관리
 
 운영 중 룰 수정이 쉬워지고, 모델이 이상한 주문을 제안해도 실행기가 차단
+
+`execution_guards` 섹션에서 loop lock TTL, decision cooldown, entry mutex TTL, unknown state block window, recovery sweep 주기를 조정
 
 11) 보안/운영
 
@@ -371,6 +529,8 @@ long_term_memory의 recent rule과 candidate_lessons를 읽고 과잉 일반화 
 policy.yaml의 손실 한도, size cap, max positions, trigger threshold를 재검토한다
 
 default / trigger / memory 모델 분리가 여전히 적절한지 본다
+
+context_budget은 `tools/tune_context_budget.py`로 최근 audit 로그의 토큰/컨텍스트 분포를 기반으로 주기 조정한다
 
 SQLite 파일 크기와 audit_logs / position_ledger / replay_runs 증가량을 점검한다
 
@@ -485,7 +645,7 @@ Phase 1: MVP(안전한 자동매매 최소셋)
 
 BTCUSDT/ETHUSDT 1~2개 심볼
 
-1시간 + 15분 스케줄
+adaptive cadence(기본 1시간, 관리 시 15분, trigger 시 5분)
 
 TradeIntent JSON 스키마 고정
 
@@ -506,6 +666,8 @@ hypothesis→rule 승격 규칙
 Phase 3: 트리거 모드 + 유사 사례 검색(RAG)
 
 이벤트 발생 시만 과거 유사 케이스 3~10개를 첨부
+
+이때 유사도는 시장+컨텍스트 26차원 기준으로 계산한다
 
 비용은 유지하면서 통찰 강화
 

@@ -4,7 +4,7 @@ import time
 import yaml
 from pathlib import Path
 from core.risk_engine import RiskEngine
-from core.models import DerivativesSnapshot, EvidenceItem, MarketSnapshot, RationaleItem, TradeIntent, AccountState, PositionState, OrderIntent
+from core.models import DerivativesSnapshot, EvidenceItem, MarketSnapshot, OpenOrderState, RationaleItem, TradeIntent, AccountState, PositionState, OrderIntent
 
 class TestRiskEngine(unittest.TestCase):
     def setUp(self):
@@ -234,7 +234,7 @@ class TestRiskEngine(unittest.TestCase):
         )
         self.assertTrue(approved)
 
-    def test_wide_spread_blocks_new_entries(self):
+    def test_wide_spread_is_passed_as_advisory_not_hard_block(self):
         intent = TradeIntent(
             decision="BUY",
             orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.01)],
@@ -261,10 +261,11 @@ class TestRiskEngine(unittest.TestCase):
             market_prices={"BTCUSDT": 30000},
         )
 
-        self.assertFalse(approved)
-        self.assertIn("wide spread", reason.lower())
+        self.assertTrue(approved)
+        self.assertIn("risk advisories", reason.lower())
+        self.assertIn("wide_spread", reason.lower())
 
-    def test_elevated_positive_funding_blocks_long_entries(self):
+    def test_elevated_positive_funding_is_passed_as_advisory_not_hard_block(self):
         intent = TradeIntent(
             decision="BUY",
             orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.01)],
@@ -292,8 +293,9 @@ class TestRiskEngine(unittest.TestCase):
             market_prices={"BTCUSDT": 30000},
         )
 
-        self.assertFalse(approved)
-        self.assertIn("elevated funding", reason.lower())
+        self.assertTrue(approved)
+        self.assertIn("risk advisories", reason.lower())
+        self.assertIn("elevated_funding_unfavorable", reason.lower())
 
     def test_elevated_positive_funding_allows_short_entries(self):
         intent = TradeIntent(
@@ -513,6 +515,99 @@ class TestRiskEngine(unittest.TestCase):
         self.assertTrue(summary["adjusted"])
         self.assertLess(summary["effective_cap_pct"], summary["base_cap_pct"])
         self.assertIn("low_signal_diversity", summary["evidence_quality"]["issues"])
+
+    def test_unresolved_unknown_orders_block_new_entry(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.01)],
+            rationale=["Momentum"],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            unresolved_timeout_count=1,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("unresolved order lifecycle", reason.lower())
+
+    def test_pending_open_orders_are_reserved_for_max_positions(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[
+                OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.01),
+                OrderIntent(symbol="SOLUSDT", action="BUY", order_type="MARKET", quantity=1.0),
+            ],
+            rationale=["Portfolio expansion"],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=1000,
+            positions=[],
+            open_orders=[
+                OpenOrderState(
+                    symbol="ETHUSDT",
+                    side="BUY",
+                    order_type="MARKET",
+                    quantity=0.2,
+                    status="open",
+                    reduce_only=False,
+                )
+            ],
+            open_orders_count=1,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000, "ETHUSDT": 2000, "SOLUSDT": 100},
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("cannot open more than", reason.lower())
+
+    def test_pending_open_orders_are_reserved_for_candidate_size_cap(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.005)],
+            rationale=["Trigger continuation"],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=1000,
+            positions=[],
+            open_orders=[
+                OpenOrderState(
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="MARKET",
+                    quantity=0.008,
+                    price=30000,
+                    status="open",
+                    reduce_only=False,
+                )
+            ],
+            open_orders_count=1,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            is_trigger_mode=True,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("candidate size", reason.lower())
 
 if __name__ == '__main__':
     unittest.main()

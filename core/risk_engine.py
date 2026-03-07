@@ -1,6 +1,6 @@
 import yaml
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -154,6 +154,8 @@ class RiskEngine:
         market_prices: Optional[Dict[str, float]] = None,
         risk_state: Optional[Dict[str, float]] = None,
         is_trigger_mode: bool = False,
+        unresolved_timeout_count: int = 0,
+        active_profile_override: Optional[Dict] = None,
     ) -> Tuple[bool, str]:
         """
         Validates the proposed TradeIntent against policy.yaml and account_state.
@@ -169,7 +171,10 @@ class RiskEngine:
         market_snapshots = market_snapshots or {}
         risk_state = risk_state or {}
         active_mode = self.get_active_risk_mode(risk_state=risk_state, is_trigger_mode=is_trigger_mode)
-        active_profile = self.get_active_risk_profile(risk_state=risk_state, is_trigger_mode=is_trigger_mode)
+        active_profile = active_profile_override or self.get_active_risk_profile(
+            risk_state=risk_state,
+            is_trigger_mode=is_trigger_mode,
+        )
         is_entry_decision = intent.decision in ("BUY", "SELL")
         is_risk_reducing = intent.decision in ("REDUCE", "EXIT")
 
@@ -180,11 +185,23 @@ class RiskEngine:
                 return market_snapshot
             return market_snapshot
 
+        def is_pending_entry_order(order) -> bool:
+            status = str(getattr(order, "status", "") or "").lower()
+            if status in ("closed", "filled", "canceled", "cancelled", "rejected", "failed"):
+                return False
+            if bool(getattr(order, "reduce_only", False)):
+                return False
+            return str(getattr(order, "side", "")).upper() in ("BUY", "SELL")
+
         allowed_actions = set(active_profile.get("allowed_actions", []))
         if allowed_actions and intent.decision not in allowed_actions:
             return False, f"Risk profile {active_mode} blocks action {intent.decision}."
 
         if is_entry_decision:
+            if int(unresolved_timeout_count or 0) > 0:
+                return False, (
+                    f"Entry blocked: {int(unresolved_timeout_count)} unresolved order lifecycle state(s) remain unknown."
+                )
             daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
             daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
             if daily_max_loss_pct > 0 and daily_pnl_pct <= -daily_max_loss_pct:
@@ -216,12 +233,17 @@ class RiskEngine:
                 for order in intent.orders
                 if not order.reduce_only
             }
+            pending_symbols = {
+                order.symbol
+                for order in account_state.open_orders
+                if is_pending_entry_order(order)
+            }
             existing_symbols = {
                 position.symbol
                 for position in account_state.positions
                 if abs(float(position.size)) > 0
             }
-            projected_symbols = existing_symbols | new_symbols
+            projected_symbols = existing_symbols | pending_symbols | new_symbols
             if len(projected_symbols) > max_positions:
                 return False, f"Risk limit exceeded: Cannot open more than {max_positions} positions."
 
@@ -229,6 +251,7 @@ class RiskEngine:
         allowed_symbols = trading_policy.get('symbols', [])
         policy_order_type = str(trading_policy.get("order_type", "market")).upper()
         max_leverage = float(trading_policy.get("max_leverage", 0) or 0)
+        risk_advisories: List[str] = []
 
         for order in intent.orders:
             symbol_market_snapshot = get_snapshot_for_symbol(order.symbol)
@@ -249,7 +272,15 @@ class RiskEngine:
                 return False, f"{intent.decision} orders must be marked reduce_only."
 
             if is_entry_decision and "wide_spread" in risk_trigger_reasons:
-                return False, f"Entry blocked: wide spread risk trigger is active for {order.symbol}."
+                spread_bps = (
+                    symbol_market_snapshot.order_book.spread_bps
+                    if symbol_market_snapshot is not None
+                    else None
+                )
+                if spread_bps is not None:
+                    risk_advisories.append(f"{order.symbol}: wide_spread={float(spread_bps):.2f}bps")
+                else:
+                    risk_advisories.append(f"{order.symbol}: wide_spread")
 
             if is_entry_decision and symbol_market_snapshot is not None:
                 funding_rate = symbol_market_snapshot.derivatives.funding_rate
@@ -257,13 +288,20 @@ class RiskEngine:
                     unfavorable_long = funding_rate > 0 and order.action == "BUY"
                     unfavorable_short = funding_rate < 0 and order.action == "SELL"
                     if unfavorable_long or unfavorable_short:
-                        return False, (
-                            f"Entry blocked: elevated funding ({funding_rate:.6f}) is unfavorable for "
-                            f"{order.action} positions on {order.symbol}."
+                        risk_advisories.append(
+                            f"{order.symbol}: elevated_funding_unfavorable={float(funding_rate):.6f}"
                         )
 
         if is_entry_decision and max_leverage > 0:
             current_exposure = sum(abs(pos.size) * pos.entry_price for pos in account_state.positions)
+            pending_exposure = 0.0
+            for pending_order in account_state.open_orders:
+                if not is_pending_entry_order(pending_order):
+                    continue
+                pending_price = pending_order.price or market_prices.get(pending_order.symbol)
+                if pending_price is None:
+                    pending_price = 0.0
+                pending_exposure += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
             incremental_exposure = 0.0
             for order in intent.orders:
                 if order.reduce_only:
@@ -277,7 +315,7 @@ class RiskEngine:
                     reference_price = 0.0
                 incremental_exposure += abs(order.quantity) * float(reference_price)
 
-            projected_exposure = current_exposure + incremental_exposure
+            projected_exposure = current_exposure + pending_exposure + incremental_exposure
             max_allowed_exposure = account_state.total_balance * max_leverage
             if max_allowed_exposure > 0 and projected_exposure > max_allowed_exposure:
                 return False, (
@@ -296,6 +334,14 @@ class RiskEngine:
             evidence_quality = cap_summary["evidence_quality"]
             adjusted_notional_pct_balance = float(cap_summary["effective_cap_pct"])
             candidate_notional = 0.0
+            pending_notional = 0.0
+            for pending_order in account_state.open_orders:
+                if not is_pending_entry_order(pending_order):
+                    continue
+                pending_price = pending_order.price or market_prices.get(pending_order.symbol)
+                if pending_price is None:
+                    pending_price = 0.0
+                pending_notional += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
             for order in intent.orders:
                 if order.reduce_only:
                     continue
@@ -307,6 +353,7 @@ class RiskEngine:
                     )
                     reference_price = 0.0
                 candidate_notional += abs(order.quantity) * float(reference_price)
+            candidate_notional += pending_notional
             max_candidate_notional = account_state.total_balance * (adjusted_notional_pct_balance / 100.0)
             if candidate_notional > max_candidate_notional:
                 issue_suffix = ""
@@ -317,5 +364,9 @@ class RiskEngine:
                     f"{max_candidate_notional:.2f}, got {candidate_notional:.2f}."
                     f"{issue_suffix}"
                 )
+
+        if risk_advisories:
+            summarized = "; ".join(dict.fromkeys(risk_advisories))
+            return True, f"Approved with risk advisories: {summarized}"
 
         return True, "Approved"

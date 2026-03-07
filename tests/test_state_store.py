@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,7 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 0)
         self.assertEqual(len(snapshot["recent_memory"]), 1)
         self.assertEqual(snapshot["recent_memory"][0]["metrics"]["status"], "rule")
+        self.assertEqual(snapshot["recent_symbol_journal"], [])
         hashed_log = next(log for log in snapshot["recent_logs"] if log["decision_input_hash"] == "abc123")
         self.assertEqual(hashed_log["risk_mode"], "cooldown")
 
@@ -188,6 +190,42 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["risk_mode"], "drawdown")
         self.assertEqual(rows[0]["ledger_net_realized_pnl"], -16.0)
         self.assertEqual(rows[0]["execution_summary"]["ai_usage"]["total_token_count"], 321)
+
+    def test_monitoring_snapshot_includes_recent_symbol_journal(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"ETHUSDT": {"symbol": "ETHUSDT"}}},
+            intent={"decision": "SELL"},
+            risk_ok=True,
+            reason="Approved with risk advisories",
+            receipts=[],
+            risk_mode="trigger",
+        )
+        self.store.save_symbol_journal_entries(
+            [
+                {
+                    "audit_log_id": audit_id,
+                    "symbol": "ETHUSDT",
+                    "decision": "SELL",
+                    "risk_reason": "Approved with risk advisories",
+                    "risk_mode": "trigger",
+                    "risk_approved": True,
+                    "triggered": True,
+                    "risk_triggered": False,
+                    "estimated_pnl_pct": 0.2,
+                    "net_realized_pnl": 1.5,
+                    "evidence_signals": ["rsi_14@15m"],
+                }
+            ]
+        )
+
+        snapshot = self.store.get_monitoring_snapshot()
+
+        self.assertEqual(len(snapshot["recent_symbol_journal"]), 1)
+        row = snapshot["recent_symbol_journal"][0]
+        self.assertEqual(row["audit_log_id"], audit_id)
+        self.assertEqual(row["symbol"], "ETHUSDT")
+        self.assertEqual(row["evidence_signals"], ["rsi_14@15m"])
 
     def test_get_recent_journals_includes_structured_evidence_summary(self):
         audit_id = self.store.save_audit(
@@ -573,6 +611,157 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["market_vectors"]["BTCUSDT"], [0.1, 0.2, 0.3])
         self.assertEqual(rows[0]["intent"]["decision"], "BUY")
+
+    def test_symbol_journal_entries_round_trip(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "BUY"},
+            risk_ok=True,
+            reason="Approved with risk advisories: BTCUSDT: wide_spread=12.30bps",
+            receipts=[],
+            risk_mode="trigger",
+        )
+        self.store.save_symbol_journal_entries(
+            [
+                {
+                    "audit_log_id": audit_id,
+                    "symbol": "BTCUSDT",
+                    "decision": "BUY",
+                    "risk_reason": "Approved with risk advisories: BTCUSDT: wide_spread=12.30bps",
+                    "risk_mode": "trigger",
+                    "risk_approved": True,
+                    "triggered": True,
+                    "risk_triggered": True,
+                    "net_realized_pnl": -2.5,
+                    "fee_cost": 0.8,
+                    "estimated_pnl_pct": -0.25,
+                    "evidence_signals": ["volume_ratio@15m", "spread_bps@microstructure"],
+                    "summary": "Momentum setup with caution.",
+                    "payload": {"order_actions": ["BUY:MARKET:0.01"]},
+                }
+            ]
+        )
+
+        rows = self.store.get_recent_symbol_journal(limit=5)
+        filtered = self.store.get_recent_symbol_journal(limit=5, symbol="BTCUSDT")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["audit_log_id"], audit_id)
+        self.assertEqual(rows[0]["symbol"], "BTCUSDT")
+        self.assertEqual(rows[0]["risk_mode"], "trigger")
+        self.assertEqual(rows[0]["triggered"], 1)
+        self.assertEqual(rows[0]["risk_triggered"], 1)
+        self.assertEqual(rows[0]["evidence_signals"], ["volume_ratio@15m", "spread_bps@microstructure"])
+        self.assertEqual(rows[0]["payload"]["order_actions"], ["BUY:MARKET:0.01"])
+        self.assertEqual(len(filtered), 1)
+
+        since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+        since_rows = self.store.get_symbol_journal_entries_since(since)
+        self.assertEqual(len(since_rows), 1)
+        self.assertEqual(since_rows[0]["symbol"], "BTCUSDT")
+
+    def test_symbol_journal_indexes_exist(self):
+        rows = self.store.conn.execute("PRAGMA index_list('symbol_journal')").fetchall()
+        index_names = {row["name"] for row in rows}
+
+        self.assertIn("idx_symbol_journal_symbol_id", index_names)
+        self.assertIn("idx_symbol_journal_timestamp_id", index_names)
+        self.assertIn("idx_symbol_journal_audit_log_id", index_names)
+
+    def test_runtime_lock_blocks_other_owner_until_release(self):
+        acquired_a = self.store.try_acquire_runtime_lock("loop_lock", owner="worker-a", ttl_seconds=60)
+        acquired_b_before_release = self.store.try_acquire_runtime_lock("loop_lock", owner="worker-b", ttl_seconds=60)
+
+        self.store.release_runtime_lock("loop_lock", owner="worker-a")
+        acquired_b_after_release = self.store.try_acquire_runtime_lock("loop_lock", owner="worker-b", ttl_seconds=60)
+
+        self.assertTrue(acquired_a)
+        self.assertFalse(acquired_b_before_release)
+        self.assertTrue(acquired_b_after_release)
+
+    def test_entry_mutex_blocks_duplicate_symbol_entry(self):
+        acquired_a = self.store.acquire_entry_mutex("BTCUSDT", owner="worker-a", ttl_seconds=60)
+        acquired_b_before_release = self.store.acquire_entry_mutex("BTCUSDT", owner="worker-b", ttl_seconds=60)
+
+        self.store.release_entry_mutex("BTCUSDT", owner="worker-a")
+        acquired_b_after_release = self.store.acquire_entry_mutex("BTCUSDT", owner="worker-b", ttl_seconds=60)
+
+        self.assertTrue(acquired_a)
+        self.assertFalse(acquired_b_before_release)
+        self.assertTrue(acquired_b_after_release)
+
+    def test_decision_fingerprint_and_unknown_runtime_state_queries(self):
+        self.store.save_decision_fingerprints(
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "action": "BUY",
+                    "size_band": "small",
+                    "fingerprint": "fp-1",
+                    "status": "planned",
+                }
+            ]
+        )
+        has_recent = self.store.has_recent_decision_fingerprint(
+            symbol="BTCUSDT",
+            action="BUY",
+            size_band="small",
+            within_minutes=10,
+        )
+
+        self.store.save_order_state_transitions(
+            audit_log_id=1,
+            entries=[
+                {
+                    "symbol": "BTCUSDT",
+                    "client_order_id": "cid-1",
+                    "exchange_order_id": "oid-1",
+                    "from_state": "none",
+                    "to_state": "submitted",
+                    "event_type": "intent_submitted",
+                    "payload": {},
+                }
+            ],
+        )
+        self.store.save_order_state_transitions(
+            audit_log_id=2,
+            entries=[
+                {
+                    "symbol": "BTCUSDT",
+                    "client_order_id": "cid-1",
+                    "exchange_order_id": "oid-1",
+                    "from_state": "submitted",
+                    "to_state": "completed",
+                    "event_type": "exchange_update",
+                    "payload": {},
+                }
+            ],
+        )
+        self.store.save_order_state_transitions(
+            audit_log_id=3,
+            entries=[
+                {
+                    "symbol": "BTCUSDT",
+                    "client_order_id": "cid-1",
+                    "exchange_order_id": "oid-1",
+                    "from_state": "completed",
+                    "to_state": "submitted",
+                    "event_type": "invalid_regression",
+                    "payload": {},
+                }
+            ],
+        )
+
+        # Ensure CURRENT_TIMESTAMP has advanced in SQLite before querying lookback windows.
+        time.sleep(0.01)
+        unknown_count = self.store.count_recent_unknown_orders(minutes=30)
+        unknown_rows = self.store.get_unknown_order_runtime_states(limit=10)
+
+        self.assertTrue(has_recent)
+        self.assertGreaterEqual(unknown_count, 1)
+        self.assertEqual(unknown_rows[0]["state"], "unknown")
+        self.assertEqual(unknown_rows[0]["client_order_id"], "cid-1")
 
 
 if __name__ == "__main__":

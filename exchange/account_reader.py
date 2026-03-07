@@ -30,16 +30,31 @@ class AccountReader:
     def get_account_state(self, symbols: List[str], force_refresh: bool = False) -> AccountState:
         cache_key = tuple(sorted(symbols))
         private_feed = getattr(self, "private_feed", None)
-        if not force_refresh:
-            cached_state = self._get_cached_account_state(cache_key)
-            if cached_state is not None:
-                return cached_state
+        ws_health = None
+        ws_reconcile_due = False
 
-            if private_feed is not None:
+        if private_feed is not None:
+            ws_health = private_feed.get_health_status()
+            ws_reconcile_due = private_feed.needs_periodic_reconcile()
+
+        if not force_refresh:
+            if private_feed is None:
+                cached_state = self._get_cached_account_state(cache_key)
+                if cached_state is not None:
+                    return cached_state
+            elif ws_health == "healthy" and not ws_reconcile_due:
+                cached_state = self._get_cached_account_state(cache_key)
+                if cached_state is not None:
+                    return cached_state
                 ws_state = private_feed.get_account_state(symbols)
                 if ws_state is not None:
                     self._set_cached_account_state(cache_key, ws_state)
                     return ws_state
+            else:
+                logger.info(
+                    f"Private WS account cache unavailable; using REST reconcile "
+                    f"(health={ws_health}, reconcile_due={ws_reconcile_due})"
+                )
 
         try:
             # 1. Fetch Balances

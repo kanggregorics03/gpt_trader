@@ -194,6 +194,10 @@ HTML_TEMPLATE = """
                     <div id="ledger-list">Loading...</div>
                 </article>
                 <article class="panel">
+                    <p class="eyebrow">Recent Symbol Journal</p>
+                    <div id="symbol-journal-list">Loading...</div>
+                </article>
+                <article class="panel">
                     <p class="eyebrow">Recent Replays</p>
                     <div id="replay-list">Loading...</div>
                 </article>
@@ -756,6 +760,16 @@ HTML_TEMPLATE = """
                         <strong>${row.symbol || 'UNKNOWN'} ${row.decision || ''}</strong>
                         <div class="fill-meta">
                             net pnl ${row.net_realized_pnl || 0} • fee ${row.fee_cost || 0} • fills ${row.fill_count || 0}
+                        </div>
+                    </div>
+                `);
+
+                renderList('symbol-journal-list', 'No symbol journal rows yet.', data.recent_symbol_journal || [], row => `
+                    <div class="fill-item">
+                        <strong>${row.symbol || 'UNKNOWN'} ${row.decision || 'UNKNOWN'} • audit ${row.audit_log_id || '-'}</strong>
+                        <div class="fill-meta">
+                            mode ${row.risk_mode || 'n/a'} • triggered ${row.triggered ? 'yes' : 'no'} • risk ${row.risk_triggered ? 'yes' : 'no'}
+                            <br>est pnl ${row.estimated_pnl_pct ?? 'n/a'} • net pnl ${row.net_realized_pnl ?? 'n/a'} • signals ${(row.evidence_signals || []).slice(0, 3).join(', ') || 'none'}
                         </div>
                     </div>
                 `);

@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class TimeframeSnapshot(BaseModel):
     timeframe: str
+    closed_at: Optional[int] = None
     last_close: float = 0.0
     previous_values: Dict[str, Optional[float]] = Field(default_factory=dict)
     atr: float = 0.0

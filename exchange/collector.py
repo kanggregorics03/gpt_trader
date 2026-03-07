@@ -15,9 +15,27 @@ from core.models import (
 )
 
 class MarketCollector:
-    def __init__(self, exchange: ccxt.bybit, public_feed: Optional[BybitPublicMarketFeed] = None):
+    DEFAULT_RESPONSE_CACHE_TTLS_MS = {
+        "ticker": 5_000,
+        "order_book": 5_000,
+        "funding_rate": 300_000,
+        "open_interest": 30_000,
+    }
+
+    def __init__(
+        self,
+        exchange: ccxt.bybit,
+        public_feed: Optional[BybitPublicMarketFeed] = None,
+        response_cache_ttls_ms: Optional[Dict[str, int]] = None,
+    ):
         self.exchange = exchange
         self.public_feed = public_feed
+        cache_ttls = dict(self.DEFAULT_RESPONSE_CACHE_TTLS_MS)
+        cache_ttls.update(response_cache_ttls_ms or {})
+        self.response_cache_ttls_ms = {
+            key: max(250, int(value or self.DEFAULT_RESPONSE_CACHE_TTLS_MS[key]))
+            for key, value in cache_ttls.items()
+        }
         self._ohlcv_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._response_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._previous_order_books: Dict[str, OrderBookSnapshot] = {}
@@ -219,6 +237,7 @@ class MarketCollector:
             return TimeframeSnapshot(timeframe=timeframe)
 
         last = df_closed.iloc[-1]
+        closed_at = int(last["timestamp"]) if "timestamp" in df_closed.columns else None
         prev_close = df_closed["close"].iloc[-2] if len(df_closed) >= 2 else last["close"]
         close_3 = df_closed["close"].iloc[-4] if len(df_closed) >= 4 else prev_close
         close_6 = df_closed["close"].iloc[-7] if len(df_closed) >= 7 else prev_close
@@ -260,6 +279,7 @@ class MarketCollector:
 
         return TimeframeSnapshot(
             timeframe=timeframe,
+            closed_at=closed_at,
             last_close=last_close,
             previous_values={
                 "last_close": self._safe_float(previous_row["close"], last_close),
@@ -307,7 +327,10 @@ class MarketCollector:
                 if not has_capability:
                     return OrderBookSnapshot()
                 cache_key = (symbol, "order_book")
-                order_book = self._get_cached_response(cache_key, ttl_ms=1000)
+                order_book = self._get_cached_response(
+                    cache_key,
+                    ttl_ms=self.response_cache_ttls_ms["order_book"],
+                )
                 if order_book is None:
                     order_book = self.exchange.fetch_order_book(symbol, limit=10)
                     self._set_cached_response(cache_key, order_book)
@@ -364,8 +387,8 @@ class MarketCollector:
         try:
             symbol = args[0] if args else "global"
             ttl_by_method = {
-                "fetch_funding_rate": 60_000,
-                "fetch_open_interest": 5_000,
+                "fetch_funding_rate": self.response_cache_ttls_ms["funding_rate"],
+                "fetch_open_interest": self.response_cache_ttls_ms["open_interest"],
             }
             ttl_ms = ttl_by_method.get(method_name, 1_000)
             cache_key = (str(symbol), method_name)
@@ -541,33 +564,49 @@ class MarketCollector:
             "range_break_1h_active": "range_break_1h" in snapshot.opportunity_trigger_reasons,
         }
 
-    def get_market_snapshot(self, symbol: str, trigger_state: Optional[Dict[str, Any]] = None) -> MarketSnapshot:
+    def get_market_snapshot(
+        self,
+        symbol: str,
+        trigger_state: Optional[Dict[str, Any]] = None,
+        timeframes_to_fetch: Optional[Dict[str, int]] = None,
+        existing_snapshot: Optional[MarketSnapshot] = None,
+    ) -> MarketSnapshot:
         try:
-            timeframes_to_fetch = {"5m": 80, "15m": 80, "1h": 80, "4h": 80}
+            resolved_timeframes = timeframes_to_fetch or {"5m": 80, "15m": 80, "1h": 80, "4h": 80}
             raw_frames = {
                 timeframe: self._fetch_ohlcv_cached(symbol, timeframe, full_limit=limit)
-                for timeframe, limit in timeframes_to_fetch.items()
+                for timeframe, limit in resolved_timeframes.items()
             }
             closed_frames = {
                 timeframe: self._closed_candles(df)
                 for timeframe, df in raw_frames.items()
             }
-            timeframe_snapshots = {
+            fetched_timeframe_snapshots = {
                 timeframe: self._build_timeframe_snapshot(timeframe, df_closed)
                 for timeframe, df_closed in closed_frames.items()
             }
+            timeframe_snapshots = {
+                timeframe: snapshot
+                for timeframe, snapshot in ((existing_snapshot.timeframes or {}).items() if existing_snapshot else [])
+            }
+            timeframe_snapshots.update(fetched_timeframe_snapshots)
 
             ticker = None
             if self.public_feed is not None:
                 ticker = self.public_feed.get_ticker(symbol)
             if ticker is None:
                 cache_key = (symbol, "ticker")
-                ticker = self._get_cached_response(cache_key, ttl_ms=1000)
+                ticker = self._get_cached_response(
+                    cache_key,
+                    ttl_ms=self.response_cache_ttls_ms["ticker"],
+                )
                 if ticker is None:
                     ticker = self.exchange.fetch_ticker(symbol) or {}
                     self._set_cached_response(cache_key, ticker)
             current_price = self._safe_float(
-                ticker.get("last") or ticker.get("close") or timeframe_snapshots["15m"].last_close
+                ticker.get("last")
+                or ticker.get("close")
+                or (timeframe_snapshots.get("15m") or TimeframeSnapshot(timeframe="15m")).last_close
             )
             derivatives = self._build_derivatives_snapshot(symbol, ticker)
             order_book = self._build_order_book_snapshot(symbol)
@@ -606,8 +645,8 @@ class MarketCollector:
             is_opportunity_trigger = bool(opportunity_trigger_reasons)
             is_risk_trigger = bool(risk_trigger_reasons)
 
-            tf_15m = timeframe_snapshots["15m"]
-            tf_1h = timeframe_snapshots["1h"]
+            tf_15m = timeframe_snapshots.get("15m", TimeframeSnapshot(timeframe="15m"))
+            tf_1h = timeframe_snapshots.get("1h", TimeframeSnapshot(timeframe="1h"))
             return MarketSnapshot(
                 symbol=symbol,
                 current_price=current_price,

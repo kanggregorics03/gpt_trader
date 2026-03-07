@@ -65,21 +65,14 @@ AI는 전략 제안자 역할만 하며, 실제 주문 집행 권한은 없다.
 ```text
 AccountReader ----\
                    \
-MarketCollector ----> DecisionRequest ----> DecisionEngine ----> TradeIntent
-                   /                                 |
-StateStore -------/                                  v
-                                  RiskEngine (policy + risk mode/profile)
-                                                     |
-                                        approved? ---+--- rejected?
-                                           |                     |
-                                           v                     v
-                                  ExecutionEngine           Audit / Journal
-                                           |
-                                           v
-                            receipts / fills / ledgers / state transitions
-                                           |
-                                           v
-                                       StateStore
+MarketCollector ----> SnapshotService ----> DecisionRequest ----> DecisionEngine ----> TradeIntent
+                   /                 |                                  |
+StateStore -------/                  v                                  v
+                           adaptive cadence state                RiskEngine (policy + risk mode/profile)
+                           (1h / 15m / 5m)                                  |
+                                                                             +---- approved? ----> ExecutionEngine
+                                                                             |
+                                                                             +---- rejected ----> Audit / Journal
 ```
 
 그리고 별도 배치 경로가 있다.
@@ -92,7 +85,7 @@ journal + ledger stats -> MemoryUpdater -> long_term_memory
 
 ```text
 gpt_trader/
-├─ main.py                    # 메인 오케스트레이터, 스케줄러 시작점
+├─ main.py                    # 메인 오케스트레이터, 단일 adaptive loop 시작점
 ├─ policy.yaml                # 거래/리스크 정책
 ├─ .env.example               # 환경 변수 예시
 ├─ ai/
@@ -102,7 +95,8 @@ gpt_trader/
 │  └─ memory_updater.py       # 장기 메모리 일일 배치
 ├─ core/
 │  ├─ models.py               # Pydantic 데이터 모델
-│  └─ risk_engine.py          # 정책 검증, 리스크 모드/프로파일 계산
+│  ├─ risk_engine.py          # 정책 검증, 리스크 모드/프로파일 계산
+│  └─ snapshot_service.py     # 공용 계좌/시장/리스크 스냅샷 조립
 ├─ dashboard/
 │  └─ app.py                  # Flask 운영 대시보드
 ├─ db/
@@ -121,12 +115,41 @@ gpt_trader/
 
 ## 실행 흐름 상세
 
-### 1. 계좌와 시장 상태 조회
+### 1. SnapshotService가 공용 상태를 조립
 
-`main.py`의 `TradingOrchestrator.run_cycle()`는 먼저 계좌 상태와 각 심볼의 시장 스냅샷을 만든다.
+`main.py`의 오케스트레이터는 더 이상 `1시간/15분/5분` 스케줄을 각각 돌리지 않는다.  
+대신 하나의 adaptive loop가 현재 상태에 따라 다음 실행 주기를 `1h`, `15m`, `5m` 중 하나로 선택한다.
+
+각 사이클의 시작에서는 `SnapshotService`가 아래를 한 번에 만든다.
+
+- `AccountReader`로 계좌 상태 조회
+- `StateStore`로 현재 리스크 상태 계산
+- `MarketCollector`로 심볼별 시장 스냅샷 수집
+- 현재 스냅샷을 바탕으로 `is_trigger_mode`, `risk_mode`, `risk_profile` 결정
+
+즉, 정보 수집과 판단을 분리해 같은 사이클 안에서 중복 조회를 줄이는 구조다.
+계좌 상태는 `SnapshotService -> AccountReader -> private WS cache` 경로를 우선 사용하고, REST는 fallback + reconcile 시에만 호출한다.
+
+중요한 점은 `SnapshotService`가 단순히 "실행할 때마다 전부 다시 조회"하지 않는다는 것이다.
+
+- 5분마다 공용 스냅샷을 materialize
+- 현재가 / 오더북 / 파생상품 / 계좌 상태는 5분 스냅샷 시점마다 갱신
+- `5m` 타임프레임은 매 materialization 때 갱신
+- `15m`, `1h`, `4h` 타임프레임은 해당 봉이 실제로 마감됐을 때만 다시 계산
+
+계좌 상태는 아래 경우에만 REST reconcile로 보정한다.
+
+- 주문 실행 직후 pre/post trade reconcile
+- WS health가 `stale`, `degraded`, `reconnecting`, `down`
+- unknown order 복구가 필요한 경우
+- 주기적 reconcile TTL이 지난 경우
+
+즉, 상위 타임프레임 값은 "새 봉이 닫혔는가"를 기준으로 선택적으로 refresh되고, 그 외 시점에는 직전 materialized 값을 재사용한다.
 
 여기서 중요한 점은 경로가 분리되어 있다는 것이다.  
 시장 데이터는 Bybit 메인넷 public API에서 받고, 계좌 조회와 주문 실행은 `BYBIT_TRADING_MODE`에 따라 live 또는 demo private API로 보낸다.
+
+공용 스냅샷을 만드는 구성 요소는 다음과 같다.
 
 - `AccountReader`
   - 계좌 스냅샷 시각
@@ -139,8 +162,11 @@ gpt_trader/
   - 미체결 주문 목록
     - 방향 / 주문 타입 / 수량 / 가격
     - reduce-only / TP / SL / clientOrderId / 상태
-  - 짧은 TTL 캐시를 사용해 같은 구간의 중복 private API 조회를 줄이고, 주문 실행 직후에는 캐시를 무효화
-  - 가능하면 Bybit private WebSocket으로 wallet / position / order / execution을 유지하고, 주기적으로 REST reconcile
+  - 짧은 TTL 캐시를 사용해 같은 구간의 중복 private API 조회를 줄이되, private WS가 비정상이면 캐시보다 REST reconcile을 우선
+  - Bybit private WebSocket으로 `wallet / position / order / execution`을 메모리에 유지하고, REST는 fallback + reconcile 용도로만 사용
+  - WS health state는 `healthy / stale / degraded / reconnecting / down`
+  - `healthy`일 때만 WS를 primary source로 사용하고, 나머지 상태에서는 REST fallback 사용
+  - WS가 복구되더라도 바로 primary로 복귀하지 않고, private 이벤트 수신 재개 + REST reconcile 1회 성공 + 안정 구간을 통과해야 다시 `healthy`
 - `MarketCollector`
   - 현재가
   - ATR 15m / ATR 1h
@@ -148,8 +174,10 @@ gpt_trader/
   - 거래량 급증 여부
   - opportunity trigger 여부와 사유
   - risk trigger 여부와 사유
-  - 가능하면 Bybit public WebSocket으로 ticker / order book / kline을 받아 REST 호출을 줄이고, 준비되지 않은 데이터만 REST fallback
-  - OHLCV 롤링 캐시와 짧은 TTL 응답 캐시를 이용해 호출 수를 줄임
+  - public WebSocket은 `ticker + 얕은 order book` 위주로 유지하고, closed-candle 기반인 OHLCV는 기본적으로 5분 materialization 시점의 incremental REST fetch에 더 의존
+  - 즉 `1h / 4h` 진행 중 봉을 계속 스트리밍하는 것보다, 봉 마감 시점과 5분 cadence에 맞춘 저빈도 fetch를 우선한다
+  - ticker / order book / funding / open interest의 REST fallback TTL을 늘려 불필요한 재호출을 줄임
+  - 이 구조에서는 높은 WS throttle 자체보다 `bounded lag + 정합성 + 적은 호출 수`가 더 중요하다
 
 ### 2. 현재 리스크 상태 계산
 
@@ -189,7 +217,49 @@ gpt_trader/
 
 즉, 같은 `BUY`라도 지금이 `normal`인지 `drawdown`인지에 따라 허용 여부와 크기 제한이 달라질 수 있다.
 
-### Trigger 분리 원칙
+### 4. 단일 adaptive loop와 cadence 전환
+
+현재 구현에서 중요한 변경점은 `루프가 하나만 돈다`는 것이다.  
+오케스트레이터는 한 번의 사이클이 끝날 때마다 현재 상태를 보고 다음 cadence를 고른다.
+
+우선순위는 다음과 같다.
+
+- `5m`
+  - opportunity trigger가 활성화된 경우
+- `15m`
+  - 포지션이 있거나
+  - 미체결 주문이 있거나
+  - unknown order 상태가 있거나
+  - 최근 실행/청산 직후인 경우
+- `1h`
+  - 위 조건이 모두 없을 때
+
+승격은 빠르게, 강등은 천천히 한다.
+
+- `1h -> 15m`
+  - 포지션/주문/복구 필요 상태가 생기면 즉시 승격
+- `1h or 15m -> 5m`
+  - trigger가 켜지면 즉시 승격
+- `5m -> 15m or 1h`
+  - trigger가 꺼졌다고 바로 강등하지 않고 최소 유지 시간과 clear streak를 만족해야 함
+- `15m -> 1h`
+  - flat 상태가 여러 사이클 연속 확인돼야 함
+
+이 히스테리시스는 cadence가 `5m <-> 15m <-> 1h` 사이에서 경계값 근처에서 깜빡이는 현상을 줄이기 위한 것이다.
+
+또한 cadence마다 역할도 다르다.
+
+- `1h`
+  - 전략 판단 중심
+  - 신규 진입과 방향성 결정을 담당
+- `15m`
+  - 포지션/주문 관리 중심
+  - 기본적으로 신규 진입보다 `REDUCE`, `EXIT`, 주문 정리 쪽으로 제한
+- `5m`
+  - trigger 대응 중심
+  - active trigger 구간에서 더 짧은 주기로 반응
+
+### 5. Trigger 분리 원칙
 
 이 프로젝트는 트리거를 두 부류로 나눈다.
 
@@ -201,7 +271,11 @@ gpt_trader/
   - 예: `wide_spread`, `elevated_funding`
 
 중요한 점은 `trigger mode` 자체는 기본적으로 `opportunity_trigger`를 기준으로 켜진다는 것이다.  
-반면 `risk_trigger`는 AI와 리스크 엔진에 전달되어 더 보수적인 행동을 유도하고, 필요하면 신규 진입을 직접 차단한다.
+반면 `risk_trigger`는 AI와 리스크 엔진에 전달되어 더 보수적인 행동을 유도한다.  
+현재 기본 구현에서는 `risk_trigger`를 신규 진입의 하드 차단으로 쓰기보다, 승인 사유에 advisory로 남겨 판단 맥락을 강화한다.
+
+현재 구현에서는 별도의 `Trigger (5m)` 작업이 따로 스케줄되지 않는다.  
+대신 공용 스냅샷에서 `opportunity_trigger`가 감지되면 다음 cadence가 `5m`로 승격되고, trigger가 해제될 때까지 짧은 주기로 더 자주 판단한다.
 
 `fast_price_move_15m`, `volume_surge_15m`, `range_break_1h`에는 심볼별 히스테리시스를 적용한다.  
 즉, 경계값 부근에서는 직전 상태를 참고해 매 루프마다 `trigger mode`가 깜빡이는 현상을 줄인다.
@@ -222,7 +296,7 @@ gpt_trader/
 - `elevated_funding`
   - 펀딩비 절대값이 0.0005 이상일 때
 
-### 4. AI 입력 구성
+### 6. AI 입력 구성
 
 `DecisionRequest`는 아래를 포함한다.
 
@@ -257,7 +331,13 @@ gpt_trader/
 같은 계좌 상태, 장기 메모리, journal 문맥을 반복 전송하지 않기 때문에 API 비용이 줄고, 심볼 간 우선순위 비교도 한 번에 가능해진다.
 
 여섯째, RAG는 최근 audit를 심볼별로 반복 스캔하지 않는다.  
-audit 저장 시 시장 feature vector를 함께 저장하고, 조회 시에는 여러 심볼의 유사 케이스를 한 번의 DB 스캔으로 배치 계산한다.
+audit 저장 시 심볼별 feature vector를 함께 저장하고, 조회 시에는 여러 심볼의 유사 케이스를 한 번의 DB 스캔으로 배치 계산한다.
+
+일곱째, RAG feature vector는 단순 시장 13차원만 쓰지 않는다.  
+시장 13차원 + 의사결정 컨텍스트 13차원(리스크 상태, 계좌 상태, 심볼 포지션/오더 상태)으로 확장한 26차원 벡터를 사용한다.
+
+여덟째, 코사인 유사도 계산 전 차원별 정규화와 가중치를 적용한다.  
+즉 ATR 같은 절대 스케일이 큰 축이 유사도 방향을 과도하게 지배하지 않도록, scale normalization + clipping + weighting 후 코사인을 계산한다.
 
 ### 5. 주문 후보 생성 근거 입력 해시
 
@@ -272,6 +352,7 @@ audit 저장 시 시장 feature vector를 함께 저장하고, 조회 시에는 
 
 프롬프트는 compact JSON으로 직렬화되고, 완전히 같은 `prompt + model` 조합은 SQLite `decision_cache`에서 재사용된다.  
 즉, 정보량을 줄이지 않으면서도 토큰 비용과 중복 API 호출을 낮춘다.
+단, `account_state.snapshot_timestamp` 같은 고변동 필드는 캐시 안정성을 위해 canonicalization 시 제외한다.
 
 이 해시는 `decision_input_hash`로 audit에 저장된다.
 
@@ -381,6 +462,7 @@ AI 출력은 `TradeIntent`다.
 - 최대 동시 포지션 수
 - 모드별 리스크 프로파일
 - 루프 주기
+- 실행 동시성/중복 실행 가드
 
 특히 `mode_profiles`가 운영 편의성에 중요하다.  
 상황이 바뀌었을 때 코드 수정 없이 YAML 테이블만 조정하면 되기 때문이다.
@@ -423,6 +505,22 @@ intervals:
   strategy_loop_minutes: 60
   position_loop_minutes: 15
   trigger_loop_minutes: 5
+
+execution_guards:
+  loop_lock_ttl_seconds: 240
+  decision_cooldown_minutes: 10
+  entry_mutex_ttl_seconds: 180
+  unknown_order_block_minutes: 30
+  recovery_sweep_minutes: 5
+
+context_budget:
+  journal_fetch_limit: 24
+  journal_keep_limit: 6
+  memory_keep_limit: 8
+  similar_case_keep_limit: 5
+  max_rationale_items_per_journal: 2
+  max_evidence_per_rationale_item: 2
+  max_ignore_when_per_memory: 2
 ```
 
 해석 예:
@@ -435,6 +533,10 @@ intervals:
   - 변동성 이벤트 구간에서는 주문 후보 총 노출을 잔고의 35% 이내로 제한한다.
 - `cooldown.allowed_actions`
   - 쿨다운 구간에서는 신규 진입 없이 축소/청산 위주 행동만 허용할 수 있다.
+- `execution_guards`
+  - 루프 전역 락, 심볼별 entry mutex, 반복 판단 쿨다운, unknown 주문 상태 감시/복구 주기를 정책에서 조정한다.
+- `context_budget`
+  - 최근 journal/long_term_memory/similar case를 전부 보내지 않고, 관련성 높은 상위 컨텍스트만 압축해 전달한다.
 
 ## 실행 엔진 상세
 
@@ -468,6 +570,25 @@ intervals:
 
 일반 예외가 발생하면 receipt에 `failed` 상태로 남긴다.  
 즉, 실패가 로그에만 남고 데이터 상에는 사라지는 구조가 아니다.
+
+### 실행 안전 가드
+
+`run_cycle` 실행 전후에는 아래 운영 가드를 적용한다.
+
+- 전역 실행 락(`runtime_locks`)
+  - 루프 시작 시 `loop_lock` 획득 실패면 해당 루프를 스킵해 다중 인스턴스/중복 실행을 차단한다.
+- 결정 쿨다운 + fingerprint(`decision_fingerprints`)
+  - 최근 N분 내 같은 `symbol + action + size_band`가 있으면 반복 진입 주문을 차단한다.
+- Pending Exposure Reserve
+  - 미체결 진입 주문을 가상 포지션처럼 포함해 `max_open_positions`, 노출/레버리지, 주문 크기 한도를 보수적으로 계산한다.
+- Pre-trade Reconciliation
+  - 주문 직전 `positions/open_orders`를 강제 재조회한 뒤 intent를 다시 리스크 검증한다.
+- Per-symbol Entry Mutex(`entry_mutex`)
+  - 심볼별 `entry in-flight` 락이 살아 있으면 동일 심볼 신규 진입을 차단한다.
+- Order Runtime Unknown Guard
+  - `unknown_order_block_minutes` 안에 `unknown` 상태 주문이 남아 있으면 신규 진입을 막는다.
+- Recovery Sweep Job
+  - 주기적으로 unknown 주문 상태를 재조회해 `completed/cancelled/failed/partial_filled`로 복구 시도한다.
 
 ## 주문/포지션 상태 머신
 
@@ -525,6 +646,7 @@ intervals:
 
 - `account_state`
 - `market_state`
+- `market_vectors`
 - `intent`
 - `risk_approved`
 - `risk_reason`
@@ -565,8 +687,28 @@ intervals:
     "max_order_notional_pct_balance": 35,
     "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"]
   },
+  "market_state": {
+    "symbols": ["BTCUSDT"],
+    "market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}},
+    "trigger_symbols": ["BTCUSDT"],
+    "risk_trigger_symbols": [],
+    "rag_context": {
+      "risk_state": {
+        "daily_pnl_pct": -1.2,
+        "consecutive_losses": 1,
+        "cooldown_active": false
+      },
+      "account_state": {
+        "total_balance": 1000.0,
+        "available_balance": 760.0
+      }
+    }
+  },
+  "market_vectors": {
+    "BTCUSDT": [0.24, 0.18, 1.0, 1.0, "... 26d ..."]
+  },
   "execution_summary": {
-    "loop_type": "Trigger (5m)",
+    "loop_type": "Adaptive (5m)",
     "trigger_mode": true,
     "executed_order_count": 1
   }
@@ -596,6 +738,10 @@ Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있�
 
 이 배치는 signal 반복뿐 아니라 `evidence_quality.factor` 버킷과 `entry_size_cap` 조정 패턴도 같이 집계한다.  
 즉 근거 품질이 낮거나 size cap이 줄어든 상황이 실제 손실과 함께 반복되는지도 candidate lesson seed에 반영한다.
+
+추가로 `symbol_journal`도 함께 읽어 심볼 단위 evidence signal 반복 패턴을 candidate lesson에 반영한다.  
+즉 포트폴리오 단일 journal만 볼 때 생기던 심볼 간 혼선을 줄이고, 심볼별 교훈 추출을 강화한다.
+이때 symbol 기반 candidate의 `evidence_journal_ids`는 `audit_log_id`가 아니라 `symbol_journal.id`를 사용한다.
 
 ### `long_term_memory`
 
@@ -669,6 +815,20 @@ Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있�
 }
 ```
 
+### `symbol_journal`
+
+포트폴리오 단일 journal과 별도로 저장하는 심볼 단위 로그다.
+
+- `audit_log_id`, `symbol`
+- `decision`, `risk_reason`, `risk_mode`, `risk_approved`
+- `triggered`, `risk_triggered`
+- `net_realized_pnl`, `fee_cost`, `estimated_pnl_pct`
+- `evidence_signals`
+- `summary`, `payload`
+- 인덱스: `symbol+id`, `timestamp+id`, `audit_log_id`
+
+즉, 동일 사이클에서도 `BTCUSDT`와 `ETHUSDT`를 분리해 신호/성과를 분석할 수 있다.
+
 ### `replay_runs`
 
 리플레이 결과 비교 저장소다.
@@ -697,6 +857,43 @@ Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있�
   "rationale_keywords_removed": ["breakout", "momentum"]
 }
 ```
+
+### `runtime_locks`
+
+오케스트레이터 루프의 전역 락 저장소다.
+
+- `lock_name`, `owner`
+- `acquired_at_epoch`, `expires_at_epoch`
+
+락 만료 기반으로 비정상 종료 후에도 다음 루프가 회복 가능하다.
+
+### `entry_mutex`
+
+심볼별 신규 진입 실행 락 저장소다.
+
+- `symbol`, `owner`
+- `acquired_at_epoch`, `expires_at_epoch`
+
+같은 심볼에 대해 동시/중복 진입이 발생하지 않도록 보장한다.
+
+### `decision_fingerprints`
+
+반복 판단 쿨다운용 fingerprint 로그다.
+
+- `symbol`, `action`, `size_band`
+- `fingerprint`, `created_at`
+- `audit_log_id`, `status`
+
+최근 N분 기준으로 동일 판단 반복 여부를 빠르게 차단한다.
+
+### `order_runtime_state`
+
+주문별 최신 runtime 상태 스냅샷이다.
+
+- `order_key`, `client_order_id`, `exchange_order_id`, `symbol`
+- `state`, `updated_at`, `last_audit_log_id`, `payload`
+
+`order_state_transitions`와 함께 사용해 `unknown` 상태 감시 및 recovery sweep 기반 복구를 수행한다.
 
 ### `order_state_transitions`
 
@@ -803,7 +1000,7 @@ python tools/replay_audit.py --audit-id 12 --save
 이제 replay는 `rationale_items.evidence`도 비교한다.  
 즉 어떤 evidence signal이 추가되거나 사라져서 결정이 바뀌었는지까지 추적할 수 있다.
 
-대시보드는 최근 replay에 이 evidence diff를, 최근 memory에는 heuristic candidate lesson seed를 함께 보여준다.
+대시보드는 최근 replay evidence diff, 최근 memory candidate seed, 최근 symbol_journal을 함께 보여준다.
 
 audit detail 화면은 raw JSON 외에도 `rationale_items`와 evidence quality / entry size cap 요약을 카드로 보여준다.
 `rationale_items.evidence[].source`는 클릭해서 stored DecisionRequest 안의 실제 값을 바로 lookup할 수 있다.
@@ -869,6 +1066,7 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 - 최근 ledger net pnl
 - 최근 audit 목록
 - 최근 memory
+- 최근 symbol_journal
 - 최근 fills
 - 최근 ledger
 - 최근 replay 결과
@@ -997,6 +1195,18 @@ http://127.0.0.1:5000
 
 ```powershell
 python batch/memory_updater.py
+```
+
+context budget 튜닝(최근 audit 로그 기반):
+
+```powershell
+python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800
+```
+
+추천값을 정책에 반영:
+
+```powershell
+python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --write-policy
 ```
 
 ## 테스트

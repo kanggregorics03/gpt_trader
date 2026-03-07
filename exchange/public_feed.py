@@ -30,11 +30,17 @@ class BybitPublicMarketFeed:
         symbols: List[str],
         timeframes: Optional[List[str]] = None,
         orderbook_depth: int = 50,
+        stream_ticker: bool = True,
+        stream_orderbook: bool = True,
+        max_kline_rows: int = 240,
         ws_factory: Optional[Any] = None,
     ):
         self.symbols = sorted(set(symbols))
-        self.timeframes = timeframes or ["5m", "15m", "1h", "4h"]
+        self.timeframes = list(timeframes) if timeframes is not None else ["5m", "15m", "1h", "4h"]
         self.orderbook_depth = orderbook_depth
+        self.stream_ticker = bool(stream_ticker)
+        self.stream_orderbook = bool(stream_orderbook)
+        self.max_kline_rows = max(20, int(max_kline_rows or 240))
         self.ws_factory = ws_factory or BybitWebSocket
         self._lock = threading.RLock()
         self._started = False
@@ -57,12 +63,14 @@ class BybitPublicMarketFeed:
         try:
             self._ws = self.ws_factory(testnet=False, channel_type="linear")
             for symbol in self.symbols:
-                self._ws.ticker_stream(symbol=symbol, callback=self._handle_ticker_message)
-                self._ws.orderbook_stream(
-                    depth=self.orderbook_depth,
-                    symbol=symbol,
-                    callback=self._handle_orderbook_message,
-                )
+                if self.stream_ticker:
+                    self._ws.ticker_stream(symbol=symbol, callback=self._handle_ticker_message)
+                if self.stream_orderbook:
+                    self._ws.orderbook_stream(
+                        depth=self.orderbook_depth,
+                        symbol=symbol,
+                        callback=self._handle_orderbook_message,
+                    )
                 for timeframe in self.timeframes:
                     interval = TIMEFRAME_TO_INTERVAL.get(timeframe)
                     if interval is None:
@@ -75,7 +83,8 @@ class BybitPublicMarketFeed:
             self._started = True
             logger.info(
                 f"Bybit public WebSocket feed started for {len(self.symbols)} symbols and "
-                f"{len(self.timeframes)} timeframes."
+                f"{len(self.timeframes)} timeframes (ticker={self.stream_ticker}, "
+                f"orderbook={self.stream_orderbook}, depth={self.orderbook_depth})."
             )
             return True
         except Exception as exc:
@@ -191,7 +200,7 @@ class BybitPublicMarketFeed:
                     self._safe_float(item.get("close"), 0.0),
                     self._safe_float(item.get("volume"), 0.0),
                 ]
-            self._trim_kline_cache(cache, max_items=240)
+            self._trim_kline_cache(cache, max_items=self.max_kline_rows)
 
     def _apply_orderbook_side(self, side_state: Dict[float, float], deltas: List[List[Any]]):
         for level in deltas:

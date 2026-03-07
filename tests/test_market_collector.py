@@ -249,6 +249,46 @@ class TestMarketCollector(unittest.TestCase):
         self.assertEqual(len(second_round), 4)
         self.assertTrue(all(limit <= 3 for _, limit in second_round))
 
+    def test_market_snapshot_supports_lightweight_timeframe_probe(self):
+        class RecordingExchange(MinimalExchange):
+            def __init__(self):
+                self.calls = []
+
+            def fetch_ohlcv(self, symbol, timeframe="15m", limit=80):
+                self.calls.append((timeframe, limit))
+                return super().fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+        exchange = RecordingExchange()
+        collector = MarketCollector(exchange)
+
+        snapshot = collector.get_market_snapshot(
+            "BTCUSDT",
+            timeframes_to_fetch={"15m": 80, "1h": 80},
+        )
+
+        self.assertEqual(set(snapshot.timeframes.keys()), {"15m", "1h"})
+        self.assertEqual({timeframe for timeframe, _ in exchange.calls}, {"15m", "1h"})
+
+    def test_market_snapshot_reuses_existing_higher_timeframes_when_refreshing_subset(self):
+        collector = MarketCollector(RichExchange())
+
+        baseline = collector.get_market_snapshot("BTCUSDT")
+        refreshed = collector.get_market_snapshot(
+            "BTCUSDT",
+            timeframes_to_fetch={"5m": 80},
+            existing_snapshot=baseline,
+        )
+
+        self.assertEqual(set(refreshed.timeframes.keys()), {"5m", "15m", "1h", "4h"})
+        self.assertEqual(
+            refreshed.timeframes["15m"].closed_at,
+            baseline.timeframes["15m"].closed_at,
+        )
+        self.assertEqual(
+            refreshed.timeframes["1h"].closed_at,
+            baseline.timeframes["1h"].closed_at,
+        )
+
     def test_short_ttl_response_cache_reuses_ticker_and_microstructure_fetches(self):
         class RecordingExchange(RichExchange):
             def __init__(self):
