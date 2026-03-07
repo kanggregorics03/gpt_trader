@@ -32,6 +32,7 @@ class TestRiskEngine(unittest.TestCase):
                         "max_open_positions": 1,
                         "max_order_notional_pct_balance": 30,
                         "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                        "block_additional_entries_when_position_exists": True,
                     },
                     "cooldown": {
                         "max_open_positions": 2,
@@ -608,6 +609,75 @@ class TestRiskEngine(unittest.TestCase):
 
         self.assertFalse(approved)
         self.assertIn("candidate size", reason.lower())
+
+    def test_trigger_mode_blocks_additional_entry_when_live_position_exists(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.002)],
+            rationale=["Trigger follow-through"],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=900,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.01,
+                    entry_price=30000,
+                    unrealized_pnl_pct=0,
+                )
+            ],
+            open_orders_count=0,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            is_trigger_mode=True,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("trigger mode blocks additional entry", reason.lower())
+
+    def test_trigger_mode_can_allow_additional_entry_when_policy_flag_disabled(self):
+        self.engine.policy["risk_limits"]["mode_profiles"]["trigger"][
+            "block_additional_entries_when_position_exists"
+        ] = False
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.002)],
+            rationale=["Trigger follow-through"],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=900,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.01,
+                    entry_price=30000,
+                    unrealized_pnl_pct=0,
+                )
+            ],
+            open_orders_count=0,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            is_trigger_mode=True,
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(reason, "Approved")
 
 if __name__ == '__main__':
     unittest.main()

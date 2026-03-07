@@ -134,6 +134,59 @@ class RangeBreakHysteresisExchange:
         return {"last": 100.2, "high": 101.0, "low": 99.0, "percentage": 0.2}
 
 
+class DynamicMetricsPublicFeed:
+    def __init__(self):
+        self.tick = 0
+        self.current_tick = 0
+
+    def get_ticker(self, symbol):
+        self.tick += 1
+        self.current_tick = self.tick
+        last = 205.0 + self.tick
+        premium = 0.3 + (self.tick * 0.05)
+        return {
+            "symbol": symbol,
+            "last": last,
+            "close": last,
+            "high": last + 7.0,
+            "low": last - 45.0,
+            "percentage": 4.0 + (self.tick * 0.1),
+            "baseVolume": 15000.0 + (self.tick * 10),
+            "quoteVolume": 3000000.0 + (self.tick * 25000),
+            "markPrice": last + premium,
+            "indexPrice": last,
+            "fundingRate": 0.0001 + (self.tick * 0.00002),
+            "openInterest": 100000.0 + (self.tick * 1000.0),
+            "openInterestValue": 20000000.0 + (self.tick * 250000.0),
+        }
+
+    def get_order_book(self, symbol, limit=10):
+        spread_half = 0.04 + (self.current_tick * 0.01)
+        best_bid = 205.0 - spread_half
+        best_ask = 205.0 + spread_half
+        bid_size = 12.0 + self.current_tick
+        ask_size = 8.0 + (self.current_tick * 0.5)
+        return {
+            "bids": [
+                [best_bid, bid_size],
+                [best_bid - 0.1, bid_size + 1],
+                [best_bid - 0.2, bid_size + 1],
+                [best_bid - 0.3, bid_size + 2],
+                [best_bid - 0.4, bid_size + 2],
+            ],
+            "asks": [
+                [best_ask, ask_size],
+                [best_ask + 0.1, ask_size + 1],
+                [best_ask + 0.2, ask_size + 1],
+                [best_ask + 0.3, ask_size + 1],
+                [best_ask + 0.4, ask_size + 2],
+            ],
+        }
+
+    def get_ohlcv_rows(self, symbol, timeframe, limit=80):
+        return None
+
+
 class TestMarketCollector(unittest.TestCase):
     def test_market_snapshot_contains_rich_multi_timeframe_context(self):
         collector = MarketCollector(RichExchange())
@@ -146,12 +199,15 @@ class TestMarketCollector(unittest.TestCase):
         self.assertGreater(snapshot.atr_1h, 0.0)
         self.assertEqual(snapshot.trend_1h, "UP")
         self.assertTrue(snapshot.recent_volume_surge)
+        self.assertGreater(snapshot.volume_ratio_15m, 1.8)
+        self.assertTrue(snapshot.volume_surge_15m_now)
         self.assertTrue(snapshot.is_trigger_event)
         self.assertTrue(snapshot.is_opportunity_trigger)
         self.assertTrue(snapshot.is_risk_trigger)
         self.assertIn("volume_surge_15m", snapshot.opportunity_trigger_reasons)
         self.assertIn("wide_spread", snapshot.risk_trigger_reasons)
         self.assertIn("elevated_funding", snapshot.risk_trigger_reasons)
+        self.assertTrue(snapshot.volume_surge_trigger_active)
         self.assertGreater(snapshot.timeframes["15m"].rsi_14, 50.0)
         self.assertIn("last_close", snapshot.timeframes["15m"].previous_values)
         self.assertIn("rsi_14", snapshot.timeframes["15m"].previous_values)
@@ -173,6 +229,7 @@ class TestMarketCollector(unittest.TestCase):
         self.assertEqual(snapshot.symbol, "ETHUSDT")
         self.assertEqual(snapshot.order_book.bid_depth_top5, 0.0)
         self.assertIsNone(snapshot.derivatives.mark_price)
+        self.assertIsNone(snapshot.oi_change_15m)
         self.assertIn("15m", snapshot.timeframes)
         self.assertEqual(snapshot.risk_trigger_reasons, [])
 
@@ -385,6 +442,33 @@ class TestMarketCollector(unittest.TestCase):
         self.assertEqual(exchange.order_book_calls, 0)
         self.assertEqual(exchange.funding_calls, 0)
         self.assertEqual(exchange.open_interest_calls, 0)
+
+    def test_market_snapshot_adds_derived_execution_and_structure_fields(self):
+        collector = MarketCollector(RichExchange(), public_feed=DynamicMetricsPublicFeed())
+
+        snapshot = None
+        for _ in range(13):
+            snapshot = collector.get_market_snapshot("BTCUSDT")
+
+        self.assertIsNotNone(snapshot)
+        self.assertIsNotNone(snapshot.oi_change_15m)
+        self.assertIsNotNone(snapshot.oi_change_1h)
+        self.assertGreater(snapshot.oi_change_15m, 0.0)
+        self.assertGreater(snapshot.oi_change_1h, 0.0)
+        self.assertIsNotNone(snapshot.funding_rate_change_1h)
+        self.assertGreater(snapshot.funding_rate_change_1h, 0.0)
+        self.assertIsNotNone(snapshot.basis_change_1h)
+        self.assertGreater(snapshot.basis_change_1h, 0.0)
+        self.assertIsNotNone(snapshot.spread_vs_1h_avg)
+        self.assertGreater(snapshot.spread_vs_1h_avg, 0.0)
+        self.assertIsNotNone(snapshot.spread_percentile_1h)
+        self.assertGreaterEqual(snapshot.spread_percentile_1h, 75.0)
+        self.assertIsNotNone(snapshot.depth_percentile_1h)
+        self.assertGreaterEqual(snapshot.depth_percentile_1h, 75.0)
+        self.assertIsNotNone(snapshot.distance_to_15m_breakout_level)
+        self.assertIsNotNone(snapshot.distance_to_1h_breakout_level)
+        self.assertIsNotNone(snapshot.distance_to_invalid_level)
+        self.assertGreater(snapshot.distance_to_invalid_level, 0.0)
 
 
 if __name__ == "__main__":

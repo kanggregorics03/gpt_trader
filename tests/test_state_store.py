@@ -1,3 +1,5 @@
+import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -9,13 +11,21 @@ from db.state_store import StateStore
 
 class TestStateStore(unittest.TestCase):
     def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.db_path = str(Path(self.tmpdir.name) / "state.db")
+        base_tmp = Path("c:/gpt_trader/.tmp_tests")
+        base_tmp.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(dir=base_tmp, suffix=".db")
+        os.close(fd)
+        self.tmpdir = base_tmp
+        self.db_path = raw_path
         self.store = StateStore(self.db_path)
 
     def tearDown(self):
         self.store.close()
-        self.tmpdir.cleanup()
+        try:
+            Path(self.db_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_monitoring_snapshot_counts_rejections_timeouts_and_memory(self):
         self.store.save_audit(
@@ -176,6 +186,9 @@ class TestStateStore(unittest.TestCase):
             risk_reason="Approved",
             estimated_pnl_pct=-1.5,
             loss_signal=True,
+            trade_case_ids=["BTCUSDT-case-1"],
+            case_statuses={"BTCUSDT": "closed"},
+            case_summary="BTCUSDT:closed",
         )
 
         rows = self.store.get_journal_entries_since(
@@ -190,6 +203,53 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["risk_mode"], "drawdown")
         self.assertEqual(rows[0]["ledger_net_realized_pnl"], -16.0)
         self.assertEqual(rows[0]["execution_summary"]["ai_usage"]["total_token_count"], 321)
+        self.assertEqual(rows[0]["trade_case_ids"], ["BTCUSDT-case-1"])
+        self.assertEqual(rows[0]["case_statuses"]["BTCUSDT"], "closed")
+        self.assertEqual(rows[0]["case_summary"], "BTCUSDT:closed")
+
+    def test_retrieval_evaluations_round_trip(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "BUY"},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            risk_mode="trigger",
+        )
+        self.store.save_retrieval_evaluations(
+            audit_id,
+            [
+                {
+                    "context_type": "similar_past_cases",
+                    "rank_index": 1,
+                    "trade_case_id": "BTCUSDT-case-9",
+                    "case_symbol": "BTCUSDT",
+                    "matched_symbol": "BTCUSDT",
+                    "decision": "BUY",
+                    "decision_symbol_aligned": True,
+                    "estimated_pnl_pct": 0.7,
+                    "similarity": 0.93,
+                    "final_score": 1.42,
+                    "retrieval_source": "band_index",
+                    "matched_band_count": 4,
+                    "risk_mode": "trigger",
+                    "payload": {"thesis_failure_reason": "execution_quality_degraded:wide_spread"},
+                }
+            ],
+        )
+
+        rows = self.store.get_retrieval_evaluations_since(
+            datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["audit_log_id"], audit_id)
+        self.assertEqual(rows[0]["trade_case_id"], "BTCUSDT-case-9")
+        self.assertEqual(rows[0]["retrieval_source"], "band_index")
+        self.assertEqual(rows[0]["matched_band_count"], 4)
+        self.assertTrue(rows[0]["decision_symbol_aligned"])
+        self.assertEqual(rows[0]["payload"]["thesis_failure_reason"], "execution_quality_degraded:wide_spread")
 
     def test_monitoring_snapshot_includes_recent_symbol_journal(self):
         audit_id = self.store.save_audit(
@@ -298,6 +358,9 @@ class TestStateStore(unittest.TestCase):
             ],
             confidence=0.7,
             risk_reason="Approved",
+            trade_case_ids=["BTCUSDT-case-2"],
+            case_statuses={"BTCUSDT": "opened"},
+            case_summary="BTCUSDT:opened",
         )
 
         recent = self.store.get_recent_journals(limit=1)
@@ -310,6 +373,7 @@ class TestStateStore(unittest.TestCase):
         self.assertIn("cap=30.0->21.0", recent[0])
         self.assertIn("trigger=BTCUSDT", recent[0])
         self.assertIn("risk_trigger=BTCUSDT", recent[0])
+        self.assertIn("cases=BTCUSDT:opened", recent[0])
 
         context = self.store.get_recent_journal_context(limit=1)
 
@@ -319,6 +383,8 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(context[0]["risk_trigger_symbols"], ["BTCUSDT"])
         self.assertEqual(context[0]["evidence_quality"]["factor"], 0.7)
         self.assertEqual(context[0]["entry_size_cap"]["effective_cap_pct"], 21.0)
+        self.assertEqual(context[0]["trade_case_ids"], ["BTCUSDT-case-2"])
+        self.assertEqual(context[0]["case_statuses"]["BTCUSDT"], "opened")
 
     def test_get_audit_log_and_replay_candidates_decode_json_payloads(self):
         audit_id = self.store.save_audit(
@@ -636,6 +702,10 @@ class TestStateStore(unittest.TestCase):
                     "net_realized_pnl": -2.5,
                     "fee_cost": 0.8,
                     "estimated_pnl_pct": -0.25,
+                    "trade_case_id": "BTCUSDT-case-3",
+                    "case_status": "opened",
+                    "case_opened_at": "2026-03-07 12:00:00",
+                    "holding_minutes": 5.5,
                     "evidence_signals": ["volume_ratio@15m", "spread_bps@microstructure"],
                     "summary": "Momentum setup with caution.",
                     "payload": {"order_actions": ["BUY:MARKET:0.01"]},
@@ -654,12 +724,124 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["risk_triggered"], 1)
         self.assertEqual(rows[0]["evidence_signals"], ["volume_ratio@15m", "spread_bps@microstructure"])
         self.assertEqual(rows[0]["payload"]["order_actions"], ["BUY:MARKET:0.01"])
+        self.assertEqual(rows[0]["trade_case_id"], "BTCUSDT-case-3")
+        self.assertEqual(rows[0]["case_status"], "opened")
+        self.assertEqual(rows[0]["case_opened_at"], "2026-03-07 12:00:00")
+        self.assertAlmostEqual(rows[0]["holding_minutes"], 5.5)
         self.assertEqual(len(filtered), 1)
 
         since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
         since_rows = self.store.get_symbol_journal_entries_since(since)
         self.assertEqual(len(since_rows), 1)
         self.assertEqual(since_rows[0]["symbol"], "BTCUSDT")
+
+    def test_active_trade_case_round_trip_and_close(self):
+        self.store.upsert_active_trade_case(
+            symbol="BTCUSDT",
+            trade_case_id="BTCUSDT-case-4",
+            opened_at="2026-03-07 13:00:00",
+            entry_decision="BUY",
+            last_decision="BUY",
+            last_audit_log_id=10,
+            payload={"opened_via": "intent_buy"},
+        )
+
+        active = self.store.get_active_trade_case("BTCUSDT")
+        closed = self.store.close_active_trade_case(
+            symbol="BTCUSDT",
+            closed_at="2026-03-07 13:45:00",
+            last_decision="EXIT",
+            last_audit_log_id=11,
+        )
+        missing = self.store.get_active_trade_case("BTCUSDT")
+
+        self.assertEqual(active["trade_case_id"], "BTCUSDT-case-4")
+        self.assertEqual(active["entry_decision"], "BUY")
+        self.assertEqual(active["payload"]["opened_via"], "intent_buy")
+        self.assertEqual(closed["trade_case_id"], "BTCUSDT-case-4")
+        self.assertEqual(closed["opened_at"], "2026-03-07 13:00:00")
+        self.assertEqual(missing, {})
+
+    def test_trade_case_round_trip_and_query(self):
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-5",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "risk_mode": "trigger",
+                "opened_at": "2026-03-07 13:00:00",
+                "closed_at": "2026-03-07 13:20:00",
+                "entry_audit_log_id": 15,
+                "exit_audit_log_id": 16,
+                "entry_decision": "BUY",
+                "exit_decision": "EXIT",
+                "entry_side": "LONG",
+                "entry_price": 30000.0,
+                "exit_price": 30120.0,
+                "estimated_pnl_pct": 0.4,
+                "realized_pnl": 12.5,
+                "fee_cost": 1.1,
+                "holding_minutes": 20.0,
+                "observed_mfe_pct": 1.3,
+                "observed_mae_pct": -0.6,
+                "slippage_cost": 0.9,
+                "slippage_bps": 3.0,
+                "thesis_failure_reason": None,
+                "evidence_signals": ["volume_ratio@15m"],
+                "trigger_reasons": ["range_break_1h"],
+                "risk_trigger_reasons": [],
+                "feature_vector": [30000.0, 120.0, 240.0],
+                "payload": {"regime_tags": ["trend:aligned_up"]},
+            }
+        )
+
+        self.store.save_trade_case_snapshots(
+            [
+                {
+                    "trade_case_id": "BTCUSDT-case-5",
+                    "timestamp": "2026-03-07 13:05:00",
+                    "audit_log_id": 15,
+                    "symbol": "BTCUSDT",
+                    "current_price": 30050.0,
+                    "mark_price": 30052.0,
+                    "mid_price": 30051.0,
+                    "spread_bps": 1.2,
+                    "volume_ratio_15m": 2.0,
+                    "unrealized_pnl_pct": 0.8,
+                    "payload": {"case_status": "active"},
+                }
+            ]
+        )
+
+        row = self.store.get_trade_case("BTCUSDT-case-5")
+        recent = self.store.get_recent_trade_cases(limit=5)
+        since = self.store.get_trade_cases_since(datetime(2026, 3, 7, 12, 0, 0))
+        snapshots = self.store.get_trade_case_snapshots("BTCUSDT-case-5")
+        bounded_snapshots = self.store.get_trade_case_snapshots_between(
+            "BTCUSDT-case-5",
+            start_timestamp="2026-03-07 13:00:00",
+            end_timestamp="2026-03-07 13:10:00",
+        )
+        vector_candidates = self.store.get_trade_case_vector_candidates(limit=5, symbols=["BTCUSDT"])
+        band_candidates = self.store.get_trade_case_vector_band_candidates(
+            current_feature_vectors={"BTCUSDT": [30000.0, 120.0, 240.0]},
+            limit=5,
+        )
+
+        self.assertEqual(row["symbol"], "BTCUSDT")
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["evidence_signals"], ["volume_ratio@15m"])
+        self.assertEqual(row["feature_vector"], [30000.0, 120.0, 240.0])
+        self.assertEqual(row["payload"]["regime_tags"], ["trend:aligned_up"])
+        self.assertEqual(recent[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertEqual(since[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(len(bounded_snapshots), 1)
+        self.assertEqual(snapshots[0]["payload"]["case_status"], "active")
+        self.assertEqual(vector_candidates[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertEqual(vector_candidates[0]["feature_vector"], [30000.0, 120.0, 240.0])
+        self.assertEqual(band_candidates[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertGreaterEqual(band_candidates[0]["matched_band_count"], 1)
 
     def test_symbol_journal_indexes_exist(self):
         rows = self.store.conn.execute("PRAGMA index_list('symbol_journal')").fetchall()

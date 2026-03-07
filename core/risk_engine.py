@@ -37,6 +37,7 @@ class RiskEngine:
                 "max_open_positions": max(1, min(base_max_positions, 1)),
                 "max_order_notional_pct_balance": 35.0,
                 "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "block_additional_entries_when_position_exists": True,
             },
             "cooldown": {
                 "max_open_positions": base_max_positions,
@@ -198,6 +199,18 @@ class RiskEngine:
             return False, f"Risk profile {active_mode} blocks action {intent.decision}."
 
         if is_entry_decision:
+            block_additional_entries = bool(
+                active_profile.get("block_additional_entries_when_position_exists", False)
+            )
+            has_live_positions = any(
+                abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
+                for position in account_state.positions
+            )
+            if active_mode == "trigger" and block_additional_entries and has_live_positions:
+                return False, (
+                    "Trigger mode blocks additional entry while a live position already exists. "
+                    "Manage the position with HOLD/REDUCE/EXIT instead."
+                )
             if int(unresolved_timeout_count or 0) > 0:
                 return False, (
                     f"Entry blocked: {int(unresolved_timeout_count)} unresolved order lifecycle state(s) remain unknown."

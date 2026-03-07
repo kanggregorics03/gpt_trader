@@ -21,6 +21,9 @@ class MarketCollector:
         "funding_rate": 300_000,
         "open_interest": 30_000,
     }
+    ONE_HOUR_OBSERVATION_COUNT = 12
+    FIFTEEN_MIN_OBSERVATION_COUNT = 3
+    ROLLING_HISTORY_LIMIT = 48
 
     def __init__(
         self,
@@ -40,6 +43,7 @@ class MarketCollector:
         self._response_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._previous_order_books: Dict[str, OrderBookSnapshot] = {}
         self._previous_derivatives: Dict[str, DerivativesSnapshot] = {}
+        self._metric_history: Dict[str, Dict[str, list[float]]] = {}
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         if len(df) < period + 1:
@@ -95,6 +99,192 @@ class MarketCollector:
         if reference_value == 0:
             return 0.0
         return ((current_value - reference_value) / reference_value) * 100
+
+    def _safe_delta(self, current: Any, reference: Any) -> Optional[float]:
+        current_value = self._safe_float(current, default=None)
+        reference_value = self._safe_float(reference, default=None)
+        if current_value is None or reference_value is None:
+            return None
+        return current_value - reference_value
+
+    def _safe_relative_change_pct(self, current: Any, reference: Any) -> Optional[float]:
+        current_value = self._safe_float(current, default=None)
+        reference_value = self._safe_float(reference, default=None)
+        if current_value is None or reference_value in (None, 0):
+            return None
+        return ((current_value - reference_value) / abs(reference_value)) * 100
+
+    def _metric_values(self, symbol: str, key: str) -> list[float]:
+        return self._metric_history.setdefault(symbol, {}).setdefault(key, [])
+
+    def _append_metric_value(self, symbol: str, key: str, value: Optional[float]):
+        if value is None:
+            return
+        values = self._metric_values(symbol, key)
+        values.append(float(value))
+        if len(values) > self.ROLLING_HISTORY_LIMIT:
+            del values[:-self.ROLLING_HISTORY_LIMIT]
+
+    def _history_reference(self, symbol: str, key: str, steps_back: int) -> Optional[float]:
+        values = self._metric_history.get(symbol, {}).get(key, [])
+        if len(values) < steps_back:
+            return None
+        return values[-steps_back]
+
+    def _history_average(self, symbol: str, key: str, window: int) -> Optional[float]:
+        values = self._metric_history.get(symbol, {}).get(key, [])
+        if not values:
+            return None
+        window_values = values[-window:]
+        if not window_values:
+            return None
+        return sum(window_values) / len(window_values)
+
+    def _history_percentile(self, symbol: str, key: str, current_value: Optional[float], window: int) -> Optional[float]:
+        if current_value is None:
+            return None
+        values = self._metric_history.get(symbol, {}).get(key, [])
+        window_values = values[-window:]
+        if len(window_values) < 3:
+            return None
+        ordered = sorted(window_values + [float(current_value)])
+        rank = sum(1 for value in ordered if value <= float(current_value))
+        return (rank / len(ordered)) * 100
+
+    def _distance_to_level_pct(self, current_price: float, reference_price: Optional[float]) -> Optional[float]:
+        if reference_price in (None, 0) or current_price <= 0:
+            return None
+        return abs(self._pct_change(current_price, reference_price))
+
+    def _distance_to_breakout_level_pct(
+        self,
+        current_price: float,
+        tf_snapshot: Optional[TimeframeSnapshot],
+    ) -> Optional[float]:
+        if not tf_snapshot or current_price <= 0:
+            return None
+        if tf_snapshot.breakout_up:
+            return self._distance_to_level_pct(current_price, tf_snapshot.range_20_high)
+        if tf_snapshot.breakout_down:
+            return self._distance_to_level_pct(current_price, tf_snapshot.range_20_low)
+        high_gap = self._distance_to_level_pct(current_price, tf_snapshot.range_20_high)
+        low_gap = self._distance_to_level_pct(current_price, tf_snapshot.range_20_low)
+        valid = [gap for gap in (high_gap, low_gap) if gap is not None]
+        if not valid:
+            return None
+        return min(valid)
+
+    def _distance_to_invalid_level_atr(
+        self,
+        current_price: float,
+        tf_15m: Optional[TimeframeSnapshot],
+        tf_1h: Optional[TimeframeSnapshot],
+    ) -> Optional[float]:
+        if current_price <= 0:
+            return None
+
+        reference_price = None
+        reference_atr = None
+        if tf_1h and tf_1h.atr > 0:
+            if tf_1h.breakout_up:
+                reference_price = tf_1h.range_20_high
+                reference_atr = tf_1h.atr
+            elif tf_1h.breakout_down:
+                reference_price = tf_1h.range_20_low
+                reference_atr = tf_1h.atr
+            elif tf_1h.trend == "UP":
+                reference_price = tf_1h.range_20_low
+                reference_atr = tf_1h.atr
+            elif tf_1h.trend == "DOWN":
+                reference_price = tf_1h.range_20_high
+                reference_atr = tf_1h.atr
+
+        if reference_price is None and tf_15m and tf_15m.atr > 0:
+            if tf_15m.breakout_up:
+                reference_price = tf_15m.range_20_high
+                reference_atr = tf_15m.atr
+            elif tf_15m.breakout_down:
+                reference_price = tf_15m.range_20_low
+                reference_atr = tf_15m.atr
+
+        if reference_price in (None, 0) or reference_atr in (None, 0):
+            return None
+        return abs(current_price - reference_price) / reference_atr
+
+    def _build_top_level_derived_metrics(
+        self,
+        *,
+        symbol: str,
+        current_price: float,
+        timeframes: Dict[str, TimeframeSnapshot],
+        order_book: OrderBookSnapshot,
+        derivatives: DerivativesSnapshot,
+        regime: MarketRegimeSnapshot,
+    ) -> Dict[str, Any]:
+        tf_15m = timeframes.get("15m")
+        tf_1h = timeframes.get("1h")
+
+        spread_current = self._safe_float(order_book.spread_bps, default=None)
+        depth_current = None
+        if order_book.bid_notional_top5 or order_book.ask_notional_top5:
+            depth_current = float(order_book.bid_notional_top5 + order_book.ask_notional_top5)
+
+        spread_avg_1h = self._history_average(symbol, "spread_bps", self.ONE_HOUR_OBSERVATION_COUNT)
+        spread_vs_1h_avg = None
+        if spread_current is not None and spread_avg_1h not in (None, 0):
+            spread_vs_1h_avg = self._pct_change(spread_current, spread_avg_1h)
+
+        oi_change_15m = self._safe_relative_change_pct(
+            derivatives.open_interest,
+            self._history_reference(symbol, "open_interest", self.FIFTEEN_MIN_OBSERVATION_COUNT),
+        )
+        oi_change_1h = self._safe_relative_change_pct(
+            derivatives.open_interest,
+            self._history_reference(symbol, "open_interest", self.ONE_HOUR_OBSERVATION_COUNT),
+        )
+        funding_rate_change_1h = self._safe_delta(
+            derivatives.funding_rate,
+            self._history_reference(symbol, "funding_rate", self.ONE_HOUR_OBSERVATION_COUNT),
+        )
+        basis_change_1h = self._safe_delta(
+            derivatives.basis_pct,
+            self._history_reference(symbol, "basis_pct", self.ONE_HOUR_OBSERVATION_COUNT),
+        )
+
+        metrics = {
+            "volume_ratio_15m": tf_15m.volume_ratio if tf_15m else None,
+            "volume_surge_15m_now": bool(tf_15m.volume_surge) if tf_15m else False,
+            "fast_move_trigger_active": bool(regime.fast_move_trigger_active),
+            "volume_surge_trigger_active": bool(regime.volume_surge_trigger_active),
+            "range_break_trigger_active": bool(regime.range_break_trigger_active),
+            "oi_change_15m": oi_change_15m,
+            "oi_change_1h": oi_change_1h,
+            "funding_rate_change_1h": funding_rate_change_1h,
+            "basis_change_1h": basis_change_1h,
+            "spread_vs_1h_avg": spread_vs_1h_avg,
+            "spread_percentile_1h": self._history_percentile(
+                symbol,
+                "spread_bps",
+                spread_current,
+                self.ONE_HOUR_OBSERVATION_COUNT,
+            ),
+            "depth_percentile_1h": self._history_percentile(
+                symbol,
+                "depth_notional_top5",
+                depth_current,
+                self.ONE_HOUR_OBSERVATION_COUNT,
+            ),
+            "distance_to_15m_breakout_level": self._distance_to_breakout_level_pct(current_price, tf_15m),
+            "distance_to_1h_breakout_level": self._distance_to_breakout_level_pct(current_price, tf_1h),
+            "distance_to_invalid_level": self._distance_to_invalid_level_atr(current_price, tf_15m, tf_1h),
+        }
+
+        self._append_metric_value(symbol, "spread_bps", spread_current)
+        self._append_metric_value(symbol, "depth_notional_top5", depth_current)
+        self._append_metric_value(symbol, "funding_rate", self._safe_float(derivatives.funding_rate, default=None))
+        self._append_metric_value(symbol, "basis_pct", self._safe_float(derivatives.basis_pct, default=None))
+        self._append_metric_value(symbol, "open_interest", self._safe_float(derivatives.open_interest, default=None))
+        return metrics
 
     def _apply_hysteresis(
         self,
@@ -444,20 +634,32 @@ class MarketCollector:
             index_price=index_price,
             basis_pct=basis_pct,
             funding_rate=self._safe_float(
-                funding.get("fundingRate") or funding.get("funding_rate"),
+                ticker.get("fundingRate")
+                or ticker.get("funding_rate")
+                or funding.get("fundingRate")
+                or funding.get("funding_rate"),
                 default=None,
             ),
             next_funding_rate=self._safe_float(
-                funding.get("nextFundingRate") or funding.get("nextFundingRateRate"),
+                ticker.get("nextFundingRate")
+                or ticker.get("nextFundingRateRate")
+                or funding.get("nextFundingRate")
+                or funding.get("nextFundingRateRate"),
                 default=None,
             ),
             open_interest=self._safe_float(
+                ticker.get("openInterest")
+                or ticker.get("open_interest")
+                or
                 open_interest.get("openInterestAmount")
                 or open_interest.get("openInterest")
                 or open_interest.get("amount"),
                 default=None,
             ),
             open_interest_value=self._safe_float(
+                ticker.get("openInterestValue")
+                or ticker.get("open_interest_value")
+                or
                 open_interest.get("openInterestValue")
                 or open_interest.get("value"),
                 default=None,
@@ -553,6 +755,9 @@ class MarketCollector:
             volatility_regime=volatility_regime,
             momentum_regime=momentum_regime,
             liquidity_regime=liquidity_regime,
+            fast_move_trigger_active=fast_move_active,
+            volume_surge_trigger_active=volume_surge_active,
+            range_break_trigger_active=range_break_active,
             opportunity_trigger_reasons=opportunity_trigger_reasons,
             risk_trigger_reasons=risk_trigger_reasons,
         )
@@ -647,6 +852,14 @@ class MarketCollector:
 
             tf_15m = timeframe_snapshots.get("15m", TimeframeSnapshot(timeframe="15m"))
             tf_1h = timeframe_snapshots.get("1h", TimeframeSnapshot(timeframe="1h"))
+            derived_metrics = self._build_top_level_derived_metrics(
+                symbol=symbol,
+                current_price=current_price,
+                timeframes=timeframe_snapshots,
+                order_book=order_book,
+                derivatives=derivatives,
+                regime=regime,
+            )
             return MarketSnapshot(
                 symbol=symbol,
                 current_price=current_price,
@@ -656,6 +869,21 @@ class MarketCollector:
                 atr_1h=tf_1h.atr,
                 trend_1h=tf_1h.trend,
                 recent_volume_surge=tf_15m.volume_surge,
+                volume_ratio_15m=derived_metrics["volume_ratio_15m"],
+                volume_surge_15m_now=derived_metrics["volume_surge_15m_now"],
+                fast_move_trigger_active=derived_metrics["fast_move_trigger_active"],
+                volume_surge_trigger_active=derived_metrics["volume_surge_trigger_active"],
+                range_break_trigger_active=derived_metrics["range_break_trigger_active"],
+                oi_change_15m=derived_metrics["oi_change_15m"],
+                oi_change_1h=derived_metrics["oi_change_1h"],
+                funding_rate_change_1h=derived_metrics["funding_rate_change_1h"],
+                basis_change_1h=derived_metrics["basis_change_1h"],
+                spread_vs_1h_avg=derived_metrics["spread_vs_1h_avg"],
+                spread_percentile_1h=derived_metrics["spread_percentile_1h"],
+                depth_percentile_1h=derived_metrics["depth_percentile_1h"],
+                distance_to_15m_breakout_level=derived_metrics["distance_to_15m_breakout_level"],
+                distance_to_1h_breakout_level=derived_metrics["distance_to_1h_breakout_level"],
+                distance_to_invalid_level=derived_metrics["distance_to_invalid_level"],
                 is_trigger_event=is_opportunity_trigger,
                 price_change_24h_pct=price_change_24h_pct,
                 high_24h=high_24h,

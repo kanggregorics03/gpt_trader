@@ -65,6 +65,9 @@ class MarketRegimeSnapshot(BaseModel):
     volatility_regime: str = "normal"
     momentum_regime: str = "mixed"
     liquidity_regime: str = "balanced"
+    fast_move_trigger_active: bool = False
+    volume_surge_trigger_active: bool = False
+    range_break_trigger_active: bool = False
     opportunity_trigger_reasons: List[str] = Field(default_factory=list)
     risk_trigger_reasons: List[str] = Field(default_factory=list)
 
@@ -78,6 +81,21 @@ class MarketSnapshot(BaseModel):
     atr_1h: float
     trend_1h: str
     recent_volume_surge: bool
+    volume_ratio_15m: Optional[float] = None
+    volume_surge_15m_now: bool = False
+    fast_move_trigger_active: bool = False
+    volume_surge_trigger_active: bool = False
+    range_break_trigger_active: bool = False
+    oi_change_15m: Optional[float] = None
+    oi_change_1h: Optional[float] = None
+    funding_rate_change_1h: Optional[float] = None
+    basis_change_1h: Optional[float] = None
+    spread_vs_1h_avg: Optional[float] = None
+    spread_percentile_1h: Optional[float] = None
+    depth_percentile_1h: Optional[float] = None
+    distance_to_15m_breakout_level: Optional[float] = None
+    distance_to_1h_breakout_level: Optional[float] = None
+    distance_to_invalid_level: Optional[float] = None
     is_trigger_event: bool = False
     price_change_24h_pct: Optional[float] = None
     high_24h: Optional[float] = None

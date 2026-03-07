@@ -357,6 +357,184 @@ class TestMemoryUpdater(unittest.TestCase):
             [201, 202],
         )
 
+    def test_build_stats_package_includes_trade_case_patterns(self):
+        class DummyStore:
+            def get_position_ledger_stats(self, hours):
+                return {"row_count": 2, "net_realized_pnl": -1.0, "gross_realized_pnl": 0.0, "fee_cost": 1.0}
+
+            def get_symbol_performance_report(self, hours):
+                return []
+
+            def get_daily_ledger_report(self, days):
+                return []
+
+        self.updater.state_store = DummyStore()
+        stats = self.updater._build_stats_package(
+            journals=[],
+            window_hours=24,
+            symbol_journals=[],
+            trade_cases=[
+                {
+                    "trade_case_id": "case-1",
+                    "symbol": "BTCUSDT",
+                    "status": "closed",
+                    "estimated_pnl_pct": -1.1,
+                    "observed_mfe_pct": 0.5,
+                    "observed_mae_pct": -1.4,
+                    "slippage_bps": 8.0,
+                    "thesis_failure_reason": "execution_quality_degraded:wide_spread",
+                    "evidence_signals": ["spread_bps@microstructure"],
+                    "payload": {"regime_tags": ["trend:aligned_up", "volatility:high"]},
+                },
+                {
+                    "trade_case_id": "case-2",
+                    "symbol": "BTCUSDT",
+                    "status": "closed",
+                    "estimated_pnl_pct": -0.7,
+                    "observed_mfe_pct": 0.2,
+                    "observed_mae_pct": -0.9,
+                    "slippage_bps": 6.0,
+                    "thesis_failure_reason": "execution_quality_degraded:wide_spread",
+                    "evidence_signals": ["spread_bps@microstructure"],
+                    "payload": {"regime_tags": ["trend:aligned_up", "volatility:high"]},
+                },
+            ],
+        )
+
+        self.assertEqual(stats["trade_case_count"], 2)
+        self.assertEqual(stats["closed_trade_case_count"], 2)
+        self.assertEqual(
+            stats["trade_case_patterns"]["failure_reason_counts"]["execution_quality_degraded:wide_spread"]["count"],
+            2,
+        )
+        case_candidates = [
+            item for item in stats["candidate_lessons"]
+            if item.get("seed_origin") == "trade_case_candidate"
+        ]
+        cluster_candidates = [
+            item for item in stats["candidate_lessons"]
+            if item.get("seed_origin") == "trade_case_cluster_candidate"
+        ]
+        self.assertTrue(case_candidates)
+        self.assertTrue(cluster_candidates)
+        self.assertEqual(case_candidates[0]["category"], "risk_control")
+        self.assertEqual(case_candidates[0]["trade_case_ids"], ["case-1", "case-2"])
+        self.assertEqual(stats["trade_case_clusters"][0]["count"], 2)
+        self.assertEqual(stats["trade_case_clusters"][0]["loss_count"], 2)
+        self.assertEqual(stats["trade_case_clusters"][0]["trend_alignment"], "aligned_up")
+        self.assertEqual(stats["trade_case_clusters"][0]["volatility_regime"], "high")
+        self.assertIn("quality_score", stats["trade_case_clusters"][0])
+        self.assertIn("quality_label", stats["trade_case_clusters"][0])
+        self.assertIn("evaluation", stats["trade_case_clusters"][0])
+        self.assertIn("silhouette_score", stats["trade_case_clusters"][0]["evaluation"])
+        self.assertIn("consistency_score", stats["trade_case_clusters"][0]["evaluation"])
+        self.assertEqual(stats["trade_case_cluster_evaluation"]["cluster_count"], 1)
+        self.assertGreater(stats["trade_case_cluster_evaluation"]["avg_quality_score"], 0.0)
+        self.assertFalse(stats["trade_case_clusters"][0]["retired"])
+
+    def test_build_stats_package_includes_retrieval_evaluation_summary(self):
+        class DummyStore:
+            def get_position_ledger_stats(self, hours):
+                return {"row_count": 1, "net_realized_pnl": 1.0, "gross_realized_pnl": 1.2, "fee_cost": 0.2}
+
+            def get_symbol_performance_report(self, hours):
+                return []
+
+            def get_daily_ledger_report(self, days):
+                return []
+
+        self.updater.state_store = DummyStore()
+        stats = self.updater._build_stats_package(
+            journals=[],
+            window_hours=24,
+            symbol_journals=[],
+            trade_cases=[],
+            retrieval_evaluations=[
+                {
+                    "audit_log_id": 11,
+                    "context_type": "similar_past_cases",
+                    "trade_case_id": "BTCUSDT-case-1",
+                    "decision_symbol_aligned": True,
+                    "estimated_pnl_pct": 0.8,
+                    "similarity": 0.92,
+                    "final_score": 1.35,
+                    "retrieval_source": "band_index",
+                    "matched_band_count": 4,
+                },
+                {
+                    "audit_log_id": 12,
+                    "context_type": "similar_past_cases",
+                    "trade_case_id": "BTCUSDT-case-2",
+                    "decision_symbol_aligned": False,
+                    "estimated_pnl_pct": -0.4,
+                    "similarity": 0.71,
+                    "final_score": 0.94,
+                    "retrieval_source": "full_scan",
+                    "matched_band_count": 0,
+                },
+            ],
+        )
+
+        self.assertEqual(stats["retrieval_evaluation_count"], 2)
+        self.assertEqual(stats["retrieval_evaluation_summary"]["aligned_count"], 1)
+        self.assertEqual(stats["retrieval_evaluation_summary"]["source_counts"]["band_index"], 1)
+        self.assertGreater(stats["retrieval_evaluation_summary"]["avg_similarity"], 0.0)
+        self.assertEqual(len(stats["recent_retrieval_evaluations"]), 2)
+
+    def test_build_trade_case_cluster_candidate_lessons_skips_retired_clusters(self):
+        candidates = self.updater._build_trade_case_cluster_candidate_lessons(
+            [
+                {
+                    "cluster_id": "cluster-1",
+                    "symbol": "BTCUSDT",
+                    "thesis_failure_reason": "execution_quality_degraded:wide_spread",
+                    "trend_alignment": "aligned_up",
+                    "volatility_regime": "high",
+                    "count": 4,
+                    "loss_count": 3,
+                    "quality_score": 0.72,
+                    "retired": False,
+                    "avg_slippage_bps": 7.1,
+                    "numeric_feature_centroid": {
+                        "spread_percentile_1h": 91.0,
+                        "volume_ratio_15m": 2.1,
+                        "distance_to_invalid_level": 1.0,
+                    },
+                    "evaluation": {
+                        "silhouette_score": 0.31,
+                        "loss_rate_gap": 0.12,
+                    },
+                    "trade_case_ids": ["case-a", "case-b"],
+                },
+                {
+                    "cluster_id": "cluster-2",
+                    "symbol": "BTCUSDT",
+                    "thesis_failure_reason": "execution_quality_degraded:wide_spread",
+                    "trend_alignment": "aligned_up",
+                    "volatility_regime": "high",
+                    "count": 4,
+                    "loss_count": 3,
+                    "quality_score": 0.71,
+                    "retired": True,
+                    "retirement_reason": "holdout_not_confirmed",
+                    "avg_slippage_bps": 7.2,
+                    "numeric_feature_centroid": {
+                        "spread_percentile_1h": 92.0,
+                        "volume_ratio_15m": 2.2,
+                        "distance_to_invalid_level": 1.1,
+                    },
+                    "evaluation": {
+                        "silhouette_score": 0.28,
+                        "loss_rate_gap": 0.61,
+                    },
+                    "trade_case_ids": ["case-c", "case-d"],
+                },
+            ]
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["trade_case_ids"], ["case-a", "case-b"])
+
     def test_generate_lessons_falls_back_to_candidate_lessons_on_failure(self):
         class DummyClient:
             class models:

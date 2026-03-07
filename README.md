@@ -171,7 +171,11 @@ gpt_trader/
   - 현재가
   - ATR 15m / ATR 1h
   - 1시간 추세
-  - 거래량 급증 여부
+  - 15분 거래량 비율과 즉시 거래량 급증 여부
+  - 히스테리시스가 반영된 fast move / volume surge / range break trigger 상태
+  - open interest / funding / basis의 변화율 요약
+  - spread와 depth의 최근 1시간 상대 수준(percentile / avg 대비 악화 여부)
+  - breakout 기준선 및 invalidation까지의 거리 요약
   - opportunity trigger 여부와 사유
   - risk trigger 여부와 사유
   - public WebSocket은 `ticker + 얕은 order book` 위주로 유지하고, closed-candle 기반인 OHLCV는 기본적으로 5분 materialization 시점의 incremental REST fetch에 더 의존
@@ -241,7 +245,7 @@ gpt_trader/
 - `1h or 15m -> 5m`
   - trigger가 켜지면 즉시 승격
 - `5m -> 15m or 1h`
-  - trigger가 꺼졌다고 바로 강등하지 않고 최소 유지 시간과 clear streak를 만족해야 함
+  - trigger가 꺼졌다고 바로 강등하지 않고 clear streak를 만족해야 함
 - `15m -> 1h`
   - flat 상태가 여러 사이클 연속 확인돼야 함
 
@@ -258,6 +262,7 @@ gpt_trader/
 - `5m`
   - trigger 대응 중심
   - active trigger 구간에서 더 짧은 주기로 반응
+  - 기본 정책에서는 포지션이 없을 때만 첫 진입을 허용하고, 이미 포지션이 있으면 추가 trigger-mode 진입 대신 `HOLD / REDUCE / EXIT` 위주로 제한
 
 ### 5. Trigger 분리 원칙
 
@@ -323,6 +328,14 @@ gpt_trader/
 
 셋째, 시장 스냅샷 안에서 `opportunity_trigger_reasons`와 `risk_trigger_reasons`를 분리해 전달한다.  
 즉, “시장이 움직였다”와 “지금 거래 품질이 나쁘다”를 같은 신호로 취급하지 않는다.
+
+또한 시장 스냅샷은 raw 값만 나열하지 않고, `oi_change_15m`, `oi_change_1h`, `funding_rate_change_1h`,
+`basis_change_1h`, `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`,
+`distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`처럼
+LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 전달한다.
+
+`volume_surge_15m_now`와 `volume_surge_trigger_active`는 의도적으로 분리한다.  
+전자는 현재 15분 봉의 즉시 조건이고, 후자는 히스테리시스가 반영된 안정화된 trigger 상태다.
 
 넷째, 장기 메모리는 더 이상 단순 문장 리스트만이 아니다.  
 규칙, 지원 근거 수, 적용 조건, 무시 조건을 가진 구조화 레코드로 전달될 수 있다.
@@ -726,12 +739,16 @@ context_budget:
 - risk reason
 - 추정 손익률
 - 손실 신호 여부
+- `trade_case_ids`, `case_statuses`, `case_summary`
 
 `rationale` 텍스트는 사람용으로 유지한다.  
 동시에 `rationale_json`에는 구조화 근거를 그대로 저장해 리플레이, 메모리 생성, 사후 분석에서 재사용한다.
 
 최근 journal 요약을 AI에 다시 넣을 때는 텍스트 이유만 보내지 않는다.  
 가능한 경우 audit/ledger와 연결해 실제 결과, 수수료, risk mode, trigger 정보를 함께 요약해 피드백 루프를 강화한다.
+
+최근 구조에서는 journal도 단순 1회성 로그에 머무르지 않고, 같은 사이클에서 생성된 심볼별 `trade_case_id`와 `case_status` 요약을 함께 남긴다.  
+즉 포트폴리오 journal만 봐도 "이번 판단이 어떤 케이스를 열었는지, 줄였는지, 닫았는지"를 빠르게 복기할 수 있다.
 
 daily memory batch는 `rationale_json.evidence`의 반복 시그널에서 heuristic `candidate_lessons`를 먼저 만들고, Gemini는 이를 정제하거나 병합하는 역할을 한다.  
 Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
@@ -823,11 +840,83 @@ Gemini 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있�
 - `decision`, `risk_reason`, `risk_mode`, `risk_approved`
 - `triggered`, `risk_triggered`
 - `net_realized_pnl`, `fee_cost`, `estimated_pnl_pct`
+- `trade_case_id`, `case_status`
+- `case_opened_at`, `case_closed_at`, `holding_minutes`
 - `evidence_signals`
 - `summary`, `payload`
 - 인덱스: `symbol+id`, `timestamp+id`, `audit_log_id`
 
 즉, 동일 사이클에서도 `BTCUSDT`와 `ETHUSDT`를 분리해 신호/성과를 분석할 수 있다.
+
+추가로 `symbol_journal`은 심볼별 포지션 생애주기를 `trade_case_id`로 연결한다.  
+예를 들어 flat -> open은 `opened`, open -> reducing은 `reduced`, open -> closed는 `closed`로 기록되어 이후 배치나 수동 복기에서 "한 번의 트레이드 사례" 단위로 묶어 볼 수 있다.
+
+운영 중 열려 있는 케이스는 내부 `active_trade_cases` 상태에 유지하고, 다음 cycle의 symbol journal이 같은 case id를 이어받는다.
+
+### `trade_cases`
+
+심볼별 트레이드 사례 이력 테이블이다.
+
+- `trade_case_id`, `symbol`, `status`, `risk_mode`
+- `opened_at`, `closed_at`
+- `entry_audit_log_id`, `exit_audit_log_id`
+- `entry_decision`, `exit_decision`, `entry_side`
+- `entry_price`, `exit_price`
+- `estimated_pnl_pct`, `realized_pnl`, `fee_cost`
+- `holding_minutes`
+- `observed_mfe_pct`, `observed_mae_pct`
+- `slippage_cost`, `slippage_bps`
+- `thesis_failure_reason`
+- `evidence_signals`, `trigger_reasons`, `risk_trigger_reasons`
+- `feature_vector`
+
+여기서 `observed_mfe_pct` / `observed_mae_pct`는 단일 entry/exit 값이 아니라 저장된 `trade_case_snapshots` 경로를 다시 읽어 재계산한 excursion이다.  
+가능하면 `entry_audit_log_id` / `exit_audit_log_id`의 실제 fill timestamp를 복원해, 그 체결 구간 안쪽 snapshot만 우선 사용한다.  
+아직 체결 틱 단위는 아니지만, cycle별 경로를 누적하므로 이전보다 훨씬 신뢰도 높은 case quality 지표로 사용한다.
+
+최근 `journal` 선별은 이제 단순 최신순 점수보다, 이 `trade_cases`의 심볼/trigger/risk mode/regime/결과 패턴을 같이 보고 유사한 사례를 우선 선택한다.  
+여기에 `feature_vector` 기반 cosine similarity도 섞어서 규칙 태그만으로는 놓치기 쉬운 수치적 유사 케이스를 같이 반영한다.
+
+### `trade_case_snapshots`
+
+열려 있거나 방금 닫힌 케이스의 cycle별 경로 저장소다.
+
+- `trade_case_id`, `timestamp`, `audit_log_id`, `symbol`
+- `current_price`, `mark_price`, `mid_price`
+- `spread_bps`, `volume_ratio_15m`
+- `unrealized_pnl_pct`
+- `payload`
+
+이 테이블은 케이스 경과 중의 가격/체결 품질/손익률 변화를 누적해서 나중에 excursion, slippage 문맥, 실패 패턴 복기에 사용한다.  
+run cycle 때뿐 아니라 scheduler poll 구간에서도 active case를 경량 샘플링해서 `mark_price`/`mid_price`/`unrealized_pnl_pct` 경로를 더 촘촘히 남긴다.
+
+### `trade_case_vector_index`
+
+유사 사례 검색용 별도 인덱스 테이블이다.
+
+- `trade_case_id`, `symbol`, `status`, `risk_mode`
+- `opened_at`, `closed_at`
+- `estimated_pnl_pct`, `realized_pnl`, `slippage_bps`
+- `thesis_failure_reason`
+- `vector_norm`, `feature_vector`
+- `payload`
+
+즉 `trade_cases.feature_vector`를 본 테이블에 JSON으로만 들고 있는 것이 아니라, retrieval 전용 저장소로도 분리해서 관리한다.  
+최근 context 선별과 `similar_past_cases`는 이 인덱스의 coarse `band hash` 후보를 먼저 찾고, 그 뒤 cosine similarity와 규칙 점수로 rerank한다.
+
+### `retrieval_evaluations`
+
+실제 프롬프트에 들어간 retrieval 결과를 나중에 복기할 수 있게 남기는 평가 로그다.
+
+- `audit_log_id`, `context_type`, `rank_index`
+- `trade_case_id`, `case_symbol`, `matched_symbol`
+- `decision`, `decision_symbol_aligned`
+- `estimated_pnl_pct`
+- `similarity`, `final_score`
+- `retrieval_source`, `matched_band_count`
+- `risk_mode`, `payload`
+
+즉 "무슨 유사 사례를 꺼냈는가"만이 아니라, 최종 결정 심볼과 정렬되었는지, 어떤 점수로 선택되었는지도 함께 남긴다.
 
 ### `replay_runs`
 
@@ -1013,7 +1102,11 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 
 ## 장기 메모리 배치 상세
 
-`batch/memory_updater.py`는 최근 journal과 ledger 통계를 바탕으로 장기 교훈을 구조화한다.
+`batch/memory_updater.py`는 최근 journal과 ledger 통계뿐 아니라 `trade_cases` 이력과 `trade_case_clusters` 요약도 함께 읽어 장기 교훈을 구조화한다.
+
+최근 버전의 `trade_case_clusters`에는 `quality_score`, `quality_label`, `evaluation.silhouette_score`, `evaluation.consistency_score`가 같이 들어가서,
+군집을 그냥 묶는 데서 끝나지 않고 "이 군집이 실제로 반복성과 설명력이 있는가"를 자동 평가한다.
+또한 `retired`, `retirement_reason`을 함께 계산해, holdout에서 더 이상 같은 손실 패턴이 재현되지 않거나 품질이 너무 낮은 cluster는 candidate lesson seed에서 자동 제외한다.
 
 ### 기본 원칙
 
@@ -1030,6 +1123,8 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 - `category`
 - `support_count`
 - `evidence_journal_ids`
+- `trade_case_patterns`
+- `trade_case_clusters`
 - `hypothesis`
 - `apply_when`
 - `ignore_when`
@@ -1067,6 +1162,7 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 - 최근 audit 목록
 - 최근 memory
 - 최근 symbol_journal
+- 최근 trade_cases
 - 최근 fills
 - 최근 ledger
 - 최근 replay 결과

@@ -385,6 +385,46 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertEqual(usage["candidates_token_count"], 45)
         self.assertEqual(usage["total_token_count"], 168)
 
+    def test_prompt_describes_derived_market_fields_and_trigger_state(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        request = DecisionRequest(
+            policy_summary="risk: normal",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=900.0,
+            ),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                volume_ratio_15m=2.1,
+                volume_surge_15m_now=True,
+                volume_surge_trigger_active=True,
+                oi_change_15m=3.4,
+                spread_percentile_1h=42.0,
+                distance_to_invalid_level=0.9,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            long_term_memory=[],
+        )
+
+        prompt = engine._create_prompt(request)
+
+        self.assertIn("Prefer derived fields such as change, percentile, distance, and trigger-state", prompt)
+        self.assertIn("volume_surge_15m_now is the immediate current-bar condition", prompt)
+        self.assertIn('"volume_surge_15m_now":true', prompt)
+        self.assertIn('"spread_percentile_1h":42.0', prompt)
+        self.assertIn("market_snapshots.BTCUSDT.oi_change_15m", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

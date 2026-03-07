@@ -42,6 +42,9 @@ collector
 
 지표/특징 계산(ATR, 추세 기울기, 변동성 등)
 
+LLM이 raw 값보다 바로 판단에 쓸 수 있도록 volume ratio, 즉시 volume surge 여부, stabilized trigger state,
+open interest / funding / basis 변화율, spread / depth percentile, breakout / invalidation 거리 같은 상단 요약 필드를 함께 계산
+
 public WebSocket은 ticker/orderbook 위주로 유지하고, closed-candle 기반 OHLCV는 5분 materialization 시점의 incremental REST fetch를 우선
 
 즉 진행 중인 1h/4h 봉을 계속 스트리밍하기보다, 필요한 시점에만 저빈도로 가져오는 쪽을 기본값으로 둔다
@@ -141,6 +144,8 @@ opportunity_trigger 활성화
 
 역할: trigger 대응과 빠른 재판단
 
+기본 정책에서는 포지션이 없을 때만 첫 trigger entry를 허용하고, 기존 포지션이 있으면 추가 진입 대신 HOLD/REDUCE/EXIT 위주로 동작
+
 즉, trigger가 뜨면 무엇이 돌고 있든 5분 cadence가 선점하고, trigger가 사라지면 포지션/주문 상태에 따라 15분 또는 1시간으로 강등된다.
 
 4.1.1 스냅샷 materialization
@@ -191,11 +196,11 @@ opportunity_trigger가 켜지면 즉시 승격
 
 `5m -> 15m`
 
-trigger 해제 + 최소 유지 시간 충족 + clear streak 충족 + 포지션/주문/복구 대상 존재
+trigger 해제 + clear streak 충족 + 포지션/주문/복구 대상 존재
 
 `5m -> 1h`
 
-trigger 해제 + 최소 유지 시간 충족 + clear streak 충족 + 포지션/주문/복구 대상 없음
+trigger 해제 + clear streak 충족 + 포지션/주문/복구 대상 없음
 
 `15m -> 1h`
 
@@ -225,6 +230,13 @@ market_snapshot: 15m/1h 캔들(마감된 캔들만), 핵심 지표/레벨 요약
 멀티 심볼 운영에서는 market_snapshots로 여러 심볼 스냅샷을 한 번에 전달해 포트폴리오 단일 판단을 생성
 
 market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 분리해 포함
+
+또한 market snapshot 상단에는 `volume_ratio_15m`, `volume_surge_15m_now`,
+`fast_move_trigger_active`, `volume_surge_trigger_active`, `range_break_trigger_active`,
+`oi_change_15m`, `oi_change_1h`, `funding_rate_change_1h`, `basis_change_1h`,
+`spread_vs_1h_avg`, `spread_percentile_1h`, `depth_percentile_1h`,
+`distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`
+같은 파생 요약 필드를 추가해 LLM이 raw 값보다 change / percentile / distance / trigger-state를 우선 해석하게 한다
 
 risk_state: 일일 손익률, 연속 손실, 쿨다운, 드로우다운 상태
 
@@ -424,6 +436,35 @@ audit에도 같은 구조화 근거를 원본 그대로 남겨 당시 판단 근
 
 또한 symbol_journal을 별도로 저장해, 같은 의사결정 사이클에서도 심볼별 trigger/evidence/pnl을 분리 추적한다
 
+최근 구조에서는 journal에도 `trade_case_ids`, `case_statuses`, `case_summary`를 함께 저장해
+"이번 포트폴리오 판단이 어떤 심볼 케이스를 열고/줄이고/닫았는지"를 요약 단위에서도 바로 볼 수 있게 한다
+
+symbol_journal은 더 깊게 들어가 `trade_case_id`, `case_status`, `case_opened_at`, `case_closed_at`, `holding_minutes`를 남긴다
+
+즉 journal은 사람용 사례 요약, symbol_journal은 심볼별 사례 로그 역할을 맡는다
+
+활성 케이스는 `active_trade_cases` 상태로 유지하고, 다음 cycle에서 같은 symbol이 이어질 때 동일 case id를 재사용한다
+
+별도 `trade_cases` 이력 테이블도 유지한다
+
+이 테이블은 심볼별 사례 단위로 opened/closed lifecycle, holding time, realized pnl, fee, observed MFE/MAE,
+slippage, thesis_failure_reason, feature_vector를 함께 저장한다
+
+즉 active_trade_cases는 현재 열려 있는 케이스 상태 저장소이고, trade_cases는 학습/복기용 영속 사례 저장소다
+
+추가로 trade_case_snapshots 테이블을 두어 active/just-closed case의 cycle별 current_price, spread, volume_ratio,
+unrealized_pnl_pct 경로를 저장한다
+
+observed MFE/MAE는 단일 cycle 값이 아니라 이 snapshot 경로를 다시 읽어 재계산한다
+가능하면 entry/exit audit의 fill timestamp를 복원해 실제 체결 구간 안쪽 경로만 우선 사용한다
+
+또한 scheduler poll 구간에서도 active case를 경량 샘플링해 mark_price / mid_price / unrealized_pnl_pct 경로를 더 촘촘히 남긴다
+
+trade_case_vector_index를 별도로 유지해 feature_vector를 retrieval 전용 인덱스로도 관리한다
+최근 버전에서는 coarse band-hash lookup으로 후보를 먼저 좁히고, 그 다음 cosine similarity와 규칙 점수로 rerank한다
+또한 retrieval_evaluations 테이블에 실제 prompt에 포함된 retrieval 결과를 남겨,
+trade_case_id / similarity / final_score / retrieval_source / decision_symbol_aligned를 나중에 성과와 연결해서 볼 수 있게 한다
+
 daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 market regime를 함께 읽어 장기 규칙을 만든다
 
 또한 evidence signal 반복에서 heuristic candidate lesson을 먼저 만들고, LLM은 이를 정제/병합하는 역할로 사용한다
@@ -433,6 +474,39 @@ daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 
 symbol 기반 candidate lesson의 evidence_journal_ids는 audit_log_id가 아니라 symbol_journal.id를 근거로 기록한다
 
 symbol_journal 조회 효율을 위해 symbol+id, timestamp+id, audit_log_id 인덱스를 유지한다
+
+recent_journal_context 선별도 단순 recency score가 아니라 trade_cases의 symbol overlap, trigger overlap,
+risk_mode 일치, regime tag, closed win/loss 결과를 함께 보는 similarity score로 확장한다
+
+여기에 trade_cases.feature_vector와 현재 market snapshot vector의 cosine similarity를 섞어,
+태그 규칙만으로는 포착되지 않는 수치적 유사성도 retrieval에 반영한다
+
+retrieval 흐름은
+
+1. trade_case_vector_index에서 vector top-k 후보 검색
+2. symbol overlap / trigger overlap / risk_mode / 결과 / slippage / failure reason으로 rerank
+
+구조를 따른다
+
+memory_updater는 journal + symbol_journal 외에도 trade_cases를 읽어 repeated failure reason,
+signal failure, slippage, excursion 품질을 candidate lesson seed로 반영한다
+
+또한 trade_case_clusters를 만들어 symbol + failure_reason + regime 조합별 반복 손실 군집을 요약하고,
+이 군집을 risk_control lesson의 추가 seed로 사용한다
+
+최근 버전에서는 이 cluster를 단순 규칙 그룹핑이 아니라 numeric feature distance 기반 online centroid clustering으로 만든다
+또한 silhouette / nearest-cluster separation / temporal holdout consistency를 계산해 quality_score와 quality_label을 붙인다
+quality가 낮거나 holdout에서 손실 패턴이 더 이상 확인되지 않는 cluster는 retired 처리하고, lesson seed에서 자동 제외한다
+
+입력 특징 예:
+
+- spread_percentile_1h
+- oi_change_15m
+- volume_ratio_15m
+- distance_to_invalid_level
+- slippage_bps
+- observed MFE / MAE
+- trend / volatility encoding
 
 9.3 리플레이(강력 권장)
 

@@ -1,4 +1,6 @@
+import hashlib
 import json
+import math
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -52,7 +54,10 @@ class StateStore:
                     confidence REAL,
                     risk_reason TEXT,
                     estimated_pnl_pct REAL,
-                    loss_signal BOOLEAN DEFAULT 0
+                    loss_signal BOOLEAN DEFAULT 0,
+                    trade_case_ids JSON,
+                    case_statuses JSON,
+                    case_summary TEXT
                 );
                 
                 CREATE TABLE IF NOT EXISTS long_term_memory (
@@ -112,8 +117,113 @@ class StateStore:
                     net_realized_pnl REAL,
                     fee_cost REAL,
                     estimated_pnl_pct REAL,
+                    trade_case_id TEXT,
+                    case_status TEXT,
+                    case_opened_at DATETIME,
+                    case_closed_at DATETIME,
+                    holding_minutes REAL,
                     evidence_signals JSON,
                     summary TEXT,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS active_trade_cases (
+                    symbol TEXT PRIMARY KEY,
+                    trade_case_id TEXT NOT NULL,
+                    opened_at DATETIME,
+                    entry_decision TEXT,
+                    last_decision TEXT,
+                    last_audit_log_id INTEGER,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_cases (
+                    trade_case_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    risk_mode TEXT,
+                    opened_at DATETIME,
+                    closed_at DATETIME,
+                    entry_audit_log_id INTEGER,
+                    exit_audit_log_id INTEGER,
+                    entry_decision TEXT,
+                    exit_decision TEXT,
+                    entry_side TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    estimated_pnl_pct REAL,
+                    realized_pnl REAL,
+                    fee_cost REAL,
+                    holding_minutes REAL,
+                    observed_mfe_pct REAL,
+                    observed_mae_pct REAL,
+                    slippage_cost REAL,
+                    slippage_bps REAL,
+                    thesis_failure_reason TEXT,
+                    evidence_signals JSON,
+                    trigger_reasons JSON,
+                    risk_trigger_reasons JSON,
+                    feature_vector JSON,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_case_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_case_id TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    audit_log_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    current_price REAL,
+                    mark_price REAL,
+                    mid_price REAL,
+                    spread_bps REAL,
+                    volume_ratio_15m REAL,
+                    unrealized_pnl_pct REAL,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_case_vector_index (
+                    trade_case_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    status TEXT,
+                    risk_mode TEXT,
+                    opened_at DATETIME,
+                    closed_at DATETIME,
+                    estimated_pnl_pct REAL,
+                    realized_pnl REAL,
+                    slippage_bps REAL,
+                    thesis_failure_reason TEXT,
+                    vector_norm REAL,
+                    feature_vector JSON,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_case_vector_bands (
+                    trade_case_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    band_index INTEGER NOT NULL,
+                    band_hash TEXT NOT NULL,
+                    closed_at DATETIME,
+                    PRIMARY KEY (trade_case_id, band_index)
+                );
+
+                CREATE TABLE IF NOT EXISTS retrieval_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_log_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    context_type TEXT NOT NULL,
+                    rank_index INTEGER DEFAULT 0,
+                    trade_case_id TEXT,
+                    case_symbol TEXT,
+                    matched_symbol TEXT,
+                    decision TEXT,
+                    decision_symbol_aligned BOOLEAN DEFAULT 0,
+                    estimated_pnl_pct REAL,
+                    similarity REAL,
+                    final_score REAL,
+                    retrieval_source TEXT,
+                    matched_band_count INTEGER DEFAULT 0,
+                    risk_mode TEXT,
                     payload JSON
                 );
 
@@ -222,6 +332,39 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_symbol_journal_audit_log_id
                 ON symbol_journal(audit_log_id);
 
+                CREATE INDEX IF NOT EXISTS idx_active_trade_cases_trade_case_id
+                ON active_trade_cases(trade_case_id);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_cases_symbol_closed_at
+                ON trade_cases(symbol, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_cases_status_closed_at
+                ON trade_cases(status, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_case_snapshots_case_time
+                ON trade_case_snapshots(trade_case_id, timestamp);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_case_vector_symbol_closed_at
+                ON trade_case_vector_index(symbol, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_case_vector_status_closed_at
+                ON trade_case_vector_index(status, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_case_vector_bands_lookup
+                ON trade_case_vector_bands(symbol, band_index, band_hash, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_trade_case_vector_bands_hash_lookup
+                ON trade_case_vector_bands(band_index, band_hash, closed_at);
+
+                CREATE INDEX IF NOT EXISTS idx_retrieval_evaluations_audit
+                ON retrieval_evaluations(audit_log_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_retrieval_evaluations_context_created
+                ON retrieval_evaluations(context_type, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_retrieval_evaluations_trade_case
+                ON retrieval_evaluations(trade_case_id, created_at, id);
+
                 CREATE INDEX IF NOT EXISTS idx_decision_fingerprint_lookup
                 ON decision_fingerprints(symbol, action, size_band, id);
 
@@ -241,6 +384,49 @@ class StateStore:
         self._ensure_column("journal", "risk_reason", "TEXT")
         self._ensure_column("journal", "estimated_pnl_pct", "REAL")
         self._ensure_column("journal", "loss_signal", "BOOLEAN DEFAULT 0")
+        self._ensure_column("journal", "trade_case_ids", "JSON")
+        self._ensure_column("journal", "case_statuses", "JSON")
+        self._ensure_column("journal", "case_summary", "TEXT")
+        self._ensure_column("symbol_journal", "trade_case_id", "TEXT")
+        self._ensure_column("symbol_journal", "case_status", "TEXT")
+        self._ensure_column("symbol_journal", "case_opened_at", "DATETIME")
+        self._ensure_column("symbol_journal", "case_closed_at", "DATETIME")
+        self._ensure_column("symbol_journal", "holding_minutes", "REAL")
+        self._ensure_column("trade_cases", "risk_mode", "TEXT")
+        self._ensure_column("trade_cases", "opened_at", "DATETIME")
+        self._ensure_column("trade_cases", "closed_at", "DATETIME")
+        self._ensure_column("trade_cases", "entry_audit_log_id", "INTEGER")
+        self._ensure_column("trade_cases", "exit_audit_log_id", "INTEGER")
+        self._ensure_column("trade_cases", "entry_decision", "TEXT")
+        self._ensure_column("trade_cases", "exit_decision", "TEXT")
+        self._ensure_column("trade_cases", "entry_side", "TEXT")
+        self._ensure_column("trade_cases", "entry_price", "REAL")
+        self._ensure_column("trade_cases", "exit_price", "REAL")
+        self._ensure_column("trade_cases", "estimated_pnl_pct", "REAL")
+        self._ensure_column("trade_cases", "realized_pnl", "REAL")
+        self._ensure_column("trade_cases", "fee_cost", "REAL")
+        self._ensure_column("trade_cases", "holding_minutes", "REAL")
+        self._ensure_column("trade_cases", "observed_mfe_pct", "REAL")
+        self._ensure_column("trade_cases", "observed_mae_pct", "REAL")
+        self._ensure_column("trade_cases", "slippage_cost", "REAL")
+        self._ensure_column("trade_cases", "slippage_bps", "REAL")
+        self._ensure_column("trade_cases", "thesis_failure_reason", "TEXT")
+        self._ensure_column("trade_cases", "evidence_signals", "JSON")
+        self._ensure_column("trade_cases", "trigger_reasons", "JSON")
+        self._ensure_column("trade_cases", "risk_trigger_reasons", "JSON")
+        self._ensure_column("trade_cases", "feature_vector", "JSON")
+        self._ensure_column("trade_cases", "payload", "JSON")
+        self._ensure_column("trade_case_vector_index", "status", "TEXT")
+        self._ensure_column("trade_case_vector_index", "risk_mode", "TEXT")
+        self._ensure_column("trade_case_vector_index", "opened_at", "DATETIME")
+        self._ensure_column("trade_case_vector_index", "closed_at", "DATETIME")
+        self._ensure_column("trade_case_vector_index", "estimated_pnl_pct", "REAL")
+        self._ensure_column("trade_case_vector_index", "realized_pnl", "REAL")
+        self._ensure_column("trade_case_vector_index", "slippage_bps", "REAL")
+        self._ensure_column("trade_case_vector_index", "thesis_failure_reason", "TEXT")
+        self._ensure_column("trade_case_vector_index", "vector_norm", "REAL")
+        self._ensure_column("trade_case_vector_index", "feature_vector", "JSON")
+        self._ensure_column("trade_case_vector_index", "payload", "JSON")
         self._ensure_column("replay_runs", "side_changed", "BOOLEAN DEFAULT 0")
         self._ensure_column("replay_runs", "size_delta", "REAL DEFAULT 0")
         self._ensure_column("replay_runs", "rationale_keywords_added", "JSON")
@@ -328,6 +514,9 @@ class StateStore:
         risk_reason: str = "",
         estimated_pnl_pct: Optional[float] = None,
         loss_signal: bool = False,
+        trade_case_ids: Optional[List[str]] = None,
+        case_statuses: Optional[Dict[str, str]] = None,
+        case_summary: str = "",
     ):
         try:
             with self.conn:
@@ -341,8 +530,11 @@ class StateStore:
                         confidence,
                         risk_reason,
                         estimated_pnl_pct,
-                        loss_signal
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        loss_signal,
+                        trade_case_ids,
+                        case_statuses,
+                        case_summary
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         audit_log_id,
@@ -353,10 +545,62 @@ class StateStore:
                         risk_reason,
                         estimated_pnl_pct,
                         int(loss_signal),
+                        json.dumps(trade_case_ids or []),
+                        json.dumps(case_statuses or {}),
+                        case_summary,
                     ),
                 )
         except Exception as e:
             logger.error(f"Failed to save journal log: {e}")
+
+    def save_retrieval_evaluations(self, audit_log_id: int, entries: List[Dict[str, Any]]):
+        if not audit_log_id or not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO retrieval_evaluations (
+                        audit_log_id,
+                        context_type,
+                        rank_index,
+                        trade_case_id,
+                        case_symbol,
+                        matched_symbol,
+                        decision,
+                        decision_symbol_aligned,
+                        estimated_pnl_pct,
+                        similarity,
+                        final_score,
+                        retrieval_source,
+                        matched_band_count,
+                        risk_mode,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            audit_log_id,
+                            entry.get("context_type"),
+                            entry.get("rank_index"),
+                            entry.get("trade_case_id"),
+                            entry.get("case_symbol"),
+                            entry.get("matched_symbol"),
+                            entry.get("decision"),
+                            int(bool(entry.get("decision_symbol_aligned"))),
+                            entry.get("estimated_pnl_pct"),
+                            entry.get("similarity"),
+                            entry.get("final_score"),
+                            entry.get("retrieval_source"),
+                            int(entry.get("matched_band_count") or 0),
+                            entry.get("risk_mode"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save retrieval evaluations: {e}")
 
     def get_recent_journals(self, limit: int = 10) -> List[str]:
         try:
@@ -381,6 +625,9 @@ class StateStore:
                 j.risk_reason,
                 j.estimated_pnl_pct,
                 j.loss_signal,
+                j.trade_case_ids,
+                j.case_statuses,
+                j.case_summary,
                 COALESCE(ledger.net_realized_pnl, 0) AS ledger_net_realized_pnl,
                 COALESCE(ledger.fee_cost, 0) AS ledger_fee_cost,
                 a.risk_approved,
@@ -457,6 +704,9 @@ class StateStore:
                 j.risk_reason,
                 j.estimated_pnl_pct,
                 j.loss_signal,
+                j.trade_case_ids,
+                j.case_statuses,
+                j.case_summary,
                 COALESCE(ledger.net_realized_pnl, 0) AS ledger_net_realized_pnl,
                 COALESCE(ledger.fee_cost, 0) AS ledger_fee_cost,
                 a.risk_approved,
@@ -485,6 +735,50 @@ class StateStore:
         rows = []
         for row in cursor.fetchall():
             rows.append(self._decode_journal_context_row(dict(row)))
+        return rows
+
+    def get_retrieval_evaluations_since(
+        self,
+        since: datetime,
+        context_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                audit_log_id,
+                created_at,
+                context_type,
+                rank_index,
+                trade_case_id,
+                case_symbol,
+                matched_symbol,
+                decision,
+                decision_symbol_aligned,
+                estimated_pnl_pct,
+                similarity,
+                final_score,
+                retrieval_source,
+                matched_band_count,
+                risk_mode,
+                payload
+            FROM retrieval_evaluations
+            WHERE created_at >= ?
+            ORDER BY created_at ASC, id ASC
+        """
+        params: List[Any] = [since.strftime("%Y-%m-%d %H:%M:%S")]
+        if context_type:
+            query = query.replace("WHERE created_at >= ?", "WHERE created_at >= ? AND context_type = ?")
+            params.append(context_type)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
         return rows
 
     def save_long_term_memory_entries(self, entries: List[Dict[str, Any]]):
@@ -616,10 +910,15 @@ class StateStore:
                         net_realized_pnl,
                         fee_cost,
                         estimated_pnl_pct,
+                        trade_case_id,
+                        case_status,
+                        case_opened_at,
+                        case_closed_at,
+                        holding_minutes,
                         evidence_signals,
                         summary,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -634,6 +933,11 @@ class StateStore:
                             entry.get("net_realized_pnl"),
                             entry.get("fee_cost"),
                             entry.get("estimated_pnl_pct"),
+                            entry.get("trade_case_id"),
+                            entry.get("case_status"),
+                            entry.get("case_opened_at"),
+                            entry.get("case_closed_at"),
+                            entry.get("holding_minutes"),
                             json.dumps(entry.get("evidence_signals") or []),
                             entry.get("summary"),
                             json.dumps(entry.get("payload") or {}),
@@ -661,6 +965,11 @@ class StateStore:
                 net_realized_pnl,
                 fee_cost,
                 estimated_pnl_pct,
+                trade_case_id,
+                case_status,
+                case_opened_at,
+                case_closed_at,
+                holding_minutes,
                 evidence_signals,
                 summary,
                 payload
@@ -676,10 +985,7 @@ class StateStore:
         cursor = self.conn.execute(query, params)
         rows = []
         for row in cursor.fetchall():
-            item = dict(row)
-            item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
-            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
-            rows.append(item)
+            rows.append(self._decode_symbol_journal_row(dict(row)))
         return rows
 
     def get_symbol_journal_entries_since(
@@ -702,6 +1008,11 @@ class StateStore:
                 net_realized_pnl,
                 fee_cost,
                 estimated_pnl_pct,
+                trade_case_id,
+                case_status,
+                case_opened_at,
+                case_closed_at,
+                holding_minutes,
                 evidence_signals,
                 summary,
                 payload
@@ -717,8 +1028,563 @@ class StateStore:
         cursor = self.conn.execute(query, params)
         rows = []
         for row in cursor.fetchall():
+            rows.append(self._decode_symbol_journal_row(dict(row)))
+        return rows
+
+    def get_active_trade_case(self, symbol: str) -> Dict[str, Any]:
+        if not symbol:
+            return {}
+        cursor = self.conn.execute(
+            """
+            SELECT
+                symbol,
+                trade_case_id,
+                opened_at,
+                entry_decision,
+                last_decision,
+                last_audit_log_id,
+                payload
+            FROM active_trade_cases
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+        return item
+
+    def get_all_active_trade_cases(self) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+                symbol,
+                trade_case_id,
+                opened_at,
+                entry_decision,
+                last_decision,
+                last_audit_log_id,
+                payload
+            FROM active_trade_cases
+            ORDER BY opened_at ASC, symbol ASC
+            """
+        )
+        rows = []
+        for row in cursor.fetchall():
             item = dict(row)
-            item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def upsert_active_trade_case(
+        self,
+        symbol: str,
+        trade_case_id: str,
+        opened_at: Optional[str],
+        entry_decision: Optional[str] = None,
+        last_decision: Optional[str] = None,
+        last_audit_log_id: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ):
+        if not symbol or not trade_case_id:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO active_trade_cases (
+                        symbol,
+                        trade_case_id,
+                        opened_at,
+                        entry_decision,
+                        last_decision,
+                        last_audit_log_id,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        trade_case_id = excluded.trade_case_id,
+                        opened_at = excluded.opened_at,
+                        entry_decision = excluded.entry_decision,
+                        last_decision = excluded.last_decision,
+                        last_audit_log_id = excluded.last_audit_log_id,
+                        payload = excluded.payload
+                    """,
+                    (
+                        symbol,
+                        trade_case_id,
+                        opened_at,
+                        entry_decision,
+                        last_decision,
+                        last_audit_log_id,
+                        json.dumps(payload or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to upsert active trade case: {e}")
+
+    def close_active_trade_case(
+        self,
+        symbol: str,
+        closed_at: Optional[str] = None,
+        last_decision: Optional[str] = None,
+        last_audit_log_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        existing = self.get_active_trade_case(symbol)
+        if not existing:
+            return {}
+        payload = dict(existing.get("payload") or {})
+        if closed_at:
+            payload["closed_at"] = closed_at
+        if last_decision:
+            payload["last_decision"] = last_decision
+        if last_audit_log_id is not None:
+            payload["last_audit_log_id"] = last_audit_log_id
+        existing["payload"] = payload
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "DELETE FROM active_trade_cases WHERE symbol = ?",
+                    (symbol,),
+                )
+        except Exception as e:
+            logger.error(f"Failed to close active trade case: {e}")
+        return existing
+
+    def upsert_trade_case(self, record: Dict[str, Any]):
+        trade_case_id = str(record.get("trade_case_id") or "").strip()
+        symbol = str(record.get("symbol") or "").strip()
+        status = str(record.get("status") or "open").strip() or "open"
+        if not trade_case_id or not symbol:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO trade_cases (
+                        trade_case_id,
+                        symbol,
+                        status,
+                        risk_mode,
+                        opened_at,
+                        closed_at,
+                        entry_audit_log_id,
+                        exit_audit_log_id,
+                        entry_decision,
+                        exit_decision,
+                        entry_side,
+                        entry_price,
+                        exit_price,
+                        estimated_pnl_pct,
+                        realized_pnl,
+                        fee_cost,
+                        holding_minutes,
+                        observed_mfe_pct,
+                        observed_mae_pct,
+                        slippage_cost,
+                        slippage_bps,
+                        thesis_failure_reason,
+                        evidence_signals,
+                        trigger_reasons,
+                        risk_trigger_reasons,
+                        feature_vector,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_case_id) DO UPDATE SET
+                        symbol = excluded.symbol,
+                        status = excluded.status,
+                        risk_mode = excluded.risk_mode,
+                        opened_at = excluded.opened_at,
+                        closed_at = excluded.closed_at,
+                        entry_audit_log_id = excluded.entry_audit_log_id,
+                        exit_audit_log_id = excluded.exit_audit_log_id,
+                        entry_decision = excluded.entry_decision,
+                        exit_decision = excluded.exit_decision,
+                        entry_side = excluded.entry_side,
+                        entry_price = excluded.entry_price,
+                        exit_price = excluded.exit_price,
+                        estimated_pnl_pct = excluded.estimated_pnl_pct,
+                        realized_pnl = excluded.realized_pnl,
+                        fee_cost = excluded.fee_cost,
+                        holding_minutes = excluded.holding_minutes,
+                        observed_mfe_pct = excluded.observed_mfe_pct,
+                        observed_mae_pct = excluded.observed_mae_pct,
+                        slippage_cost = excluded.slippage_cost,
+                        slippage_bps = excluded.slippage_bps,
+                        thesis_failure_reason = excluded.thesis_failure_reason,
+                        evidence_signals = excluded.evidence_signals,
+                        trigger_reasons = excluded.trigger_reasons,
+                        risk_trigger_reasons = excluded.risk_trigger_reasons,
+                        feature_vector = excluded.feature_vector,
+                        payload = excluded.payload
+                    """,
+                    (
+                        trade_case_id,
+                        symbol,
+                        status,
+                        record.get("risk_mode"),
+                        record.get("opened_at"),
+                        record.get("closed_at"),
+                        record.get("entry_audit_log_id"),
+                        record.get("exit_audit_log_id"),
+                        record.get("entry_decision"),
+                        record.get("exit_decision"),
+                        record.get("entry_side"),
+                        record.get("entry_price"),
+                        record.get("exit_price"),
+                        record.get("estimated_pnl_pct"),
+                        record.get("realized_pnl"),
+                        record.get("fee_cost"),
+                        record.get("holding_minutes"),
+                        record.get("observed_mfe_pct"),
+                        record.get("observed_mae_pct"),
+                        record.get("slippage_cost"),
+                        record.get("slippage_bps"),
+                        record.get("thesis_failure_reason"),
+                        json.dumps(record.get("evidence_signals") or []),
+                        json.dumps(record.get("trigger_reasons") or []),
+                        json.dumps(record.get("risk_trigger_reasons") or []),
+                        json.dumps(record.get("feature_vector") or []),
+                        json.dumps(record.get("payload") or {}),
+                    ),
+                )
+                feature_vector = record.get("feature_vector") or []
+                self.conn.execute(
+                    """
+                    INSERT INTO trade_case_vector_index (
+                        trade_case_id,
+                        symbol,
+                        status,
+                        risk_mode,
+                        opened_at,
+                        closed_at,
+                        estimated_pnl_pct,
+                        realized_pnl,
+                        slippage_bps,
+                        thesis_failure_reason,
+                        vector_norm,
+                        feature_vector,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_case_id) DO UPDATE SET
+                        symbol = excluded.symbol,
+                        status = excluded.status,
+                        risk_mode = excluded.risk_mode,
+                        opened_at = excluded.opened_at,
+                        closed_at = excluded.closed_at,
+                        estimated_pnl_pct = excluded.estimated_pnl_pct,
+                        realized_pnl = excluded.realized_pnl,
+                        slippage_bps = excluded.slippage_bps,
+                        thesis_failure_reason = excluded.thesis_failure_reason,
+                        vector_norm = excluded.vector_norm,
+                        feature_vector = excluded.feature_vector,
+                        payload = excluded.payload
+                    """,
+                    (
+                        trade_case_id,
+                        symbol,
+                        status,
+                        record.get("risk_mode"),
+                        record.get("opened_at"),
+                        record.get("closed_at"),
+                        record.get("estimated_pnl_pct"),
+                        record.get("realized_pnl"),
+                        record.get("slippage_bps"),
+                        record.get("thesis_failure_reason"),
+                        self._vector_norm(feature_vector),
+                        json.dumps(feature_vector),
+                        json.dumps(
+                            {
+                                "trigger_reasons": record.get("trigger_reasons") or [],
+                                "risk_trigger_reasons": record.get("risk_trigger_reasons") or [],
+                                "evidence_signals": record.get("evidence_signals") or [],
+                                "payload": record.get("payload") or {},
+                            }
+                        ),
+                    ),
+                )
+                self.conn.execute(
+                    "DELETE FROM trade_case_vector_bands WHERE trade_case_id = ?",
+                    (trade_case_id,),
+                )
+                band_entries = self._build_trade_case_vector_band_entries(
+                    trade_case_id=trade_case_id,
+                    symbol=symbol,
+                    feature_vector=feature_vector,
+                    closed_at=record.get("closed_at"),
+                )
+                if band_entries:
+                    self.conn.executemany(
+                        """
+                        INSERT INTO trade_case_vector_bands (
+                            trade_case_id,
+                            symbol,
+                            band_index,
+                            band_hash,
+                            closed_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        band_entries,
+                    )
+        except Exception as e:
+            logger.error(f"Failed to upsert trade case: {e}")
+
+    def get_trade_case(self, trade_case_id: str) -> Dict[str, Any]:
+        if not trade_case_id:
+            return {}
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM trade_cases
+            WHERE trade_case_id = ?
+            LIMIT 1
+            """,
+            (trade_case_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        return self._decode_trade_case_row(dict(row))
+
+    def get_recent_trade_cases(
+        self,
+        limit: int = 50,
+        symbol: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT *
+            FROM trade_cases
+        """
+        params: List[Any] = []
+        clauses: List[str] = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY COALESCE(closed_at, opened_at) DESC, trade_case_id DESC LIMIT ?"
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        return [self._decode_trade_case_row(dict(row)) for row in cursor.fetchall()]
+
+    def get_trade_cases_since(
+        self,
+        since: datetime,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT *
+            FROM trade_cases
+            WHERE COALESCE(closed_at, opened_at) >= ?
+            ORDER BY COALESCE(closed_at, opened_at) ASC, trade_case_id ASC
+        """
+        params: List[Any] = [since.strftime("%Y-%m-%d %H:%M:%S")]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        return [self._decode_trade_case_row(dict(row)) for row in cursor.fetchall()]
+
+    def get_trade_case_vector_candidates(
+        self,
+        limit: int = 200,
+        symbols: Optional[List[str]] = None,
+        statuses: Optional[List[str]] = None,
+        since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT *
+            FROM trade_case_vector_index
+        """
+        params: List[Any] = []
+        clauses: List[str] = []
+        clean_symbols = [str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()]
+        clean_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if clean_symbols:
+            placeholders = ", ".join("?" for _ in clean_symbols)
+            clauses.append(f"symbol IN ({placeholders})")
+            params.extend(clean_symbols)
+        if clean_statuses:
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        if since is not None:
+            clauses.append("COALESCE(closed_at, opened_at) >= ?")
+            params.append(since.strftime("%Y-%m-%d %H:%M:%S"))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY COALESCE(closed_at, opened_at) DESC, trade_case_id DESC LIMIT ?"
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        return [self._decode_trade_case_vector_row(dict(row)) for row in cursor.fetchall()]
+
+    def get_trade_case_vector_band_candidates(
+        self,
+        current_feature_vectors: Dict[str, List[float]],
+        limit: int = 200,
+        statuses: Optional[List[str]] = None,
+        since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        probes: List[tuple[str, int, str]] = []
+        for symbol, feature_vector in (current_feature_vectors or {}).items():
+            symbol_text = str(symbol).strip()
+            if not symbol_text:
+                continue
+            for band_index, band_hash in self._build_vector_band_hashes(feature_vector):
+                probes.append((symbol_text, band_index, band_hash))
+        if not probes:
+            return []
+        query = """
+            SELECT
+                v.*,
+                COUNT(*) AS matched_band_count
+            FROM trade_case_vector_bands b
+            JOIN trade_case_vector_index v
+                ON v.trade_case_id = b.trade_case_id
+            WHERE
+        """
+        params: List[Any] = []
+        probe_clauses = []
+        for symbol, band_index, band_hash in probes:
+            probe_clauses.append("(b.symbol = ? AND b.band_index = ? AND b.band_hash = ?)")
+            params.extend([symbol, band_index, band_hash])
+        query += " (" + " OR ".join(probe_clauses) + ")"
+
+        clean_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if clean_statuses:
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            query += f" AND v.status IN ({placeholders})"
+            params.extend(clean_statuses)
+        if since is not None:
+            query += " AND COALESCE(v.closed_at, v.opened_at) >= ?"
+            params.append(since.strftime("%Y-%m-%d %H:%M:%S"))
+
+        query += """
+            GROUP BY v.trade_case_id
+            ORDER BY matched_band_count DESC, COALESCE(v.closed_at, v.opened_at) DESC, v.trade_case_id DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        return [self._decode_trade_case_vector_row(dict(row)) for row in cursor.fetchall()]
+
+    def save_trade_case_snapshots(self, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO trade_case_snapshots (
+                        trade_case_id,
+                        timestamp,
+                        audit_log_id,
+                        symbol,
+                        current_price,
+                        mark_price,
+                        mid_price,
+                        spread_bps,
+                        volume_ratio_15m,
+                        unrealized_pnl_pct,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            entry.get("trade_case_id"),
+                            entry.get("timestamp"),
+                            entry.get("audit_log_id"),
+                            entry.get("symbol"),
+                            entry.get("current_price"),
+                            entry.get("mark_price"),
+                            entry.get("mid_price"),
+                            entry.get("spread_bps"),
+                            entry.get("volume_ratio_15m"),
+                            entry.get("unrealized_pnl_pct"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                        if entry.get("trade_case_id") and entry.get("symbol")
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save trade case snapshots: {e}")
+
+    def get_trade_case_snapshots(self, trade_case_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                trade_case_id,
+                timestamp,
+                audit_log_id,
+                symbol,
+                current_price,
+                mark_price,
+                mid_price,
+                spread_bps,
+                volume_ratio_15m,
+                unrealized_pnl_pct,
+                payload
+            FROM trade_case_snapshots
+            WHERE trade_case_id = ?
+            ORDER BY timestamp ASC, id ASC
+        """
+        params: List[Any] = [trade_case_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def get_trade_case_snapshots_between(
+        self,
+        trade_case_id: str,
+        start_timestamp: Optional[str] = None,
+        end_timestamp: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                trade_case_id,
+                timestamp,
+                audit_log_id,
+                symbol,
+                current_price,
+                mark_price,
+                mid_price,
+                spread_bps,
+                volume_ratio_15m,
+                unrealized_pnl_pct,
+                payload
+            FROM trade_case_snapshots
+            WHERE trade_case_id = ?
+        """
+        params: List[Any] = [trade_case_id]
+        if start_timestamp:
+            query += " AND timestamp >= ?"
+            params.append(start_timestamp)
+        if end_timestamp:
+            query += " AND timestamp <= ?"
+            params.append(end_timestamp)
+        query += " ORDER BY timestamp ASC, id ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
             item["payload"] = self._safe_json_loads(item.get("payload"), default={})
             rows.append(item)
         return rows
@@ -2133,6 +2999,9 @@ class StateStore:
             parts.append(f"trigger={','.join(trigger_symbols)}")
         if risk_trigger_symbols:
             parts.append(f"risk_trigger={','.join(risk_trigger_symbols)}")
+        case_summary = str(row.get("case_summary") or "").strip()
+        if case_summary:
+            parts.append(f"cases={case_summary}")
         return " ".join(parts)
 
     def _decode_journal_context_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2140,6 +3009,8 @@ class StateStore:
         item["rationale_json"] = self._safe_json_loads(item.get("rationale_json"), default=[])
         item["market_state"] = self._safe_json_loads(item.get("market_state"), default={})
         item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+        item["trade_case_ids"] = self._safe_json_loads(item.get("trade_case_ids"), default=[])
+        item["case_statuses"] = self._safe_json_loads(item.get("case_statuses"), default={})
         rationale_text = item.get("rationale") or ""
         item["rationale"] = [line for line in str(rationale_text).split("\n") if line]
         item["rationale_items"] = item["rationale_json"]
@@ -2150,6 +3021,98 @@ class StateStore:
         item["entry_size_cap"] = item["execution_summary"].get("entry_size_cap") or {}
         item["summary"] = self._format_journal_summary(item)
         return item
+
+    def _decode_symbol_journal_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
+        item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+        return item
+
+    def _decode_trade_case_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        item["evidence_signals"] = self._safe_json_loads(item.get("evidence_signals"), default=[])
+        item["trigger_reasons"] = self._safe_json_loads(item.get("trigger_reasons"), default=[])
+        item["risk_trigger_reasons"] = self._safe_json_loads(item.get("risk_trigger_reasons"), default=[])
+        item["feature_vector"] = self._safe_json_loads(item.get("feature_vector"), default=[])
+        item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+        return item
+
+    def _decode_trade_case_vector_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        item["feature_vector"] = self._safe_json_loads(item.get("feature_vector"), default=[])
+        item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+        item["matched_band_count"] = int(item.get("matched_band_count") or 0)
+        return item
+
+    def _vector_norm(self, vector: Any) -> float:
+        values = vector if isinstance(vector, list) else []
+        total = 0.0
+        for value in values:
+            try:
+                total += float(value) * float(value)
+            except (TypeError, ValueError):
+                continue
+        return total ** 0.5
+
+    def _coerce_vector_values(self, vector: Any) -> List[float]:
+        values = vector if isinstance(vector, list) else []
+        normalized: List[float] = []
+        for value in values:
+            try:
+                normalized.append(float(value))
+            except (TypeError, ValueError):
+                normalized.append(0.0)
+        return normalized
+
+    def _build_vector_band_hashes(
+        self,
+        feature_vector: Any,
+        band_count: int = 4,
+        dims_per_band: int = 4,
+    ) -> List[tuple[int, str]]:
+        values = self._coerce_vector_values(feature_vector)
+        if not values:
+            return []
+        norm = self._vector_norm(values) or 1.0
+        unit_values = [value / norm for value in values]
+        required_dims = band_count * dims_per_band
+        if len(unit_values) < required_dims:
+            unit_values = unit_values + ([0.0] * (required_dims - len(unit_values)))
+        else:
+            unit_values = unit_values[:required_dims]
+        hashes: List[tuple[int, str]] = []
+        for band_index in range(band_count):
+            chunk = unit_values[band_index::band_count][:dims_per_band]
+            if len(chunk) < dims_per_band:
+                chunk = chunk + ([0.0] * (dims_per_band - len(chunk)))
+            quantized = []
+            for value in chunk:
+                bucket = max(-6, min(6, int(round(value / 0.2))))
+                quantized.append(str(bucket))
+            digest = hashlib.sha1("|".join(quantized).encode("utf-8")).hexdigest()[:16]
+            hashes.append((band_index, digest))
+        return hashes
+
+    def _build_trade_case_vector_band_entries(
+        self,
+        trade_case_id: str,
+        symbol: str,
+        feature_vector: Any,
+        closed_at: Any = None,
+    ) -> List[tuple[Any, ...]]:
+        if not trade_case_id or not symbol:
+            return []
+        band_hashes = self._build_vector_band_hashes(feature_vector)
+        return [
+            (
+                trade_case_id,
+                symbol,
+                band_index,
+                band_hash,
+                closed_at,
+            )
+            for band_index, band_hash in band_hashes
+        ]
 
     def _safe_json_loads(self, value: Any, default: Any):
         if value in (None, ""):

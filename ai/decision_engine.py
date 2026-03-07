@@ -118,30 +118,41 @@ similar_past_cases:
 trigger_mode_active:
 {str(request.is_trigger_mode).lower()}
 
+MARKET INTERPRETATION
+1. Prefer derived fields such as change, percentile, distance, and trigger-state over raw values when making decisions.
+2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_trigger_active is the stabilized trigger state after hysteresis. Do not treat them as interchangeable.
+3. fast_move_trigger_active, volume_surge_trigger_active, and range_break_trigger_active represent stabilized trigger states and matter more for cadence and follow-through than one-bar noise.
+4. spread_vs_1h_avg, spread_percentile_1h, and depth_percentile_1h describe execution quality. Poor execution quality should reduce aggressiveness even if direction looks favorable.
+5. oi_change_15m, oi_change_1h, funding_rate_change_1h, and basis_change_1h describe change and participation, not just static state.
+6. distance_to_15m_breakout_level, distance_to_1h_breakout_level, and distance_to_invalid_level describe structure quality. Smaller and clearer invalidation distance generally supports cleaner entries.
+
 RULES
-1. Analyze trend, ATR, trigger context, and recent performance.
+1. Analyze structure, participation, trigger context, execution quality, and recent performance.
 2. Decide one of HOLD, BUY, SELL, REDUCE, EXIT at the portfolio level.
 3. If entering or reducing, populate orders and include take_profit / stop_loss when appropriate.
 4. Distinguish opportunity triggers vs risk triggers. Opportunity triggers mean closer monitoring; risk triggers mean more conservative execution.
 5. Review existing open orders and avoid duplicate or conflicting orders for the same symbol.
-6. If liquidation risk, cooldown pressure, drawdown pressure, wide spread, or unfavorable funding is elevated, prefer REDUCE or EXIT over new exposure.
+6. If liquidation risk, cooldown pressure, drawdown pressure, wide spread, weak depth, or unfavorable funding is elevated, prefer REDUCE or EXIT over new exposure.
 7. In trigger mode, prioritize risk reduction. Avoid new positions unless uniquely supported by long_term_memory.
 8. Consider idempotency and avoid repeating a failed request from recent_journal_context.
 9. Put identified risks in risk_notes.
 10. All text fields must be English.
 11. When market_context contains multiple symbols, compare them and only place orders on the strongest justified symbols.
-12. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
-13. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
-14. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14 or risk_state.cooldown_remaining_minutes.
-15. If operator is not note, threshold is required. If operator is note, threshold must be null.
-16. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+12. Do not force a trade just because an opportunity trigger exists.
+13. A breakout without volume, open-interest support, or acceptable execution quality is weak.
+14. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
+15. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
+16. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
+17. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, or risk_state.cooldown_remaining_minutes.
+18. If operator is not note, threshold is required. If operator is note, threshold must be null.
+19. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
 
 OUTPUT EXAMPLE
 {{
   "decision":"BUY",
   "orders":[{{"symbol":"BTCUSDT","action":"BUY","order_type":"MARKET","quantity":0.01,"price":null,"reduce_only":false,"take_profit":31200.0,"stop_loss":29850.0}}],
-  "rationale":["BTC 15m momentum and volume confirm continuation above the hourly range."],
-  "rationale_items":[{{"summary":"BTC momentum confirmation on 15m breakout","why_it_matters":"Momentum and participation are aligned with continuation risk/reward.","trade_implication":"Allows one small long entry with defined exit levels.","failure_mode":"Invalidate if the breakout loses volume or falls back inside the 1h range.","evidence":[{{"signal":"volume_ratio","symbol":"BTCUSDT","timeframe":"15m","operator":"gte","observed_value":2.4,"threshold":1.8,"units":"ratio","source":"market_snapshots.BTCUSDT.timeframes.15m.volume_ratio","confidence_contribution":0.3}},{{"signal":"last_close","symbol":"BTCUSDT","timeframe":"1h","operator":"cross_up","observed_value":30120.0,"threshold":30000.0,"units":"usdt","source":"market_snapshots.BTCUSDT.timeframes.1h.last_close","confidence_contribution":0.2}}]}}],
+  "rationale":["BTC breakout has volume and open-interest follow-through while execution quality remains acceptable."],
+  "rationale_items":[{{"summary":"BTC breakout has participation and acceptable execution quality","why_it_matters":"Continuation setups are stronger when structure, participation, and execution quality align.","trade_implication":"Allows one small long entry with defined risk.","failure_mode":"Invalidate if the breakout loses participation or falls back through the invalidation level.","evidence":[{{"signal":"volume_ratio_15m","symbol":"BTCUSDT","timeframe":"15m","operator":"gte","observed_value":2.1,"threshold":1.8,"units":"ratio","source":"market_snapshots.BTCUSDT.volume_ratio_15m","confidence_contribution":0.22}},{{"signal":"oi_change_15m","symbol":"BTCUSDT","timeframe":"15m","operator":"gt","observed_value":3.4,"threshold":0.0,"units":"pct","source":"market_snapshots.BTCUSDT.oi_change_15m","confidence_contribution":0.18}},{{"signal":"spread_percentile_1h","symbol":"BTCUSDT","timeframe":"risk","operator":"lte","observed_value":42.0,"threshold":70.0,"units":"percentile","source":"market_snapshots.BTCUSDT.spread_percentile_1h","confidence_contribution":0.1}},{{"signal":"distance_to_invalid_level","symbol":"BTCUSDT","timeframe":"1h","operator":"lte","observed_value":0.9,"threshold":1.2,"units":"atr","source":"market_snapshots.BTCUSDT.distance_to_invalid_level","confidence_contribution":0.14}}]}}],
   "risk_notes":["Wide spread or negative follow-through would invalidate the setup."],
   "confidence":0.62
 }}

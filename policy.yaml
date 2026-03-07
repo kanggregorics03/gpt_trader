@@ -20,6 +20,7 @@ risk_limits:
       max_open_positions: 1
       max_order_notional_pct_balance: 35
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+      block_additional_entries_when_position_exists: true
     cooldown:
       max_open_positions: 2
       max_order_notional_pct_balance: 0
@@ -36,8 +37,7 @@ intervals:
 
 adaptive_loop:
   materialization_minutes: 5
-  trigger_min_duration_minutes: 15
-  trigger_clear_cycles: 3
+  trigger_clear_cycles: 2
   position_min_duration_minutes: 30
   flat_clear_cycles: 4
   recent_execution_window_minutes: 20

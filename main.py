@@ -1,5 +1,5 @@
-import os
 import hashlib
+import os
 import subprocess
 import sys
 import time
@@ -49,13 +49,13 @@ class TradingOrchestrator:
         "base_loop_minutes": 60,
         "position_loop_minutes": 15,
         "trigger_loop_minutes": 5,
-        "trigger_min_duration_minutes": 15,
-        "trigger_clear_cycles": 3,
+        "trigger_clear_cycles": 2,
         "position_min_duration_minutes": 30,
         "flat_clear_cycles": 4,
         "recent_execution_window_minutes": 20,
         "recent_close_window_minutes": 20,
         "poll_seconds": 1,
+        "trade_case_snapshot_poll_seconds": 5,
     }
     DEFAULT_PRIVATE_ACCOUNT_WS = {
         "reconcile_ttl_ms": 600000,
@@ -314,11 +314,8 @@ class TradingOrchestrator:
         config["base_loop_minutes"] = max(5, int(config.get("base_loop_minutes", 60) or 60))
         config["position_loop_minutes"] = max(1, int(config.get("position_loop_minutes", 15) or 15))
         config["trigger_loop_minutes"] = max(1, int(config.get("trigger_loop_minutes", 5) or 5))
-        config["trigger_min_duration_minutes"] = max(
-            config["trigger_loop_minutes"],
-            int(config.get("trigger_min_duration_minutes", 15) or 15),
-        )
-        config["trigger_clear_cycles"] = max(1, int(config.get("trigger_clear_cycles", 3) or 3))
+        config.pop("trigger_min_duration_minutes", None)
+        config["trigger_clear_cycles"] = max(1, int(config.get("trigger_clear_cycles", 2) or 2))
         config["position_min_duration_minutes"] = max(
             config["position_loop_minutes"],
             int(config.get("position_min_duration_minutes", 30) or 30),
@@ -333,6 +330,10 @@ class TradingOrchestrator:
             int(config.get("recent_close_window_minutes", 20) or 20),
         )
         config["poll_seconds"] = max(1, int(config.get("poll_seconds", 1) or 1))
+        config["trade_case_snapshot_poll_seconds"] = max(
+            1,
+            int(config.get("trade_case_snapshot_poll_seconds", 5) or 5),
+        )
         return config
 
     def _initialize_runtime_state(self):
@@ -345,6 +346,8 @@ class TradingOrchestrator:
         self.last_close_at = None
         self.last_recovery_sweep_at = 0.0
         self.last_daily_batch_date = None
+        self.last_trade_case_snapshot_at = 0.0
+        self.last_similar_case_matches = []
 
     def _loop_minutes_for_mode(self, mode: str) -> int:
         mapping = {
@@ -434,13 +437,7 @@ class TradingOrchestrator:
 
         if current_mode == "5m":
             self.trigger_clear_streak += 1
-            held_long_enough = (now_epoch - self.active_loop_mode_since) >= (
-                self.adaptive_loop_config["trigger_min_duration_minutes"] * 60
-            )
-            if (
-                not held_long_enough
-                or self.trigger_clear_streak < self.adaptive_loop_config["trigger_clear_cycles"]
-            ):
+            if self.trigger_clear_streak < self.adaptive_loop_config["trigger_clear_cycles"]:
                 return current_mode
             previous = self.active_loop_mode
             self.active_loop_mode = desired_mode
@@ -496,6 +493,18 @@ class TradingOrchestrator:
                 "React to active opportunity triggers quickly while respecting trigger-mode risk limits."
             )
             effective_profile["allowed_actions"] = allowed_actions
+            if (
+                bool(effective_profile.get("block_additional_entries_when_position_exists", False))
+                and self._has_live_positions(account_state)
+            ):
+                effective_profile["cycle_guidance"] = (
+                    "React to active opportunity triggers while managing existing exposure. "
+                    "Do not open additional trigger-mode entries when a live position already exists."
+                )
+                effective_profile["allowed_actions"] = [
+                    action for action in allowed_actions
+                    if action in ("HOLD", "REDUCE", "EXIT")
+                ]
         else:
             effective_profile["cycle_role"] = "strategy"
             effective_profile["cycle_guidance"] = (
@@ -640,8 +649,279 @@ class TradingOrchestrator:
             "risk_trigger_symbols": row.get("risk_trigger_symbols") or [],
             "evidence_quality": row.get("evidence_quality") or {},
             "entry_size_cap": row.get("entry_size_cap") or {},
+            "trade_case_ids": row.get("trade_case_ids") or [],
+            "case_statuses": row.get("case_statuses") or {},
+            "case_summary": row.get("case_summary") or "",
+            "similarity_score": row.get("similarity_score"),
+            "matched_features": row.get("matched_features") or [],
             "summary": row.get("summary"),
         }
+
+    def _build_market_case_signature(self, market_snapshots, risk_mode: str) -> dict:
+        symbols = set(market_snapshots.keys())
+        trigger_reasons = set()
+        risk_trigger_reasons = set()
+        regime_tags = set()
+        for symbol, snapshot in (market_snapshots or {}).items():
+            for reason in getattr(snapshot, "opportunity_trigger_reasons", []) or []:
+                trigger_reasons.add(f"{symbol}:{reason}")
+            for reason in getattr(snapshot, "risk_trigger_reasons", []) or []:
+                risk_trigger_reasons.add(f"{symbol}:{reason}")
+            trend_alignment = str(getattr(snapshot.regime, "trend_alignment", "") or "").strip()
+            volatility_regime = str(getattr(snapshot.regime, "volatility_regime", "") or "").strip()
+            if trend_alignment:
+                regime_tags.add(f"trend:{trend_alignment}")
+            if volatility_regime:
+                regime_tags.add(f"volatility:{volatility_regime}")
+        return {
+            "symbols": symbols,
+            "trigger_reasons": trigger_reasons,
+            "risk_trigger_reasons": risk_trigger_reasons,
+            "regime_tags": regime_tags,
+            "risk_mode": str(risk_mode or ""),
+        }
+
+    def _serialize_market_snapshots(self, market_snapshots) -> dict[str, dict]:
+        serialized = {}
+        for symbol, snapshot in (market_snapshots or {}).items():
+            if hasattr(snapshot, "model_dump"):
+                serialized[str(symbol)] = snapshot.model_dump(mode="json")
+            elif isinstance(snapshot, dict):
+                serialized[str(symbol)] = dict(snapshot)
+        return serialized
+
+    def _build_current_market_vectors(self, market_snapshots, account_state=None, risk_state=None) -> dict[str, list[float]]:
+        rag_engine = getattr(self, "rag_engine", None)
+        if rag_engine is None or not hasattr(rag_engine, "build_market_vectors"):
+            return {}
+        serialized_snapshots = self._serialize_market_snapshots(market_snapshots)
+        if not serialized_snapshots:
+            return {}
+        account_payload = (
+            account_state.model_dump(mode="json")
+            if hasattr(account_state, "model_dump")
+            else (dict(account_state or {}) if isinstance(account_state, dict) else None)
+        )
+        risk_payload = (
+            risk_state.model_dump(mode="json")
+            if hasattr(risk_state, "model_dump")
+            else (dict(risk_state or {}) if isinstance(risk_state, dict) else None)
+        )
+        try:
+            return rag_engine.build_market_vectors(
+                serialized_snapshots,
+                account_state=account_payload,
+                risk_state=risk_payload,
+            )
+        except Exception:
+            return {}
+
+    def _search_trade_case_vector_matches(
+        self,
+        current_feature_vectors: dict[str, list[float]],
+        risk_mode: str,
+        limit: int = 24,
+    ) -> dict[str, dict]:
+        if not current_feature_vectors:
+            return {}
+        fetch_candidates = getattr(self.state_store, "get_trade_case_vector_candidates", None)
+        fetch_band_candidates = getattr(self.state_store, "get_trade_case_vector_band_candidates", None)
+        if not callable(fetch_candidates) or getattr(self, "rag_engine", None) is None:
+            return {}
+        symbols = sorted({str(symbol) for symbol in current_feature_vectors.keys() if str(symbol).strip()})
+        raw_candidates = []
+        seen_trade_case_ids = set()
+        if callable(fetch_band_candidates):
+            for row in fetch_band_candidates(
+                current_feature_vectors=current_feature_vectors,
+                limit=max(limit * 12, 120),
+                statuses=["closed", "open", "active", "opened", "reduced"],
+            ) or []:
+                trade_case_id = str(row.get("trade_case_id") or "").strip()
+                if not trade_case_id or trade_case_id in seen_trade_case_ids:
+                    continue
+                seen_trade_case_ids.add(trade_case_id)
+                raw_candidates.append(dict(row, retrieval_source="band_index"))
+        if len(raw_candidates) < max(limit * 3, 24):
+            for row in fetch_candidates(limit=max(limit * 10, 100), symbols=symbols) or []:
+                trade_case_id = str(row.get("trade_case_id") or "").strip()
+                if not trade_case_id or trade_case_id in seen_trade_case_ids:
+                    continue
+                seen_trade_case_ids.add(trade_case_id)
+                raw_candidates.append(dict(row, retrieval_source="full_scan"))
+        ranked = []
+        for row in raw_candidates or []:
+            trade_case_id = str(row.get("trade_case_id") or "").strip()
+            feature_vector = row.get("feature_vector") or []
+            symbol = str(row.get("symbol") or "").strip()
+            if not trade_case_id or not feature_vector:
+                continue
+            comparison_vectors = []
+            if symbol and current_feature_vectors.get(symbol):
+                comparison_vectors.append((symbol, current_feature_vectors[symbol]))
+            else:
+                comparison_vectors.extend((candidate_symbol, vector) for candidate_symbol, vector in current_feature_vectors.items())
+            best_similarity = 0.0
+            matched_symbol = symbol or ""
+            for candidate_symbol, current_vector in comparison_vectors:
+                similarity = self.rag_engine._cosine_similarity(feature_vector, current_vector)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    matched_symbol = candidate_symbol
+            if best_similarity <= 0:
+                continue
+            recency_bonus = 0.0
+            if row.get("closed_at") or row.get("opened_at"):
+                recency_bonus = 0.5
+            pnl = row.get("realized_pnl")
+            if pnl is None:
+                pnl = row.get("estimated_pnl_pct")
+            outcome_bonus = 0.0
+            try:
+                if pnl is not None and float(pnl) < 0:
+                    outcome_bonus = 0.4
+                elif pnl is not None and float(pnl) > 0:
+                    outcome_bonus = 0.2
+            except (TypeError, ValueError):
+                outcome_bonus = 0.0
+            slippage_penalty = 0.0
+            try:
+                slippage_penalty = min(0.3, max(0.0, float(row.get("slippage_bps") or 0.0) / 50.0))
+            except (TypeError, ValueError):
+                slippage_penalty = 0.0
+            risk_mode_bonus = 0.2 if str(row.get("risk_mode") or "") == str(risk_mode or "") else 0.0
+            band_match_bonus = min(0.8, max(0.0, float(row.get("matched_band_count") or 0.0)) * 0.15)
+            final_score = (
+                best_similarity
+                + recency_bonus
+                + outcome_bonus
+                + risk_mode_bonus
+                + band_match_bonus
+                - slippage_penalty
+            )
+            ranked.append(
+                (
+                    final_score,
+                    {
+                        "trade_case_id": trade_case_id,
+                        "symbol": symbol,
+                        "matched_symbol": matched_symbol,
+                        "similarity": round(best_similarity, 4),
+                        "final_score": round(final_score, 4),
+                        "thesis_failure_reason": row.get("thesis_failure_reason"),
+                        "status": row.get("status"),
+                        "slippage_bps": row.get("slippage_bps"),
+                        "matched_band_count": int(row.get("matched_band_count") or 0),
+                        "retrieval_source": str(row.get("retrieval_source") or "full_scan"),
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return {item["trade_case_id"]: item for _, item in ranked[: max(1, limit)]}
+
+    def _score_journal_case_similarity(
+        self,
+        row,
+        current_signature: dict,
+        trade_case_lookup: dict[str, dict],
+        vector_match_lookup: dict[str, dict],
+        row_index: int,
+    ) -> tuple[float, list[str]]:
+        score = 0.0
+        matched_features: list[str] = []
+        decision = str(row.get("decision") or "HOLD").upper()
+        if decision in ("BUY", "SELL", "REDUCE", "EXIT"):
+            score += 12.0
+            matched_features.append(f"decision:{decision}")
+        if bool(row.get("loss_signal")):
+            score += 8.0
+            matched_features.append("loss_signal")
+        if str(row.get("risk_mode") or "") == current_signature["risk_mode"]:
+            score += 8.0
+            matched_features.append("risk_mode")
+        if row.get("estimated_pnl_pct") is not None:
+            score += 3.0
+            matched_features.append("has_pnl")
+        trigger_symbols = set(row.get("trigger_symbols") or [])
+        risk_trigger_symbols = set(row.get("risk_trigger_symbols") or [])
+        evidence_symbols = self._extract_symbols_from_rationale_items(row.get("rationale_items") or [])
+        symbol_overlap = current_signature["symbols"].intersection(trigger_symbols | risk_trigger_symbols | evidence_symbols)
+        if symbol_overlap:
+            score += 10.0
+            matched_features.append("symbol_overlap")
+        if str(row.get("risk_reason") or "") not in ("", "Approved", "Safe action."):
+            score += 2.0
+            matched_features.append("non_default_risk_reason")
+
+        case_statuses = row.get("case_statuses") or {}
+        if any(status in ("opened", "closed", "reduced") for status in case_statuses.values()):
+            score += 4.0
+            matched_features.append("case_status")
+
+        for trade_case_id in row.get("trade_case_ids") or []:
+            trade_case = trade_case_lookup.get(trade_case_id) or {}
+            if not trade_case:
+                continue
+            if str(trade_case.get("risk_mode") or "") == current_signature["risk_mode"]:
+                score += 4.0
+                matched_features.append("case_risk_mode")
+            if trade_case.get("symbol") in current_signature["symbols"]:
+                score += 8.0
+                matched_features.append("case_symbol")
+            trigger_overlap = current_signature["trigger_reasons"].intersection(
+                {f"{trade_case.get('symbol')}:{reason}" for reason in (trade_case.get("trigger_reasons") or [])}
+            )
+            if trigger_overlap:
+                score += 8.0
+                matched_features.append("trigger_overlap")
+            risk_trigger_overlap = current_signature["risk_trigger_reasons"].intersection(
+                {f"{trade_case.get('symbol')}:{reason}" for reason in (trade_case.get("risk_trigger_reasons") or [])}
+            )
+            if risk_trigger_overlap:
+                score += 6.0
+                matched_features.append("risk_trigger_overlap")
+            case_payload = trade_case.get("payload") or {}
+            case_regime_tags = set(case_payload.get("regime_tags") or [])
+            if case_regime_tags and current_signature["regime_tags"].intersection(case_regime_tags):
+                score += 5.0
+                matched_features.append("regime_overlap")
+            evidence_overlap = set(trade_case.get("evidence_signals") or []).intersection(
+                set((case_payload.get("entry_evidence_signals") or []))
+            )
+            if evidence_overlap:
+                score += 2.0
+                matched_features.append("case_evidence")
+            status = str(trade_case.get("status") or "")
+            realized_pnl = trade_case.get("realized_pnl")
+            estimated_pnl_pct = trade_case.get("estimated_pnl_pct")
+            if status == "closed":
+                score += 4.0
+                matched_features.append("closed_case")
+                if (realized_pnl is not None and float(realized_pnl) < 0) or (
+                    estimated_pnl_pct is not None and float(estimated_pnl_pct) < 0
+                ):
+                    score += 4.0
+                    matched_features.append("closed_loss")
+                elif (realized_pnl is not None and float(realized_pnl) > 0) or (
+                    estimated_pnl_pct is not None and float(estimated_pnl_pct) > 0
+                ):
+                    score += 2.0
+                    matched_features.append("closed_win")
+            vector_match = vector_match_lookup.get(trade_case_id) or {}
+            best_similarity = float(vector_match.get("similarity") or 0.0)
+            if best_similarity > 0:
+                score += min(18.0, best_similarity * 18.0)
+                matched_features.append(f"vector_similarity:{best_similarity:.2f}")
+                if vector_match.get("matched_symbol"):
+                    matched_features.append(f"vector_symbol:{vector_match.get('matched_symbol')}")
+                if vector_match.get("retrieval_source"):
+                    matched_features.append(f"vector_source:{vector_match.get('retrieval_source')}")
+                if vector_match.get("thesis_failure_reason"):
+                    matched_features.append("vector_failure_reason")
+
+        score += max(0.0, 5.0 - (row_index * 0.2))
+        deduped_features = list(dict.fromkeys(matched_features))
+        return score, deduped_features
 
     def _select_recent_journal_context(
         self,
@@ -651,39 +931,51 @@ class TradingOrchestrator:
         limit: int,
         max_rationale_items: int,
         max_evidence_per_item: int,
+        trade_cases=None,
+        account_state=None,
+        risk_state=None,
     ):
         if not rows:
             return []
-        current_symbols = set(market_snapshots.keys())
+        current_signature = self._build_market_case_signature(market_snapshots, risk_mode=risk_mode)
+        current_feature_vectors = self._build_current_market_vectors(
+            market_snapshots,
+            account_state=account_state,
+            risk_state=risk_state,
+        )
+        vector_match_lookup = self._search_trade_case_vector_matches(
+            current_feature_vectors=current_feature_vectors,
+            risk_mode=risk_mode,
+            limit=max(limit * 6, 18),
+        )
+        trade_case_lookup = {
+            str((case or {}).get("trade_case_id") or ""): (case or {})
+            for case in (trade_cases or [])
+            if (case or {}).get("trade_case_id")
+        }
+        for trade_case_id in vector_match_lookup.keys():
+            if trade_case_id not in trade_case_lookup:
+                trade_case = self.state_store.get_trade_case(trade_case_id)
+                if trade_case:
+                    trade_case_lookup[trade_case_id] = trade_case
         scored = []
         for index, row in enumerate(rows):
-            score = 0.0
-            decision = str(row.get("decision") or "HOLD").upper()
-            if decision in ("BUY", "SELL", "REDUCE", "EXIT"):
-                score += 12.0
-            if bool(row.get("loss_signal")):
-                score += 10.0
-            if str(row.get("risk_mode") or "") == str(risk_mode or ""):
-                score += 8.0
-            if row.get("estimated_pnl_pct") is not None:
-                score += 4.0
-            trigger_symbols = set(row.get("trigger_symbols") or [])
-            risk_trigger_symbols = set(row.get("risk_trigger_symbols") or [])
-            evidence_symbols = self._extract_symbols_from_rationale_items(row.get("rationale_items") or [])
-            if current_symbols and current_symbols.intersection(trigger_symbols):
-                score += 10.0
-            if current_symbols and current_symbols.intersection(risk_trigger_symbols):
-                score += 8.0
-            if current_symbols and current_symbols.intersection(evidence_symbols):
-                score += 6.0
-            if str(row.get("risk_reason") or "") not in ("", "Approved", "Safe action."):
-                score += 2.0
-            score += max(0.0, 6.0 - (index * 0.25))
-            scored.append((score, index, row))
+            score, matched_features = self._score_journal_case_similarity(
+                row=row,
+                current_signature=current_signature,
+                trade_case_lookup=trade_case_lookup,
+                vector_match_lookup=vector_match_lookup,
+                row_index=index,
+            )
+            enriched_row = dict(row)
+            enriched_row["similarity_score"] = round(score, 4)
+            enriched_row["matched_features"] = matched_features
+            scored.append((score, index, enriched_row))
 
         selected = sorted(scored, key=lambda item: (-item[0], item[1]))[: max(1, limit)]
         selected_indices = {index for _, index, _ in selected}
-        ordered_rows = [rows[index] for index in range(len(rows)) if index in selected_indices]
+        selected_rows = {index: row for _, index, row in selected}
+        ordered_rows = [selected_rows[index] for index in range(len(rows)) if index in selected_indices]
         return [
             self._compact_recent_journal_row(
                 row,
@@ -779,8 +1071,72 @@ class TradingOrchestrator:
         is_trigger_mode: bool,
         limit: int = 5,
     ):
+        self.last_similar_case_matches = []
         if not is_trigger_mode:
             return []
+        current_feature_vectors = self._build_current_market_vectors(
+            market_snapshots,
+            account_state=account_state,
+            risk_state=risk_state,
+        )
+        vector_matches = self._search_trade_case_vector_matches(
+            current_feature_vectors=current_feature_vectors,
+            risk_mode="trigger" if is_trigger_mode else "",
+            limit=max(limit * 3, 12),
+        )
+        cases = []
+        seen = set()
+        for trade_case_id, match in sorted(
+            vector_matches.items(),
+            key=lambda item: float((item[1] or {}).get("final_score") or 0.0),
+            reverse=True,
+        ):
+            trade_case = self.state_store.get_trade_case(trade_case_id)
+            if not trade_case:
+                continue
+            symbol = str(trade_case.get("symbol") or match.get("matched_symbol") or "UNKNOWN")
+            if symbol in market_snapshots and not market_snapshots[symbol].is_opportunity_trigger and any(
+                snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
+            ):
+                continue
+            pnl = trade_case.get("realized_pnl")
+            if pnl is None:
+                pnl = trade_case.get("estimated_pnl_pct")
+            failure_reason = trade_case.get("thesis_failure_reason") or "none"
+            case_text = (
+                f"{symbol}: Similarity {float(match.get('similarity') or 0.0):.2f}; "
+                f"status={trade_case.get('status')}; pnl={pnl}; "
+                f"slippage_bps={trade_case.get('slippage_bps')}; "
+                f"failure_reason={failure_reason}; "
+                f"source={match.get('retrieval_source') or 'full_scan'}"
+            )
+            if case_text in seen:
+                continue
+            seen.add(case_text)
+            self.last_similar_case_matches.append(
+                {
+                    "context_type": "similar_past_cases",
+                    "rank_index": len(cases) + 1,
+                    "trade_case_id": trade_case_id,
+                    "case_symbol": symbol,
+                    "matched_symbol": match.get("matched_symbol") or symbol,
+                    "similarity": match.get("similarity"),
+                    "final_score": match.get("final_score"),
+                    "retrieval_source": match.get("retrieval_source") or "full_scan",
+                    "matched_band_count": match.get("matched_band_count") or 0,
+                    "payload": {
+                        "status": trade_case.get("status"),
+                        "thesis_failure_reason": failure_reason,
+                        "slippage_bps": trade_case.get("slippage_bps"),
+                    },
+                }
+            )
+            cases.append(case_text)
+            if len(cases) >= max(1, int(limit or 1)):
+                return cases[: max(1, int(limit or 1))]
+
+        if cases:
+            return cases[: max(1, int(limit or 1))]
 
         account_payload = (
             account_state.model_dump(mode="json")
@@ -803,8 +1159,6 @@ class TradingOrchestrator:
             risk_state=risk_payload,
         )
 
-        cases = []
-        seen = set()
         for symbol, raw_cases in batch_cases.items():
             if not market_snapshots[symbol].is_opportunity_trigger and any(
                 snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
@@ -815,10 +1169,64 @@ class TradingOrchestrator:
                 if tagged_case in seen:
                     continue
                 seen.add(tagged_case)
+                self.last_similar_case_matches.append(
+                    {
+                        "context_type": "similar_past_cases",
+                        "rank_index": len(cases) + 1,
+                        "trade_case_id": None,
+                        "case_symbol": symbol,
+                        "matched_symbol": symbol,
+                        "similarity": None,
+                        "final_score": None,
+                        "retrieval_source": "rag_fallback",
+                        "matched_band_count": 0,
+                        "payload": {"raw_case": case},
+                    }
+                )
                 cases.append(tagged_case)
                 if len(cases) >= max(1, int(limit or 1)):
                     return cases[: max(1, int(limit or 1))]
         return cases[: max(1, int(limit or 1))]
+
+    def _save_retrieval_evaluations_for_audit(
+        self,
+        audit_log_id: int | None,
+        intent,
+        estimated_pnl_pct: float | None,
+        risk_mode: str,
+    ) -> None:
+        if not audit_log_id or not hasattr(self.state_store, "save_retrieval_evaluations"):
+            return
+        raw_matches = list(getattr(self, "last_similar_case_matches", []) or [])
+        if not raw_matches:
+            return
+        decision_symbols = {
+            str(getattr(order, "symbol", "") or "").strip()
+            for order in (getattr(intent, "orders", []) or [])
+            if str(getattr(order, "symbol", "") or "").strip()
+        }
+        entries = []
+        for index, match in enumerate(raw_matches, start=1):
+            matched_symbol = str(match.get("matched_symbol") or match.get("case_symbol") or "").strip()
+            entries.append(
+                {
+                    "context_type": str(match.get("context_type") or "similar_past_cases"),
+                    "rank_index": int(match.get("rank_index") or index),
+                    "trade_case_id": match.get("trade_case_id"),
+                    "case_symbol": match.get("case_symbol"),
+                    "matched_symbol": matched_symbol,
+                    "decision": getattr(intent, "decision", None),
+                    "decision_symbol_aligned": bool(matched_symbol and matched_symbol in decision_symbols),
+                    "estimated_pnl_pct": estimated_pnl_pct,
+                    "similarity": match.get("similarity"),
+                    "final_score": match.get("final_score"),
+                    "retrieval_source": match.get("retrieval_source"),
+                    "matched_band_count": match.get("matched_band_count") or 0,
+                    "risk_mode": risk_mode,
+                    "payload": match.get("payload") or {},
+                }
+            )
+        self.state_store.save_retrieval_evaluations(audit_log_id, entries)
 
     def _build_position_ledger_entries(self, intent, fills, execution_summary):
         if not fills:
@@ -962,6 +1370,773 @@ class TradingOrchestrator:
                 }
             )
         return entries
+
+    def _make_trade_case_id(self, symbol: str, audit_log_id: int, observed_at: str) -> str:
+        case_seed = f"{symbol}|{audit_log_id}|{observed_at}"
+        digest = hashlib.sha1(case_seed.encode("utf-8")).hexdigest()[:10]
+        compact_ts = (
+            str(observed_at or "")
+            .replace("-", "")
+            .replace(":", "")
+            .replace(" ", "T")
+        )
+        return f"{symbol}-{compact_ts}-{digest}"
+
+    def _calculate_holding_minutes(self, opened_at: str | None, closed_at: str | None) -> float | None:
+        if not opened_at or not closed_at:
+            return None
+        try:
+            opened_dt = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+            closed_dt = datetime.strptime(closed_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        elapsed_seconds = max(0.0, (closed_dt - opened_dt).total_seconds())
+        return round(elapsed_seconds / 60.0, 2)
+
+    def _get_positions_by_symbol(self, account_state) -> dict[str, object]:
+        if account_state is None:
+            return {}
+        return {
+            position.symbol: position
+            for position in getattr(account_state, "positions", []) or []
+            if getattr(position, "symbol", None)
+        }
+
+    def _get_symbol_observed_pnl_pct(self, symbol: str, before_state, after_state) -> float | None:
+        positions_after = self._get_positions_by_symbol(after_state)
+        positions_before = self._get_positions_by_symbol(before_state)
+        after_position = positions_after.get(symbol)
+        before_position = positions_before.get(symbol)
+        for candidate in (after_position, before_position):
+            if candidate is None:
+                continue
+            try:
+                return float(getattr(candidate, "unrealized_pnl_pct", None))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _get_symbol_entry_price(self, symbol: str, before_state, after_state) -> float | None:
+        positions_after = self._get_positions_by_symbol(after_state)
+        positions_before = self._get_positions_by_symbol(before_state)
+        for candidate in (positions_after.get(symbol), positions_before.get(symbol)):
+            if candidate is None:
+                continue
+            try:
+                entry_price = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if entry_price > 0:
+                return entry_price
+        return None
+
+    def _get_symbol_entry_side(self, symbol: str, before_state, after_state, symbol_orders: list) -> str | None:
+        positions_after = self._get_positions_by_symbol(after_state)
+        positions_before = self._get_positions_by_symbol(before_state)
+        for candidate in (positions_after.get(symbol), positions_before.get(symbol)):
+            side = str(getattr(candidate, "side", "") or "").upper()
+            if side in ("LONG", "SHORT"):
+                return side
+        for order in symbol_orders:
+            action = str(getattr(order, "action", "") or "").upper()
+            if action == "BUY":
+                return "LONG"
+            if action == "SELL":
+                return "SHORT"
+        return None
+
+    def _normalize_case_timestamp(self, value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 1_000_000_000_000:
+                timestamp /= 1000.0
+            try:
+                return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return self._normalize_case_timestamp(int(text))
+        candidate = text.replace("T", " ").replace("Z", "")
+        if "." in candidate:
+            candidate = candidate.split(".", 1)[0]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                return parsed.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+    def _get_symbol_fill_boundary_timestamp(
+        self,
+        audit_log_id: int | None,
+        symbol: str,
+        boundary: str,
+    ) -> str | None:
+        if not audit_log_id or not symbol or not hasattr(self.state_store, "get_execution_fills"):
+            return None
+        fills = self.state_store.get_execution_fills(audit_log_id)
+        normalized = []
+        for fill in fills or []:
+            if str(fill.get("symbol") or "") != symbol:
+                continue
+            fill_timestamp = self._normalize_case_timestamp(fill.get("fill_timestamp"))
+            if fill_timestamp:
+                normalized.append(fill_timestamp)
+        if not normalized:
+            return None
+        return min(normalized) if boundary == "first" else max(normalized)
+
+    def _resolve_trade_case_snapshot_window(
+        self,
+        symbol: str,
+        trade_case: dict | None,
+        entry_audit_log_id: int | None = None,
+        exit_audit_log_id: int | None = None,
+        fallback_opened_at: str | None = None,
+        fallback_closed_at: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        trade_case = dict(trade_case or {})
+        start_timestamp = self._get_symbol_fill_boundary_timestamp(
+            entry_audit_log_id or trade_case.get("entry_audit_log_id"),
+            symbol,
+            boundary="first",
+        )
+        end_timestamp = self._get_symbol_fill_boundary_timestamp(
+            exit_audit_log_id or trade_case.get("exit_audit_log_id"),
+            symbol,
+            boundary="last",
+        )
+        start_timestamp = start_timestamp or self._normalize_case_timestamp(
+            fallback_opened_at or trade_case.get("opened_at")
+        )
+        end_timestamp = end_timestamp or self._normalize_case_timestamp(
+            fallback_closed_at or trade_case.get("closed_at")
+        )
+        if start_timestamp and end_timestamp and start_timestamp > end_timestamp:
+            end_timestamp = None
+        return start_timestamp, end_timestamp
+
+    def _recompute_trade_case_excursions(
+        self,
+        trade_case_id: str | None,
+        symbol: str | None = None,
+        trade_case: dict | None = None,
+        entry_audit_log_id: int | None = None,
+        exit_audit_log_id: int | None = None,
+        fallback_opened_at: str | None = None,
+        fallback_closed_at: str | None = None,
+        current_observed_pnl_pct: float | None = None,
+    ) -> tuple[float | None, float | None]:
+        if not trade_case_id or not hasattr(self.state_store, "get_trade_case_snapshots"):
+            return current_observed_pnl_pct, current_observed_pnl_pct
+        snapshots = []
+        start_timestamp = None
+        end_timestamp = None
+        if symbol:
+            start_timestamp, end_timestamp = self._resolve_trade_case_snapshot_window(
+                symbol=symbol,
+                trade_case=trade_case,
+                entry_audit_log_id=entry_audit_log_id,
+                exit_audit_log_id=exit_audit_log_id,
+                fallback_opened_at=fallback_opened_at,
+                fallback_closed_at=fallback_closed_at,
+            )
+        window_applied = bool(start_timestamp or end_timestamp)
+        if hasattr(self.state_store, "get_trade_case_snapshots_between") and window_applied:
+            snapshots = self.state_store.get_trade_case_snapshots_between(
+                trade_case_id,
+                start_timestamp=start_timestamp,
+                end_timestamp=end_timestamp,
+            )
+        if not snapshots and not window_applied:
+            snapshots = self.state_store.get_trade_case_snapshots(trade_case_id)
+        pnl_path = []
+        for snapshot in snapshots:
+            try:
+                if snapshot.get("unrealized_pnl_pct") is not None:
+                    pnl_path.append(float(snapshot["unrealized_pnl_pct"]))
+            except (TypeError, ValueError):
+                continue
+        if current_observed_pnl_pct is not None:
+            pnl_path.append(float(current_observed_pnl_pct))
+        if not pnl_path:
+            return None, None
+        return max(pnl_path), min(pnl_path)
+
+    def _build_trade_case_feature_vector(
+        self,
+        symbol: str,
+        market_snapshots,
+        account_state,
+        risk_state,
+    ) -> list[float]:
+        if symbol not in (market_snapshots or {}):
+            return []
+        vectors = self._build_current_market_vectors(
+            {symbol: market_snapshots.get(symbol)},
+            account_state=account_state,
+            risk_state=risk_state,
+        )
+        return list(vectors.get(symbol) or [])
+
+    def _build_trade_case_snapshot_entries(
+        self,
+        audit_log_id: int | None,
+        observed_at: str,
+        account_state,
+        market_snapshots,
+        symbol_journal_entries: list[dict],
+    ) -> list[dict]:
+        fetch_active_cases = getattr(self.state_store, "get_all_active_trade_cases", None)
+        active_cases = fetch_active_cases() if callable(fetch_active_cases) else []
+        active_by_symbol = {
+            str((row or {}).get("symbol") or ""): (row or {})
+            for row in (active_cases or [])
+            if (row or {}).get("symbol") and (row or {}).get("trade_case_id")
+        }
+        entries_by_symbol = {
+            str((row or {}).get("symbol") or ""): (row or {})
+            for row in (symbol_journal_entries or [])
+            if (row or {}).get("symbol") and (row or {}).get("trade_case_id")
+        }
+        positions_by_symbol = self._get_positions_by_symbol(account_state)
+        snapshot_entries = []
+        for symbol in sorted(set(active_by_symbol.keys()) | set(entries_by_symbol.keys())):
+            case_entry = entries_by_symbol.get(symbol) or {}
+            active_case = active_by_symbol.get(symbol) or {}
+            trade_case_id = case_entry.get("trade_case_id") or active_case.get("trade_case_id")
+            if not trade_case_id:
+                continue
+            snapshot = market_snapshots.get(symbol) if isinstance(market_snapshots, dict) else None
+            position = positions_by_symbol.get(symbol)
+            order_book = getattr(snapshot, "order_book", None) if snapshot is not None else None
+            unrealized_pnl_pct = case_entry.get("observed_pnl_pct")
+            if unrealized_pnl_pct is None and position is not None:
+                unrealized_pnl_pct = getattr(position, "unrealized_pnl_pct", None)
+            snapshot_entries.append(
+                {
+                    "trade_case_id": trade_case_id,
+                    "timestamp": observed_at,
+                    "audit_log_id": audit_log_id,
+                    "symbol": symbol,
+                    "current_price": getattr(snapshot, "current_price", None) if snapshot is not None else None,
+                    "mark_price": getattr(snapshot, "mark_price", None) if snapshot is not None else None,
+                    "mid_price": getattr(order_book, "mid_price", None) if order_book is not None else None,
+                    "spread_bps": getattr(order_book, "spread_bps", None) if order_book is not None else None,
+                    "volume_ratio_15m": getattr(snapshot, "volume_ratio_15m", None) if snapshot is not None else None,
+                    "unrealized_pnl_pct": unrealized_pnl_pct,
+                    "payload": {
+                        "case_status": case_entry.get("case_status") or "active",
+                        "holding_minutes": case_entry.get("holding_minutes"),
+                        "opportunity_trigger_reasons": (
+                            getattr(snapshot, "opportunity_trigger_reasons", []) if snapshot is not None else []
+                        ),
+                        "risk_trigger_reasons": (
+                            getattr(snapshot, "risk_trigger_reasons", []) if snapshot is not None else []
+                        ),
+                    },
+                }
+            )
+        return snapshot_entries
+
+    def _read_live_account_state_for_case_sampling(self):
+        private_feed = getattr(self.account_reader, "private_feed", None)
+        if private_feed is not None:
+            try:
+                ws_state = private_feed.get_account_state(self.symbols)
+                if ws_state is not None:
+                    return ws_state
+            except Exception:
+                pass
+        try:
+            return self.account_reader.get_account_state(self.symbols, force_refresh=False)
+        except Exception:
+            return None
+
+    def _capture_active_trade_case_snapshots(self, now_epoch: float | None = None) -> int:
+        fetch_active_cases = getattr(self.state_store, "get_all_active_trade_cases", None)
+        if not callable(fetch_active_cases):
+            return 0
+        active_cases = fetch_active_cases()
+        if not active_cases:
+            return 0
+        account_state = self._read_live_account_state_for_case_sampling()
+        if account_state is None:
+            return 0
+        positions_by_symbol = self._get_positions_by_symbol(account_state)
+        observed_at = datetime.fromtimestamp(now_epoch or time.time()).strftime("%Y-%m-%d %H:%M:%S")
+        snapshot_entries = []
+        for active_case in active_cases:
+            symbol = str(active_case.get("symbol") or "").strip()
+            trade_case_id = str(active_case.get("trade_case_id") or "").strip()
+            if not symbol or not trade_case_id:
+                continue
+            ticker = None
+            order_book = None
+            if getattr(self, "public_feed", None) is not None:
+                try:
+                    ticker = self.public_feed.get_ticker(symbol)
+                except Exception:
+                    ticker = None
+                try:
+                    order_book = self.public_feed.get_order_book(symbol, limit=10)
+                except Exception:
+                    order_book = None
+            position = positions_by_symbol.get(symbol)
+            best_bid = None
+            best_ask = None
+            if isinstance(order_book, dict):
+                bids = order_book.get("bids") or []
+                asks = order_book.get("asks") or []
+                try:
+                    best_bid = float(bids[0][0]) if bids else None
+                except (TypeError, ValueError, IndexError):
+                    best_bid = None
+                try:
+                    best_ask = float(asks[0][0]) if asks else None
+                except (TypeError, ValueError, IndexError):
+                    best_ask = None
+            mid_price = ((best_bid + best_ask) / 2.0) if best_bid is not None and best_ask is not None else None
+            spread_bps = (
+                ((best_ask - best_bid) / mid_price) * 10000.0
+                if mid_price not in (None, 0.0) and best_bid is not None and best_ask is not None
+                else None
+            )
+            current_price = None
+            mark_price = None
+            if isinstance(ticker, dict):
+                for candidate in (ticker.get("last"), ticker.get("close"), ticker.get("markPrice"), ticker.get("mark")):
+                    try:
+                        value = float(candidate)
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if value > 0:
+                        current_price = value
+                        break
+                for candidate in (ticker.get("markPrice"), ticker.get("mark"), getattr(position, "mark_price", None), current_price):
+                    try:
+                        value = float(candidate)
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if value > 0:
+                        mark_price = value
+                        break
+            if mark_price is None and position is not None:
+                mark_price = getattr(position, "mark_price", None)
+            if current_price is None and mark_price is not None:
+                current_price = mark_price
+            snapshot_entries.append(
+                {
+                    "trade_case_id": trade_case_id,
+                    "timestamp": observed_at,
+                    "audit_log_id": active_case.get("last_audit_log_id"),
+                    "symbol": symbol,
+                    "current_price": current_price,
+                    "mark_price": mark_price,
+                    "mid_price": mid_price,
+                    "spread_bps": round(spread_bps, 6) if spread_bps is not None else None,
+                    "volume_ratio_15m": None,
+                    "unrealized_pnl_pct": getattr(position, "unrealized_pnl_pct", None) if position is not None else None,
+                    "payload": {
+                        "sampling_source": "poll_sampler",
+                        "entry_decision": active_case.get("entry_decision"),
+                        "last_decision": active_case.get("last_decision"),
+                    },
+                }
+            )
+        self.state_store.save_trade_case_snapshots(snapshot_entries)
+        return len(snapshot_entries)
+
+    def _sample_trade_case_paths_if_due(self, now_epoch: float) -> int:
+        interval_seconds = float(self.adaptive_loop_config.get("trade_case_snapshot_poll_seconds", 5) or 5)
+        if interval_seconds <= 0:
+            return 0
+        if self.last_trade_case_snapshot_at and (now_epoch - self.last_trade_case_snapshot_at) < interval_seconds:
+            return 0
+        captured = self._capture_active_trade_case_snapshots(now_epoch=now_epoch)
+        if captured > 0:
+            self.last_trade_case_snapshot_at = now_epoch
+        return captured
+
+    def _estimate_symbol_slippage(
+        self,
+        symbol: str,
+        symbol_orders: list,
+        fills: list[dict],
+        market_snapshots,
+    ) -> tuple[float | None, float | None, float | None]:
+        symbol_fills = [fill for fill in (fills or []) if str(fill.get("symbol") or "") == symbol]
+        if not symbol_fills:
+            return None, None, None
+
+        total_amount = sum(abs(float(fill.get("amount") or 0.0)) for fill in symbol_fills)
+        if total_amount <= 0:
+            return None, None, None
+        avg_fill_price = (
+            sum(float(fill.get("price") or 0.0) * abs(float(fill.get("amount") or 0.0)) for fill in symbol_fills)
+            / total_amount
+        )
+
+        planned_prices = [
+            float(getattr(order, "price", 0.0) or 0.0)
+            for order in (symbol_orders or [])
+            if float(getattr(order, "price", 0.0) or 0.0) > 0
+        ]
+        snapshot = market_snapshots.get(symbol) if isinstance(market_snapshots, dict) else None
+        reference_price = None
+        if planned_prices:
+            reference_price = sum(planned_prices) / len(planned_prices)
+        elif snapshot is not None:
+            for candidate in (
+                getattr(snapshot.order_book, "mid_price", None),
+                getattr(snapshot.order_book, "microprice", None),
+                getattr(snapshot, "current_price", None),
+                getattr(snapshot, "mark_price", None),
+            ):
+                try:
+                    candidate_value = float(candidate)
+                except (TypeError, ValueError):
+                    candidate_value = 0.0
+                if candidate_value > 0:
+                    reference_price = candidate_value
+                    break
+        if not reference_price or reference_price <= 0:
+            return avg_fill_price, None, None
+
+        action = str(getattr(symbol_orders[0], "action", "") or "").upper() if symbol_orders else ""
+        if action == "BUY":
+            adverse_delta = max(0.0, avg_fill_price - reference_price)
+        elif action == "SELL":
+            adverse_delta = max(0.0, reference_price - avg_fill_price)
+        else:
+            adverse_delta = abs(avg_fill_price - reference_price)
+        slippage_cost = round(adverse_delta * total_amount, 8)
+        slippage_bps = round((adverse_delta / reference_price) * 10000.0, 4) if reference_price > 0 else None
+        return avg_fill_price, slippage_cost, slippage_bps
+
+    def _get_symbol_exit_price(self, symbol: str, avg_fill_price: float | None, market_snapshots) -> float | None:
+        if avg_fill_price and avg_fill_price > 0:
+            return avg_fill_price
+        snapshot = market_snapshots.get(symbol) if isinstance(market_snapshots, dict) else None
+        if snapshot is None:
+            return None
+        for candidate in (
+            getattr(snapshot, "current_price", None),
+            getattr(snapshot, "mark_price", None),
+            getattr(snapshot.order_book, "mid_price", None),
+        ):
+            try:
+                candidate_value = float(candidate)
+            except (TypeError, ValueError):
+                candidate_value = 0.0
+            if candidate_value > 0:
+                return candidate_value
+        return None
+
+    def _extract_symbol_failure_mode(self, symbol: str, rationale_items) -> str:
+        for item in rationale_items or []:
+            evidence_rows = (item.evidence or []) if hasattr(item, "evidence") else (item.get("evidence") or [])
+            evidence_symbols = {
+                (e.symbol if hasattr(e, "symbol") else e.get("symbol"))
+                for e in evidence_rows
+            }
+            if evidence_symbols and symbol not in evidence_symbols and None not in evidence_symbols:
+                continue
+            failure_mode = (
+                item.failure_mode if hasattr(item, "failure_mode") else item.get("failure_mode")
+            )
+            if failure_mode:
+                return str(failure_mode)
+        return ""
+
+    def _derive_thesis_failure_reason(
+        self,
+        symbol: str,
+        entry: dict,
+        symbol_snapshot,
+        rationale_items,
+        risk_reason: str,
+        observed_pnl_pct: float | None,
+        realized_pnl: float | None,
+    ) -> str | None:
+        risk_reason_text = str(risk_reason or "").lower()
+        if "kill switch" in risk_reason_text:
+            return "risk_kill_switch"
+        if "cooldown" in risk_reason_text or "drawdown" in risk_reason_text:
+            return "risk_profile_pressure"
+        if symbol_snapshot is not None and getattr(symbol_snapshot, "risk_trigger_reasons", None):
+            return "execution_quality_degraded:" + ",".join(symbol_snapshot.risk_trigger_reasons[:3])
+        failure_mode = self._extract_symbol_failure_mode(symbol, rationale_items)
+        negative_outcome = (
+            (realized_pnl is not None and float(realized_pnl) < 0)
+            or (observed_pnl_pct is not None and float(observed_pnl_pct) < 0)
+            or bool(entry.get("loss_signal"))
+        )
+        if negative_outcome and failure_mode:
+            return failure_mode
+        if negative_outcome and symbol_snapshot is not None and getattr(symbol_snapshot, "opportunity_trigger_reasons", None):
+            return "setup_invalidated:" + ",".join(symbol_snapshot.opportunity_trigger_reasons[:3])
+        if negative_outcome:
+            return "adverse_price_follow_through"
+        return None
+
+    def _annotate_trade_case_entries(
+        self,
+        audit_log_id: int,
+        symbol_journal_entries: list[dict],
+        position_state_transitions: list[dict],
+        intent,
+        before_state,
+        after_state,
+        market_snapshots,
+        fills: list[dict],
+        risk_mode: str,
+        risk_state=None,
+        observed_at: str | None = None,
+    ) -> list[dict]:
+        observed_at = observed_at or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        transitions_by_symbol = {
+            str((entry or {}).get("symbol")): (entry or {})
+            for entry in (position_state_transitions or [])
+            if (entry or {}).get("symbol")
+        }
+        symbol_orders = {}
+        for order in (intent.orders or []):
+            symbol_orders.setdefault(order.symbol, []).append(order)
+
+        annotated_entries = []
+        for entry in symbol_journal_entries or []:
+            symbol = str(entry.get("symbol") or "")
+            if not symbol:
+                continue
+            transition = transitions_by_symbol.get(symbol, {})
+            from_state = str(transition.get("from_state") or "")
+            to_state = str(transition.get("to_state") or "")
+            active_case = self.state_store.get_active_trade_case(symbol)
+            trade_case_id = active_case.get("trade_case_id")
+            case_opened_at = active_case.get("opened_at")
+            case_closed_at = None
+            holding_minutes = None
+            case_status = None
+            symbol_snapshot = market_snapshots.get(symbol) if isinstance(market_snapshots, dict) else None
+            current_case = self.state_store.get_trade_case(trade_case_id) if trade_case_id else {}
+            observed_pnl_pct = self._get_symbol_observed_pnl_pct(symbol, before_state, after_state)
+            avg_fill_price, slippage_cost, slippage_bps = self._estimate_symbol_slippage(
+                symbol=symbol,
+                symbol_orders=symbol_orders.get(symbol, []),
+                fills=fills,
+                market_snapshots=market_snapshots,
+            )
+            realized_pnl = entry.get("net_realized_pnl")
+            fee_cost = entry.get("fee_cost")
+            thesis_failure_reason = self._derive_thesis_failure_reason(
+                symbol=symbol,
+                entry=entry,
+                symbol_snapshot=symbol_snapshot,
+                rationale_items=intent.rationale_items,
+                risk_reason=entry.get("risk_reason") or "",
+                observed_pnl_pct=observed_pnl_pct,
+                realized_pnl=realized_pnl,
+            )
+
+            if from_state == "flat" and to_state in ("opening", "open"):
+                trade_case_id = self._make_trade_case_id(symbol, audit_log_id, observed_at)
+                case_opened_at = observed_at
+                case_status = "opened"
+                self.state_store.upsert_active_trade_case(
+                    symbol=symbol,
+                    trade_case_id=trade_case_id,
+                    opened_at=case_opened_at,
+                    entry_decision=entry.get("decision"),
+                    last_decision=entry.get("decision"),
+                    last_audit_log_id=audit_log_id,
+                    payload={
+                        "opened_via": transition.get("event_type"),
+                        "from_state": from_state,
+                        "to_state": to_state,
+                    },
+                )
+            elif from_state == "open" and to_state == "closed":
+                closed_case = self.state_store.close_active_trade_case(
+                    symbol=symbol,
+                    closed_at=observed_at,
+                    last_decision=entry.get("decision"),
+                    last_audit_log_id=audit_log_id,
+                )
+                trade_case_id = closed_case.get("trade_case_id") or trade_case_id
+                case_opened_at = closed_case.get("opened_at") or case_opened_at
+                case_closed_at = observed_at
+                holding_minutes = self._calculate_holding_minutes(case_opened_at, case_closed_at)
+                case_status = "closed"
+            elif to_state == "reducing":
+                if not trade_case_id:
+                    trade_case_id = self._make_trade_case_id(symbol, audit_log_id, observed_at)
+                    case_opened_at = observed_at
+                self.state_store.upsert_active_trade_case(
+                    symbol=symbol,
+                    trade_case_id=trade_case_id,
+                    opened_at=case_opened_at,
+                    entry_decision=(active_case.get("entry_decision") or entry.get("decision")),
+                    last_decision=entry.get("decision"),
+                    last_audit_log_id=audit_log_id,
+                    payload={
+                        **(active_case.get("payload") or {}),
+                        "from_state": from_state,
+                        "to_state": to_state,
+                        "synthetic_opened_at": case_opened_at is None,
+                    },
+                )
+                case_status = "reduced"
+            elif to_state == "open" and from_state == "open":
+                if trade_case_id:
+                    self.state_store.upsert_active_trade_case(
+                        symbol=symbol,
+                        trade_case_id=trade_case_id,
+                        opened_at=case_opened_at,
+                        entry_decision=active_case.get("entry_decision"),
+                        last_decision=entry.get("decision"),
+                        last_audit_log_id=audit_log_id,
+                        payload=active_case.get("payload") or {},
+                    )
+                case_status = "active" if trade_case_id else None
+            elif to_state == "unknown":
+                case_status = "unknown"
+            elif trade_case_id:
+                case_status = "active"
+
+            if trade_case_id and case_opened_at and holding_minutes is None and case_closed_at is None:
+                holding_minutes = self._calculate_holding_minutes(case_opened_at, observed_at)
+
+            entry_audit_log_id = current_case.get("entry_audit_log_id") or (
+                audit_log_id if case_status == "opened" else active_case.get("last_audit_log_id")
+            )
+            exit_audit_log_id = (
+                audit_log_id if case_status == "closed" else current_case.get("exit_audit_log_id")
+            )
+            observed_mfe_pct, observed_mae_pct = self._recompute_trade_case_excursions(
+                trade_case_id,
+                symbol=symbol,
+                trade_case=current_case,
+                entry_audit_log_id=entry_audit_log_id,
+                exit_audit_log_id=exit_audit_log_id,
+                fallback_opened_at=case_opened_at,
+                fallback_closed_at=case_closed_at,
+                current_observed_pnl_pct=observed_pnl_pct,
+            )
+
+            entry["trade_case_id"] = trade_case_id
+            entry["case_status"] = case_status
+            entry["case_opened_at"] = case_opened_at
+            entry["case_closed_at"] = case_closed_at
+            entry["holding_minutes"] = holding_minutes
+            entry["observed_pnl_pct"] = observed_pnl_pct
+            entry["observed_mfe_pct"] = observed_mfe_pct
+            entry["observed_mae_pct"] = observed_mae_pct
+            entry["slippage_cost"] = slippage_cost
+            entry["slippage_bps"] = slippage_bps
+            entry["entry_price"] = current_case.get("entry_price") or self._get_symbol_entry_price(symbol, before_state, after_state)
+            entry["exit_price"] = self._get_symbol_exit_price(symbol, avg_fill_price, market_snapshots)
+            entry["entry_side"] = current_case.get("entry_side") or self._get_symbol_entry_side(
+                symbol,
+                before_state,
+                after_state,
+                symbol_orders.get(symbol, []),
+            )
+            entry["thesis_failure_reason"] = thesis_failure_reason
+            feature_vector = self._build_trade_case_feature_vector(
+                symbol=symbol,
+                market_snapshots=market_snapshots,
+                account_state=before_state,
+                risk_state=risk_state,
+            )
+            self.state_store.upsert_trade_case(
+                {
+                    "trade_case_id": trade_case_id,
+                    "symbol": symbol,
+                    "status": "closed" if case_status == "closed" else ("open" if case_status == "opened" else (case_status or "active")),
+                    "risk_mode": risk_mode,
+                    "opened_at": case_opened_at,
+                    "closed_at": case_closed_at,
+                    "entry_audit_log_id": entry_audit_log_id,
+                    "exit_audit_log_id": exit_audit_log_id,
+                    "entry_decision": current_case.get("entry_decision") or entry.get("decision"),
+                    "exit_decision": entry.get("decision") if case_status == "closed" else current_case.get("exit_decision"),
+                    "entry_side": entry.get("entry_side"),
+                    "entry_price": entry.get("entry_price"),
+                    "exit_price": entry.get("exit_price"),
+                    "estimated_pnl_pct": observed_pnl_pct,
+                    "realized_pnl": realized_pnl,
+                    "fee_cost": fee_cost,
+                    "holding_minutes": holding_minutes,
+                    "observed_mfe_pct": observed_mfe_pct,
+                    "observed_mae_pct": observed_mae_pct,
+                    "slippage_cost": slippage_cost,
+                    "slippage_bps": slippage_bps,
+                    "thesis_failure_reason": thesis_failure_reason,
+                    "evidence_signals": entry.get("evidence_signals") or [],
+                    "trigger_reasons": (entry.get("payload") or {}).get("trigger_reasons") or [],
+                    "risk_trigger_reasons": (entry.get("payload") or {}).get("risk_trigger_reasons") or [],
+                    "feature_vector": feature_vector or current_case.get("feature_vector") or [],
+                    "payload": {
+                        "case_status": case_status,
+                        "from_state": from_state,
+                        "to_state": to_state,
+                        "risk_reason": entry.get("risk_reason"),
+                        "regime_tags": [
+                            f"trend:{getattr(symbol_snapshot.regime, 'trend_alignment', '')}"
+                            if symbol_snapshot is not None else "",
+                            f"volatility:{getattr(symbol_snapshot.regime, 'volatility_regime', '')}"
+                            if symbol_snapshot is not None else "",
+                        ],
+                        "entry_evidence_signals": entry.get("evidence_signals") or [],
+                        "feature_snapshot": {
+                            "spread_percentile_1h": getattr(symbol_snapshot, "spread_percentile_1h", None)
+                            if symbol_snapshot is not None else None,
+                            "oi_change_15m": getattr(symbol_snapshot, "oi_change_15m", None)
+                            if symbol_snapshot is not None else None,
+                            "oi_change_1h": getattr(symbol_snapshot, "oi_change_1h", None)
+                            if symbol_snapshot is not None else None,
+                            "volume_ratio_15m": getattr(symbol_snapshot, "volume_ratio_15m", None)
+                            if symbol_snapshot is not None else None,
+                            "distance_to_invalid_level": getattr(symbol_snapshot, "distance_to_invalid_level", None)
+                            if symbol_snapshot is not None else None,
+                            "funding_rate_change_1h": getattr(symbol_snapshot, "funding_rate_change_1h", None)
+                            if symbol_snapshot is not None else None,
+                            "basis_change_1h": getattr(symbol_snapshot, "basis_change_1h", None)
+                            if symbol_snapshot is not None else None,
+                        },
+                    },
+                }
+            )
+            annotated_entries.append(entry)
+        return annotated_entries
+
+    def _summarize_trade_cases(self, symbol_journal_entries: list[dict]) -> tuple[list[str], dict[str, str], str]:
+        trade_case_ids = []
+        case_statuses = {}
+        summary_parts = []
+        for entry in symbol_journal_entries or []:
+            symbol = str(entry.get("symbol") or "")
+            trade_case_id = entry.get("trade_case_id")
+            case_status = entry.get("case_status")
+            if trade_case_id and trade_case_id not in trade_case_ids:
+                trade_case_ids.append(trade_case_id)
+            if symbol and case_status:
+                case_statuses[symbol] = case_status
+                summary_parts.append(f"{symbol}:{case_status}")
+        return trade_case_ids, case_statuses, ", ".join(summary_parts[:6])
 
     def _get_deterministic_skip_reason(
         self,
@@ -1176,6 +2351,12 @@ class TradingOrchestrator:
                 raw_recent_journal_context = self.state_store.get_recent_journal_context(
                     limit=context_budget["journal_fetch_limit"]
                 )
+                raw_recent_trade_cases = self.state_store.get_recent_trade_cases(
+                    limit=max(
+                        context_budget["journal_fetch_limit"],
+                        context_budget["journal_keep_limit"] * 4,
+                    )
+                )
                 raw_long_term_memory = self.state_store.get_long_term_memory()
                 recent_journal_context = self._select_recent_journal_context(
                     raw_recent_journal_context,
@@ -1184,6 +2365,9 @@ class TradingOrchestrator:
                     limit=context_budget["journal_keep_limit"],
                     max_rationale_items=context_budget["max_rationale_items_per_journal"],
                     max_evidence_per_item=context_budget["max_evidence_per_rationale_item"],
+                    trade_cases=raw_recent_trade_cases,
+                    account_state=account_state,
+                    risk_state=risk_state,
                 )
                 long_term_memory = self._select_long_term_memory_context(
                     raw_long_term_memory,
@@ -1200,9 +2384,10 @@ class TradingOrchestrator:
                     limit=context_budget["similar_case_keep_limit"],
                 )
                 log.info(
-                    "Context budget applied: journals {}->{}, memory {}->{}, similar_cases={}",
+                    "Context budget applied: journals {}->{}, trade_cases={}, memory {}->{}, similar_cases={}",
                     len(raw_recent_journal_context),
                     len(recent_journal_context),
+                    len(raw_recent_trade_cases),
                     len(raw_long_term_memory),
                     len(long_term_memory),
                     len(similar_past_cases),
@@ -1467,7 +2652,14 @@ class TradingOrchestrator:
                 ),
             )
             if audit_id is not None:
+                self._save_retrieval_evaluations_for_audit(
+                    audit_log_id=audit_id,
+                    intent=intent,
+                    estimated_pnl_pct=estimated_pnl_pct,
+                    risk_mode=risk_mode,
+                )
                 ledger_entries = []
+                position_state_transitions = []
                 if fills:
                     self.state_store.save_execution_fills(audit_id, fills)
                     ledger_entries = self._build_position_ledger_entries(intent, fills, execution_summary)
@@ -1499,7 +2691,32 @@ class TradingOrchestrator:
                     estimated_pnl_pct=estimated_pnl_pct,
                     ledger_entries=ledger_entries,
                 )
+                observed_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                symbol_journal_entries = self._annotate_trade_case_entries(
+                    audit_log_id=audit_id,
+                    symbol_journal_entries=symbol_journal_entries,
+                    position_state_transitions=position_state_transitions,
+                    intent=intent,
+                    before_state=effective_pre_execution_state,
+                    after_state=post_account_state,
+                    market_snapshots=market_snapshots,
+                    fills=fills,
+                    risk_mode=risk_mode,
+                    risk_state=risk_state,
+                    observed_at=observed_at,
+                )
                 self.state_store.save_symbol_journal_entries(symbol_journal_entries)
+                trade_case_snapshot_entries = self._build_trade_case_snapshot_entries(
+                    audit_log_id=audit_id,
+                    observed_at=observed_at,
+                    account_state=post_account_state or effective_pre_execution_state,
+                    market_snapshots=market_snapshots,
+                    symbol_journal_entries=symbol_journal_entries,
+                )
+                self.state_store.save_trade_case_snapshots(trade_case_snapshot_entries)
+            else:
+                symbol_journal_entries = []
+            trade_case_ids, case_statuses, case_summary = self._summarize_trade_cases(symbol_journal_entries)
             self.state_store.save_journal(
                 intent.decision,
                 intent.rationale,
@@ -1509,6 +2726,9 @@ class TradingOrchestrator:
                 estimated_pnl_pct=estimated_pnl_pct,
                 loss_signal=loss_signal,
                 rationale_items=intent.rationale_items,
+                trade_case_ids=trade_case_ids,
+                case_statuses=case_statuses,
+                case_summary=case_summary,
             )
             final_account_state = post_account_state or effective_pre_execution_state or account_state
             final_unknown_order_count = self.state_store.count_recent_unknown_orders(
@@ -1627,18 +2847,20 @@ class TradingOrchestrator:
     def start_scheduler(self):
         execution_guards = self._build_execution_guards()
         log.info(
-            "Adaptive scheduler started. Cadence minutes: 1h={} 15m={} 5m={} snapshot={}m recovery={}m",
+            "Adaptive scheduler started. Cadence minutes: 1h={} 15m={} 5m={} snapshot={}m recovery={}m case_path={}s",
             self.adaptive_loop_config["base_loop_minutes"],
             self.adaptive_loop_config["position_loop_minutes"],
             self.adaptive_loop_config["trigger_loop_minutes"],
             self.snapshot_service.materialization_minutes,
             execution_guards.get("recovery_sweep_minutes", 5),
+            self.adaptive_loop_config["trade_case_snapshot_poll_seconds"],
         )
         next_snapshot_at = time.time()
         next_cycle_at = time.time()
         while True:
             now_epoch = time.time()
             self._run_due_maintenance_tasks(now_epoch)
+            self._sample_trade_case_paths_if_due(now_epoch)
             if now_epoch >= next_snapshot_at:
                 self.snapshot_service.materialize(now_epoch=now_epoch)
                 next_snapshot_at = self.snapshot_service.next_materialization_epoch(now_epoch)
