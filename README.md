@@ -1372,6 +1372,10 @@ python -m unittest discover -s tests
 - ExecutionEngine 체결 매칭과 상태 전이 생성
 - 장기 메모리 통계와 조건 메타데이터 저장
 
+## 운영 문서
+
+- 수익률 부진 진단, 원인별 조치, 실험 순서는 [`PROFITABILITY_TROUBLESHOOTING.md`](./PROFITABILITY_TROUBLESHOOTING.md)를 참고한다.
+
 ## 운영 메모
 
 - 기본 거래소 타입은 Bybit linear USDT perpetual이다.
@@ -1499,87 +1503,10 @@ python -m unittest discover -s tests
   - 그 이전은 별도 백업
 - replay와 memory를 계속 쓸 계획이면 `audit_logs`는 함부로 지우지 않는 편이 좋다.
 
-## 수익률이 안 나올 때 해볼 것
+## 수익률 진단
 
-수익률이 안 나올 때는 모델을 바로 바꾸기보다, 먼저 "무엇이 나쁜지"를 분리해서 봐야 한다.
-대체로 아래 5가지 유형 중 하나다.
-
-### 1. 진입은 맞는데 실행이 나쁜 경우
-
-증상:
-
-- 방향은 대체로 맞는데 net pnl이 수수료/슬리피지 때문에 깎인다.
-- replay 기준 decision은 괜찮아 보이는데 ledger net이 약하다.
-
-해볼 것:
-
-1. `wide_spread`, `elevated_funding`이 잦은 시간대를 줄인다.
-2. `max_order_notional_pct_balance`를 낮춰 슬리피지 민감도를 줄인다.
-3. 심볼 수를 줄이고 유동성 좋은 심볼만 남긴다.
-4. market order만 허용 중이라면, 정책상 limit 운용이 가능한지 별도로 검토한다.
-
-### 2. 진입 자체가 과다한 경우
-
-증상:
-
-- 거래 수는 많은데 기대값이 낮다.
-- `BUY/SELL`은 많은데 대부분 작은 손실이 누적된다.
-
-해볼 것:
-
-1. trigger 조건을 더 보수화한다.
-2. `mode_profiles.trigger.max_order_notional_pct_balance`와 `max_open_positions`를 더 줄인다.
-3. low evidence quality에서 사실상 `HOLD`가 더 자주 나오도록 validator/risk 정책을 강화한다.
-4. 최근 journal에서 같은 signal 조합이 반복 손실인지 확인하고 memory anti-pattern 반영 여부를 점검한다.
-
-### 3. 손실은 적은데 수익도 안 나는 경우
-
-증상:
-
-- drawdown은 얕지만 계좌 곡선이 옆으로 간다.
-- `REDUCE/EXIT`가 너무 빠르거나, 좋은 추세를 끝까지 못 먹는다.
-
-해볼 것:
-
-1. `EXIT`와 `REDUCE` journal을 따로 모아 "너무 빨리 줄였는지" 본다.
-2. 장기 메모리가 지나치게 보수적인 교훈만 축적했는지 확인한다.
-3. trigger mode에서 신규 진입 억제가 과한지 점검한다.
-4. regime별로 성과를 나눠 보고, 추세장에서만 별도 정책을 둘지 검토한다.
-
-### 4. 특정 심볼만 문제인 경우
-
-증상:
-
-- 전체 수익률이 낮은데, 실제로는 특정 심볼 하나가 대부분 손실을 만든다.
-
-해볼 것:
-
-1. 대시보드 `Symbol Report`로 심볼별 net pnl을 확인한다.
-2. 손실 심볼을 잠시 제외하고 나머지 심볼만으로 관찰한다.
-3. 그 심볼의 `spread_bps`, `funding_rate`, `open_interest` 변동이 다른 심볼보다 거친지 본다.
-4. 심볼별로 다른 threshold가 필요한지 검토한다.
-
-### 5. 시장 레짐이 바뀐 경우
-
-증상:
-
-- 과거에는 맞던 패턴이 최근 몇 주간 계속 안 맞는다.
-- memory rule은 그럴듯한데 최신 audit에서는 실패가 반복된다.
-
-해볼 것:
-
-1. replay로 예전 성공 audit와 최근 실패 audit를 나란히 비교한다.
-2. `trend_alignment`, `volatility_regime`, `risk_trigger_reasons`가 달라졌는지 확인한다.
-3. trigger threshold를 ATR/volatility 기준으로 더 강하게 정규화한다.
-4. 오래된 long-term memory rule을 약화하거나 manual pruning 한다.
-
-### 수익률 부진 시 권장 점검 순서
-
-1. 대시보드에서 `ledger net pnl`, `Symbol Report`, `Semantic Fallbacks`를 먼저 본다.
-2. 손실 audit 10~20개를 replay로 다시 돌려서 decision 변화와 evidence diff를 본다.
-3. journal에서 반복 손실 signal과 evidence quality 패턴을 확인한다.
-4. 정책 조정은 한 번에 하나씩만 한다.
-5. 변경 후에는 반드시 demo 또는 축소된 size로 재관찰한다.
+수익률이 기대에 못 미칠 때는 모델을 바로 교체하기보다, 원인을 `엣지 / 비용 / 과잉거래 / 사이징 / 데이터 품질 / 운영 안정성 / LLM 품질`로 분리해서 봐야 한다.  
+상세 체크리스트와 원인별 개선 실험은 [`PROFITABILITY_TROUBLESHOOTING.md`](./PROFITABILITY_TROUBLESHOOTING.md)에 정리되어 있다.
 
 ## 권장 운영 순서
 
