@@ -617,6 +617,65 @@
 
 - memory가 설명만 늘리는 것이 아니라 판단을 더 안정적으로 만든다.
 
+### 10.6 좋은 메모리 보존과 나쁜 메모리 제거
+
+장기 메모리는 쌓는 것만큼 `보존 기준`과 `제거 기준`이 중요하다.  
+개선 가능성으로는 memory rule lifecycle을 명시적으로 두는 방식이 가장 유용하다.
+
+좋은 메모리로 간주할 조건:
+
+- support가 충분하다.
+- 최근 구간에서도 성과가 유지된다.
+- `apply_when`이 맞는 구간에서 성과가 더 낫다.
+- `ignore_when`이 실제로 나쁜 거래 회피에 기여한다.
+- 다른 레짐으로 넘어가면 rule 영향이 자연스럽게 약해진다.
+
+나쁜 메모리로 간주할 조건:
+
+- support가 낮은데 표현만 강하다.
+- 최근 구간에서 반복적으로 성과가 나쁘다.
+- 특정 레짐에서만 맞는데 일반 규칙처럼 남아 있다.
+- HOLD만 늘리고 실제 성과는 개선하지 못한다.
+- rationale 설명에는 자주 등장하지만 실제 trade outcome과 연결되지 않는다.
+
+보존 후보로 올리면 좋은 신호:
+
+- 최근 `memory_on` 거래의 평균 손익이 `memory_off` 대비 낫다.
+- 반복 손실 fingerprint 재진입을 실제로 줄였다.
+- drawdown 구간에서 계좌 손상 이벤트를 줄였다.
+- 오래된 rule보다 최신 rule이 더 일관된 성과를 보인다.
+
+제거 또는 약화 후보로 보면 좋은 신호:
+
+- 최근 N개 적용 사례에서 성과가 계속 나쁘다.
+- `apply_when`과 실제 적용 구간이 자주 어긋난다.
+- `ignore_when`이 거의 작동하지 않는다.
+- support는 높지만 최근 시장에서는 설명력이 사라졌다.
+
+나중에 추가하면 좋은 관리 방식:
+
+1. `active`, `shadow`, `retired` 같은 memory 상태를 둔다.
+2. 새 rule은 바로 강하게 쓰지 말고 `shadow` 상태로 관찰한다.
+3. 최근 성과와 rule consistency가 확인되면 `active`로 승격한다.
+4. 일정 기간 성과가 나쁘거나 레짐 부적합이 반복되면 `retired`로 내린다.
+5. retired rule은 완전히 삭제하기보다 이유와 함께 보관해 재등장 여부를 본다.
+
+권장 평가 축:
+
+- `support_count`
+- 최근 30일 적용 성과
+- 최근 30일 미적용 대비 차이
+- 레짐 적합도
+- replay 일관성
+- rule 적용 후 거래 수 변화
+
+운영상 안전장치:
+
+- support가 낮은 rule은 size 축소나 HOLD 보조 정도로만 사용한다.
+- rule 하나가 직접 decision을 override하지 않게 한다.
+- 오래된 rule은 recency decay를 준다.
+- rule이 충돌하면 현재 시장 컨텍스트와 risk state를 우선한다.
+
 권장 측정 방식:
 
 1. 같은 기간의 decision input에 대해 `memory disabled`와 `memory enabled`를 replay로 비교한다.
