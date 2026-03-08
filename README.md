@@ -190,6 +190,13 @@ gpt_trader/
   - spread와 depth의 최근 1시간 상대 수준(percentile / avg 대비 악화 여부)
     - 이 percentile 계열은 in-memory rolling history가 쌓여야 계산된다
     - 프로세스 시작 직후나 잦은 재시작 직후에는 `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`가 `null`일 수 있다
+  - materialization 시점마다 `market_snapshot_history`에도 별도 시계열 row를 남긴다
+    - 최소한 `current_price`, `mark_price`, `mid_price`, `spread_bps`, `depth_notional_top5`
+    - `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`
+    - `distance_to_invalid_level`
+    - `volume_surge / fast_move / range_break / opportunity / risk trigger` 상태
+    - `trend_1h`
+  - 따라서 replay의 미래 가격 경로는 audit 저장 빈도에만 의존하지 않고, 5분 materialization 기반 시계열을 우선 읽는다
   - breakout 기준선 및 invalidation까지의 거리 요약
   - opportunity trigger 여부와 사유
   - risk trigger 여부와 사유
@@ -849,6 +856,26 @@ LLM 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
 다만 자동 학습 입력에는 모든 audit를 그대로 쓰지 않는다. `loop error`, `execution_summary.error`,
 `ai_usage.validation_error`, `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 보존하되,
 memory batch와 incremental replay의 자동 학습 후보에서는 제외한다.
+추가로 memory batch는 replay의 `hold_opportunity_counterfactual`도 읽어,
+`missed_breakout_count`, `missed_move_median_pct`, `hold_opportunity_cost`를 undertrading 지표로 집계한다.
+이 수치가 반복되면 "trigger는 맞았지만 너무 자주 HOLD해서 기회를 놓친다"는 opportunity lesson seed를 만들고,
+policy 평가에도 같은 opportunity cost를 함께 반영한다.
+동시에 최근 closed entry case의 `false_entry_cost`도 같이 집계해,
+기회를 너무 놓치는 문제와 너무 자주 잘못 진입하는 문제를 한쪽으로만 과적합하지 않게 균형 점수로 본다.
+즉 memory batch는 `undertrading_pressure`, `overtrading_pressure`, `balance_score`를 함께 계산하고,
+장기 교훈도 `good conservative hold`, `risk filtered hold`, `execution filtered hold`,
+`structure filtered hold`, `probe only opportunity hold`, `missed opportunity hold`처럼 HOLD 품질을 나눠서 해석한다.
+여기서 `probe only opportunity hold`는 공격적 probe baseline은 이겼지만 더 보수적인 simple-rule baseline은 이기지 못한 경우다.
+즉 baseline 착시와 실제 missed opportunity를 분리하려는 중간 계층이다.
+중요한 점은 이 균형 점수가 이제 같은 단위만 비교한다는 것이다.
+`hold_opportunity_cost`와 promotion gate에 쓰이는 `false_entry_cost`는 둘 다 퍼센트 기준으로 비교하고,
+실현 손익 금액은 `false_entry_cost_amount`로 별도 보조 메트릭으로만 남긴다.
+또한 opportunity lesson seed는 문장만 좁아진 것이 아니라,
+`trigger_context`, `execution_context`, `trend_context`, `hold_quality`를 구조화 memory에도 같이 저장한다.
+이 컨텍스트는 저장만 하는 메타데이터가 아니다.
+실시간 loop는 `long_term_memory`를 고를 때 기존 `apply_when.regime/volatility/trend` 축뿐 아니라,
+현재 시장의 `trigger_context`, `execution_context`, `trend_context` signature와 직접 비교해 맞는 memory를 우선 적용한다.
+특히 opportunity memory는 trigger/execution/trend 문맥이 어긋나면 강하게 감점한다.
 구조화 evidence는 단일 스키마를 유지하되 타입 규칙은 강하게 둔다.
 즉 `gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte` 는 숫자 값만 허용하고,
 `eq/note` 만 숫자/문자열/불리언 evidence를 허용한다.
@@ -869,6 +896,7 @@ memory batch와 incremental replay의 자동 학습 후보에서는 제외한다
 - 버전
 - 구조화 메트릭
 - `confidence_score` / `validity_score` / `decay_score`
+- `trigger_context` / `execution_context` / `trend_context` / `hold_quality`
 - `lifecycle_status` / `retirement_reason` / `revive_count`
 - `canonical_key` 기반 중복 병합 메타데이터
 
@@ -1168,6 +1196,28 @@ memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`,
 운영 기본값은 `수동 단건 replay + 일일 incremental replay 자동 배치`다.
 자동 경로는 최근 24시간의 대표 audit를 최대 30건까지 선별해 daily memory batch 직전에 저장한다.
 이 자동 replay 후보는 학습 가능 audit만 대상으로 하고, 시스템 오류 fallback/loop error audit는 자동 경로에서 제외한다.
+최근 버전의 replay는 포지션이 없고 `HOLD`였던 audit에 대해서도 이후 `30m / 2h / 6h` 가격 경로를 다시 읽는다.
+즉 같은 시점에 단순 baseline entry를 넣었으면 충분히 먹을 수 있었는지 `hold_opportunity_counterfactual`로 저장한다.
+baseline은 `trigger active + acceptable spread/depth + manageable invalidation distance`를 만족할 때만 만든다.
+이때 단순 진입 여부만 가정하지 않고,
+- 방향은 trend / breakout / RSI / 단기 변화율을 조합해 추정
+- 크기는 available balance 기준 소액 notional로 제한
+- entry는 bid/ask와 spread/slippage를 반영한 assumed fill price로 가정
+- stop/take-profit은 ATR 또는 invalidation 거리를 이용해 가정
+- 미래 경로에서는 stop/take-profit hit 순서를 순차적으로 평가하고
+- 수수료를 반영한 net realized move를 같이 계산
+한다.
+리플레이는 미래 가격 경로도 더 이상 `audit_logs.market_state`에만 의존하지 않는다.
+최근 구조에서는 `market_snapshot_history` 시계열 테이블을 우선 읽고,
+해당 구간 데이터가 부족할 때는 audit에 저장된 `market_state`를 fallback으로 섞어 보강한다.
+즉 history row가 일부만 있어도 그 row만 쓰고 끝내지 않고, 부족한 timestamp 구간은 audit path로 채운다.
+또한 baseline entry 하나만 보지 않고 더 보수적인 `simple_rule_entry`도 같이 계산한다.
+즉 replay는 `probe_entry vs actual HOLD`뿐 아니라 `simple_rule_entry vs actual HOLD`도 함께 저장해,
+"놓친 기회"가 단순 공격적 baseline 착시인지까지 구분하려고 한다.
+그리고 memory/promotion은 opportunity cost만 보지 않는다.
+`turnover_rate`, `capital_idle_ratio`, `avg_holding_minutes`, `avg_entry_slippage_bps`,
+`drawdown_path_penalty`, `regime_capacity_penalty`, `portfolio_utility_score`도 같이 계산해
+"기회를 안 놓쳤다"가 아니라 "실제로 더 나은 포트폴리오 효용이었는가"까지 본다.
 
 ### 사용법
 
@@ -1209,8 +1259,16 @@ python tools/replay_audit.py --auto --save --limit 30 --window-hours 24
 - `evidence_signals_added`
 - `evidence_signals_removed`
 - `evidence_signal_count_delta`
+- `missed_breakout_count`
+- `missed_move_median_pct`
+- `hold_opportunity_cost`
+- `baseline_beats_hold`
+- `simple_rule_baseline_beats_hold`
+- `hold_quality`
 
 즉, 예전엔 `BUY`였는데 지금은 `HOLD`인지, 같은 `BUY`여도 크기가 줄었는지, rationale의 중심 키워드가 무엇으로 바뀌었는지 바로 볼 수 있다.
+또한 최근 구조에서는 `HOLD`를 하나의 값으로만 보지 않고,
+좋은 보수적 HOLD인지, 리스크/실행 품질 때문에 필터된 HOLD인지, 아니면 놓친 기회였는지도 같이 구분한다.
 
 이제 replay는 `rationale_items.evidence`도 비교한다.  
 즉 어떤 evidence signal이 추가되거나 사라져서 결정이 바뀌었는지까지 추적할 수 있다.
@@ -1233,8 +1291,22 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 최근 버전의 `trade_case_clusters`에는 `quality_score`, `quality_label`, `evaluation.silhouette_score`, `evaluation.consistency_score`가 같이 들어가서,
 군집을 그냥 묶는 데서 끝나지 않고 "이 군집이 실제로 반복성과 설명력이 있는가"를 자동 평가한다.
 또한 `retired`, `retirement_reason`을 함께 계산해, holdout에서 더 이상 같은 손실 패턴이 재현되지 않거나 품질이 너무 낮은 cluster는 candidate lesson seed에서 자동 제외한다.
+배치는 replay에서 집계한 `hold_opportunity_summary`와 `trading_balance_summary`도 함께 읽는다.
+즉 최근 시스템이 과도한 HOLD 편향인지, 반대로 false entry cost가 더 큰 과잉 진입 상태인지도 함께 본다.
+이 값은 candidate lesson 생성뿐 아니라 `alpha_1h` 후보/번들 평가와 promotion gate에도 들어간다.
+최근 promotion gate는 `hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
+`portfolio_utility_score`, `confidence_alignment_score`, `temporal_holdout_summary`도 같이 본다.
+즉 한쪽 비용이 과도하게 큰 상태이거나 두 비용의 비율이 너무 깨져 있거나,
+walk-forward 성격의 holdout 구간이 무너지거나 confidence calibration이 나쁘면 score가 좋아도 자동 승격을 막는다.
+여기서 `false_entry_cost`는 promotion용 정규화 퍼센트 비용이고, 금액 손실 합계는 `false_entry_cost_amount`로 별도 저장한다.
 또한 memory batch는 `retrieval_evaluation_summary`와 `retrieval_counterfactual_summary`를 함께 읽어,
 retrieval이 실제 성과와 반사실 비교 기준에서 얼마나 의미 있었는지, 그리고 그 차이가 path quality 기준으로도 유지되는지 장기 메모리 판단 근거로 남긴다.
+또한 최근 journal의 `confidence`와 사후 outcome을 비교해 `calibration_gap`, `brier_score`,
+`high_conf_error_rate`, `alignment_score`를 만들고, memory confidence와 policy evaluation에 같이 반영한다.
+LLM은 이제 heuristic candidate lesson을 넓게 새로 발명하기보다,
+기존 seed를 좁고 읽기 좋게 정제하는 역할에 더 가깝다.
+generated lesson이 seed와 매칭되지 않으면 버리고, 매칭되더라도
+`apply_when`, `trigger_context`, `execution_context`, `trend_context`, `hold_quality`는 seed의 좁은 조건을 우선 보존한다.
 
 ### 기본 원칙
 

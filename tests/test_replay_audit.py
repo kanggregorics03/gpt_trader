@@ -1,13 +1,28 @@
 import unittest
+import tempfile
+from pathlib import Path
 
+from db.state_store import StateStore
 from tools.replay_audit import (
+    build_hold_baseline_intent,
     build_replay_payload,
+    evaluate_hold_opportunity_counterfactual,
     should_run_retrieval_counterfactual,
     strip_retrieval_context,
 )
 
 
 class TestReplayAudit(unittest.TestCase):
+    def setUp(self):
+        Path("c:/gpt_trader/.tmp_tests").mkdir(parents=True, exist_ok=True)
+        self.tmpdir = tempfile.TemporaryDirectory(dir="c:/gpt_trader/.tmp_tests")
+        self.db_path = str(Path(self.tmpdir.name) / "replay.db")
+        self.store = StateStore(self.db_path)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmpdir.cleanup()
+
     def test_strip_retrieval_context_clears_similar_cases_only(self):
         payload = {
             "policy_summary": "x",
@@ -84,6 +99,82 @@ class TestReplayAudit(unittest.TestCase):
                 request_payload={"similar_past_cases": []},
             )
         )
+
+    def test_hold_opportunity_counterfactual_detects_missed_move(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000.0, "available_balance": 1000.0, "positions": [], "open_orders": [], "open_orders_count": 0},
+            market={
+                "market_snapshots": {
+                    "ETHUSDT": {
+                        "symbol": "ETHUSDT",
+                        "current_price": 100.0,
+                        "mark_price": 100.0,
+                        "atr_1h": 4.0,
+                        "trend_1h": "UP",
+                        "volume_ratio_15m": 1.8,
+                        "spread_percentile_1h": 40.0,
+                        "depth_percentile_1h": 70.0,
+                        "distance_to_invalid_level": 1.0,
+                        "is_opportunity_trigger": True,
+                        "volume_surge_trigger_active": True,
+                        "range_break_trigger_active": True,
+                        "timeframes": {
+                            "15m": {"trend": "UP", "change_3bar_pct": 1.2, "rsi_14": 62.0},
+                            "1h": {"trend": "UP", "change_3bar_pct": 2.1, "rsi_14": 58.0},
+                        },
+                        "order_book": {"mid_price": 100.0, "spread_bps": 3.0},
+                    }
+                }
+            },
+            intent={"decision": "HOLD", "orders": [], "rationale": ["No trade."], "confidence": 0.4},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshots": {}},
+        )
+        self.store.conn.execute(
+            "UPDATE audit_logs SET timestamp = ? WHERE id = ?",
+            ("2026-03-08 10:00:00", audit_id),
+        )
+        future_id = self.store.save_audit(
+            account={"total_balance": 1000.0},
+            market={
+                "market_snapshots": {
+                    "ETHUSDT": {
+                        "symbol": "ETHUSDT",
+                        "current_price": 104.5,
+                        "mark_price": 104.4,
+                        "order_book": {"mid_price": 104.45, "spread_bps": 4.0},
+                    }
+                }
+            },
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.2},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        self.store.conn.execute(
+            "UPDATE audit_logs SET timestamp = ? WHERE id = ?",
+            ("2026-03-08 10:20:00", future_id),
+        )
+        self.store.conn.commit()
+
+        audit = self.store.get_audit_log(audit_id)
+        baseline = build_hold_baseline_intent(audit)
+        summary = evaluate_hold_opportunity_counterfactual(self.store, audit)
+
+        self.assertEqual(baseline["decision"], "BUY")
+        self.assertEqual(summary["entry_side"], "BUY")
+        self.assertTrue(summary["baseline_beats_hold"])
+        self.assertTrue(summary["simple_rule_baseline_beats_hold"])
+        self.assertGreaterEqual(summary["missed_breakout_count"], 1)
+        self.assertGreater(summary["hold_opportunity_cost"], 0.0)
+        self.assertTrue(summary["windows"]["30m"]["breakout_hit"])
+        self.assertEqual(summary["hold_quality"], "missed_opportunity_hold")
+        self.assertEqual(summary["trigger_context"]["signature"], "volume_surge+range_break+opportunity")
+        self.assertIn("tight_spread", summary["execution_context"]["signature"])
+        self.assertIn("UP", summary["trend_context"]["signature"])
+        self.assertGreater(summary["windows"]["30m"]["realized_move_pct"], 0.0)
 
 
 if __name__ == "__main__":

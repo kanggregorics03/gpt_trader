@@ -96,6 +96,19 @@ account_reader / collector / state_store를 묶어 공용 스냅샷을 조립
 
 계좌 상태는 `SnapshotService -> AccountReader -> private WS cache`를 우선 사용하고, 주문 직후/WS 비정상/주기적 reconcile 시에만 REST 보정
 
+또한 각 materialization 시점의 시장 핵심 필드는 `market_snapshot_history`에 별도 저장한다.
+즉 future path replay는 audit 저장 빈도와 분리된 5분 시계열을 우선 사용한다.
+현재 저장 필드는 최소한 다음을 포함한다.
+- `current_price / mark_price / mid_price`
+- `spread_bps / depth_notional_top5`
+- `spread_percentile_1h / depth_percentile_1h / spread_vs_1h_avg`
+- `distance_to_invalid_level`
+- `volume_surge / fast_move / range_break / opportunity / risk trigger`
+- `trend_1h`
+future path 조회 시에는 history row가 일부만 있어도 그것만 반환하지 않고,
+비는 timestamp 구간은 audit payload의 `market_state`를 섞어 보강한다.
+즉 `history + audit fallback merge`를 기본으로 두어 partial history 때문에 반사실 평가가 비는 일을 줄인다.
+
 decision_engine (provider adapter)
 
 입력 스냅샷+메모리를 받아 TradeIntent(JSON) 출력
@@ -323,6 +336,11 @@ long_term_memory도 현재 risk_mode/시장 레짐/심볼 관련성이 높은 �
 - decay_score + lifecycle_status로 오래 검증되지 않은 rule을 감쇠/은퇴시키고
 - canonical_key + rule similarity로 비슷한 lesson을 병합하는 방향으로 운영한다
 
+또한 memory 적용도 단순 `apply_when.regime/volatility/trend` 매칭만 보지 않는다.
+최근 구조에서는 `trigger_context`, `execution_context`, `trend_context`, `hold_quality`도 구조화 필드로 저장하고,
+실시간 loop가 현재 시장의 같은 signature와 직접 비교해 맞는 memory만 강하게 우선한다.
+특히 opportunity memory는 trigger/execution/trend 문맥이 어긋나면 강하게 감점한다.
+
 constraints: “JSON only”, 출력 최대 길이, 허용 행동 제한
 
 프롬프트는 compact JSON으로 직렬화하고, 완전히 동일한 prompt + model은 decision_cache에서 재사용
@@ -414,6 +432,22 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 단, 자동 replay와 memory batch는 모든 audit를 그대로 학습 입력으로 쓰지 않는다.
 `loop error`, `execution_summary.error`, `ai_usage.validation_error`,
 `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 감사 로그로는 유지하되 자동 학습 입력에서는 제외한다.
+또한 최근 구조에서는 포지션이 없고 `HOLD`였던 audit를 replay할 때,
+이후 `30m / 2h / 6h` 가격 경로를 읽어 baseline probe entry 대비 `hold_opportunity_counterfactual`을 함께 계산한다.
+즉 `HOLD`가 안전했는지뿐 아니라 "좋은 기회를 놓친 HOLD였는가"도 별도로 점검한다.
+이 baseline은 단순 "소액 매수 가정"이 아니라,
+- trigger / breakout / trend / RSI / 단기 변화율로 방향을 추정
+- available balance 기반 소액 sizing
+- bid/ask + spread/slippage를 반영한 assumed fill price
+- ATR 또는 invalidation 거리 기반 stop/take-profit
+- future path에서 stop/take-profit hit 순서를 순차 평가
+- 수수료 포함 net realized move 계산
+을 함께 가정한다.
+미래 가격 경로는 `audit_logs.market_state`에만 의존하지 않고,
+별도 `market_snapshot_history` 시계열 테이블을 우선 사용하며, 구간이 부분적으로 비면 audit payload를 fallback으로 섞어 보강한다.
+또한 probe baseline 하나만 두지 않고 더 보수적인 `simple_rule_entry`도 같이 비교한다.
+따라서 `missed_opportunity_hold`와 `probe_only_opportunity_hold`를 분리해,
+공격적 baseline 착시를 장기 교훈으로 과잉 일반화하지 않게 한다.
 
 7.2 방식(오염 방지 필수)
 
@@ -589,6 +623,37 @@ daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 
 또한 evidence signal 반복에서 heuristic candidate lesson을 먼저 만들고, LLM은 이를 정제/병합하는 역할로 사용한다
 
 즉 오류 audit는 운영 품질 추적에는 남기되, 시스템 버그성 audit를 trading lesson seed로 직접 승격하지 않는 것이 현재 원칙이다.
+여기에 replay의 `hold_opportunity_counterfactual`도 함께 읽어,
+`missed_breakout_count`, `missed_move_median_pct`, `hold_opportunity_cost`를 undertrading 신호로 집계한다.
+이 값이 반복되면 risk_control뿐 아니라 anti-undertrading opportunity lesson도 candidate seed로 만든다.
+반대로 closed entry case 쪽에서는 `false_entry_cost`를 함께 계산해 overtrading 압력도 본다.
+즉 배치는 `undertrading_pressure`, `overtrading_pressure`, `balance_score`를 같이 유지해
+한쪽 방향의 편향만 강화하지 않도록 한다.
+여기서 promotion과 pressure 비교에 쓰는 `false_entry_cost`는 퍼센트 기준 정규화 비용이고,
+실현 손익 금액은 `false_entry_cost_amount`로 별도 유지한다.
+즉 undertrading / overtrading 비교는 항상 같은 단위끼리만 수행한다.
+추가로 최근 배치는 `turnover_rate`, `capital_idle_ratio`, `avg_holding_minutes`, `avg_entry_slippage_bps`,
+`drawdown_path_penalty`, `regime_capacity_penalty`, `portfolio_utility_score`도 같이 계산한다.
+즉 opportunity cost만 줄였다고 자동 승격하지 않고, 실제 포트폴리오 수준 utility가 나아졌는지도 함께 본다.
+또 `HOLD`도 하나의 단일 결과로 보지 않고
+`good_conservative_hold`, `risk_filtered_hold`, `execution_filtered_hold`,
+`structure_filtered_hold`, `probe_only_opportunity_hold`, `missed_opportunity_hold`, `unclear_hold`처럼 품질을 분리해 candidate lesson에 반영한다.
+anti-undertrading lesson도 넓게 "HOLD를 줄여라"가 아니라,
+dominant trigger context, execution context, trend context가 반복된 구간에서만 좁게 seed를 만든다.
+그리고 이 `trigger_context`, `execution_context`, `trend_context`, `hold_quality`는 문장 설명에만 남지 않고
+구조화 memory schema에도 같이 저장해, 이후 merge/revive/promotion 과정에서도 유지한다.
+정책 평가 역시 같은 opportunity cost를 bundle/candidate score의 보조 메트릭으로 반영해,
+지나친 `HOLD` 편향이 장기적으로 승격되지 않게 한다.
+최근 promotion gate에서는 `alpha_1h` 후보와 regime bundle을 볼 때
+`hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
+`portfolio_utility_score`, `confidence_alignment_score`, `temporal_holdout_summary`도 같이 확인한다.
+즉 비용 한쪽이 너무 크거나 두 압력의 비율이 지나치게 깨져 있거나,
+walk-forward 성격의 holdout 구간이 무너지거나 confidence calibration이 나쁘면 score가 좋아도 자동 승격하지 않는다.
+confidence calibration은 최근 journal의 `confidence`와 사후 outcome을 비교해
+`calibration_gap`, `brier_score`, `high_conf_error_rate`, `alignment_score`를 계산하는 방식으로 반영한다.
+또한 lesson synthesis 단계에서 LLM은 heuristic candidate seed를 넓게 새로 발명하지 않고,
+seed와 매칭되는 lesson만 좁고 읽기 좋게 정제한다.
+매칭된 generated lesson도 `apply_when`, `trigger_context`, `execution_context`, `trend_context`, `hold_quality`는 seed의 좁은 조건을 우선 보존한다.
 
 구조화 evidence는 현재 `numeric/categorical/boolean` 스키마를 완전히 분리하지 않고 단일 구조를 유지한다.
 대신 operator 규칙으로 타입을 제어한다.

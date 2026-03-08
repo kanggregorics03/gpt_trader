@@ -625,6 +625,373 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertGreater(stats["retrieval_counterfactual_summary"]["avg_outcome_utility_delta"], 0.0)
         self.assertEqual(len(stats["recent_retrieval_counterfactuals"]), 2)
 
+    def test_build_stats_package_includes_hold_opportunity_summary_and_candidate(self):
+        class DummyStore:
+            def get_position_ledger_stats(self, hours):
+                return {"row_count": 0, "net_realized_pnl": 0.0, "gross_realized_pnl": 0.0, "fee_cost": 0.0}
+
+            def get_symbol_performance_report(self, hours):
+                return []
+
+            def get_daily_ledger_report(self, days):
+                return []
+
+        self.updater.state_store = DummyStore()
+        journals = [
+            {
+                "id": 31,
+                "audit_log_id": 7001,
+                "decision": "HOLD",
+                "rationale_json": [],
+                "risk_reason": "Safe action.",
+                "estimated_pnl_pct": None,
+                "loss_signal": 0,
+                "market_state": {
+                    "market_snapshots": {
+                        "ETHUSDT": {
+                            "regime": {"trend_alignment": "aligned_up", "volatility_regime": "normal"},
+                        }
+                    }
+                },
+            },
+            {
+                "id": 32,
+                "audit_log_id": 7002,
+                "decision": "HOLD",
+                "rationale_json": [],
+                "risk_reason": "Safe action.",
+                "estimated_pnl_pct": None,
+                "loss_signal": 0,
+                "market_state": {
+                    "market_snapshots": {
+                        "ETHUSDT": {
+                            "regime": {"trend_alignment": "aligned_up", "volatility_regime": "normal"},
+                        }
+                    }
+                },
+            },
+        ]
+        replay_runs = [
+            {
+                "audit_log_id": 7001,
+                "payload": {
+                    "hold_opportunity_counterfactual": {
+                        "baseline_beats_hold": True,
+                        "simple_rule_baseline_beats_hold": True,
+                        "missed_breakout_count": 2,
+                        "missed_move_median_pct": 1.3,
+                        "hold_opportunity_cost": 1.1,
+                        "hold_quality": "missed_opportunity_hold",
+                        "trigger_context": {"signature": "volume_surge+range_break+opportunity"},
+                        "execution_context": {"signature": "acceptable_spread|deep_book|manageable_invalidation"},
+                        "trend_context": {"signature": "UP|UP"},
+                    }
+                },
+            },
+            {
+                "audit_log_id": 7002,
+                "payload": {
+                    "hold_opportunity_counterfactual": {
+                        "baseline_beats_hold": True,
+                        "simple_rule_baseline_beats_hold": False,
+                        "missed_breakout_count": 1,
+                        "missed_move_median_pct": 0.9,
+                        "hold_opportunity_cost": 0.7,
+                        "hold_quality": "probe_only_opportunity_hold",
+                        "trigger_context": {"signature": "volume_surge+opportunity"},
+                        "execution_context": {"signature": "acceptable_spread|deep_book|manageable_invalidation"},
+                        "trend_context": {"signature": "UP|UP"},
+                    }
+                },
+            },
+        ]
+
+        stats = self.updater._build_stats_package(
+            journals=journals,
+            window_hours=24,
+            replay_runs=replay_runs,
+        )
+
+        self.assertEqual(stats["hold_opportunity_summary"]["evaluation_count"], 2)
+        self.assertEqual(stats["hold_opportunity_summary"]["baseline_beats_hold_count"], 2)
+        self.assertEqual(stats["hold_opportunity_summary"]["missed_breakout_count"], 3)
+        self.assertEqual(stats["hold_opportunity_summary"]["simple_rule_beats_hold_count"], 1)
+        self.assertGreater(stats["hold_opportunity_summary"]["hold_opportunity_cost"], 1.0)
+        self.assertEqual(stats["hold_opportunity_summary"]["dominant_execution_context"], "acceptable_spread|deep_book|manageable_invalidation")
+        undertrading_candidates = [
+            item for item in stats["candidate_lessons"]
+            if item.get("seed_origin") == "hold_opportunity_counterfactual"
+        ]
+        self.assertEqual(len(undertrading_candidates), 1)
+        self.assertEqual(undertrading_candidates[0]["category"], "opportunity")
+        self.assertEqual(undertrading_candidates[0]["trigger_context"], "volume_surge+range_break+opportunity")
+
+    def test_build_trading_balance_summary_flags_overtrading(self):
+        summary = self.updater._build_trading_balance_summary(
+            journals=[
+                {"decision": "BUY"},
+                {"decision": "SELL"},
+                {"decision": "HOLD"},
+            ],
+            trade_cases=[
+                {
+                    "status": "closed",
+                    "entry_decision": "BUY",
+                    "estimated_pnl_pct": -1.4,
+                    "realized_pnl": -1.4,
+                },
+                {
+                    "status": "closed",
+                    "entry_decision": "SELL",
+                    "estimated_pnl_pct": -0.9,
+                    "realized_pnl": -0.9,
+                },
+            ],
+            hold_opportunity_summary={
+                "hold_opportunity_cost": 0.3,
+                "missed_breakout_count": 0,
+                "missed_move_median_pct": 0.0,
+            },
+        )
+
+        self.assertEqual(summary["stance"], "overtrading")
+        self.assertGreater(summary["false_entry_cost"], summary["hold_opportunity_cost"])
+        self.assertEqual(summary["false_entry_cost_pct"], summary["false_entry_cost"])
+        self.assertGreater(summary["false_entry_cost_amount"], 0.0)
+        self.assertLess(summary["balance_score"], 1.0)
+        self.assertLess(summary["pressure_ratio"], 1.0)
+
+    def test_prepare_memory_entries_persists_hold_context_fields(self):
+        stats = {
+            "window_hours": 24,
+            "journal_count": 4,
+            "evaluated_trade_count": 2,
+            "win_rate": 50.0,
+            "avg_estimated_pnl_pct": 0.1,
+            "ledger_stats": {"net_realized_pnl": 1.2},
+            "trade_case_patterns": {},
+            "trade_case_clusters": [],
+            "trade_case_cluster_evaluation": {},
+            "retrieval_evaluation_summary": {},
+            "retrieval_counterfactual_summary": {},
+            "hold_opportunity_summary": {},
+            "trading_balance_summary": {},
+            "execution_policy_summary": {},
+            "candidate_lessons": [],
+            "trade_case_count": 0,
+            "retrieval_evaluation_count": 0,
+            "replay_run_count": 0,
+            "execution_policy_evaluation_count": 0,
+            "closed_trade_case_count": 0,
+        }
+        lessons = [
+            MemoryLesson(
+                rule="Allow small probe entries when range breaks align with tradable execution.",
+                regime="aligned_up_normal",
+                category="opportunity",
+                support_count=3,
+                evidence_journal_ids=[11, 12, 13],
+                apply_when=MemoryCondition(
+                    regime=["aligned_up_normal"],
+                    volatility=["normal"],
+                    trend=["aligned_up"],
+                ),
+                ignore_when=["Ignore when spread widens materially."],
+                trigger_context="volume_surge+range_break+opportunity",
+                execution_context="acceptable_spread|deep_book|manageable_invalidation",
+                trend_context="UP|UP",
+                hold_quality="missed_opportunity_hold",
+            )
+        ]
+
+        entries = self.updater._prepare_memory_entries(stats, lessons)
+
+        self.assertEqual(entries[0]["metrics"]["trigger_context"], "volume_surge+range_break+opportunity")
+        self.assertEqual(entries[0]["metrics"]["execution_context"], "acceptable_spread|deep_book|manageable_invalidation")
+        self.assertEqual(entries[0]["metrics"]["trend_context"], "UP|UP")
+        self.assertEqual(entries[0]["metrics"]["hold_quality"], "missed_opportunity_hold")
+
+    def test_build_confidence_calibration_summary_tracks_alignment(self):
+        summary = self.updater._build_confidence_calibration_summary(
+            [
+                {"decision": "BUY", "confidence": 0.9, "estimated_pnl_pct": -0.6},
+                {"decision": "SELL", "confidence": 0.8, "estimated_pnl_pct": 0.7},
+                {"decision": "HOLD", "confidence": 0.35, "estimated_pnl_pct": 0.05},
+                {"decision": "HOLD", "confidence": 0.85, "estimated_pnl_pct": 0.9},
+            ]
+        )
+
+        self.assertEqual(summary["evaluated_count"], 4)
+        self.assertGreater(summary["calibration_gap"], 0.0)
+        self.assertGreater(summary["high_conf_error_rate"], 0.0)
+        self.assertLess(summary["alignment_score"], 1.0)
+
+    def test_merge_candidate_lessons_preserves_seed_specificity_and_drops_unmatched_generated(self):
+        candidates = [
+            MemoryLesson(
+                rule="Allow probes only when trigger pressure aligns with tradable execution.",
+                regime="aligned_up_high",
+                category="opportunity",
+                support_count=4,
+                evidence_journal_ids=[10, 11],
+                apply_when=MemoryCondition(
+                    regime=["aligned_up_high"],
+                    volatility=["high"],
+                    trend=["aligned_up"],
+                ),
+                ignore_when=["Ignore when spreads widen."],
+                trigger_context="volume_surge+range_break+opportunity",
+                execution_context="acceptable_spread|deep_book|manageable_invalidation",
+                trend_context="UP|UP",
+                hold_quality="missed_opportunity_hold",
+            )
+        ]
+        generated = [
+            MemoryLesson(
+                rule="Allow probes when trigger pressure aligns.",
+                regime="general",
+                category="opportunity",
+                support_count=5,
+                evidence_journal_ids=[11, 12],
+                apply_when=MemoryCondition(
+                    regime=["general"],
+                    volatility=["normal"],
+                    trend=["mixed"],
+                ),
+                ignore_when=["Ignore rarely."],
+            ),
+            MemoryLesson(
+                rule="Always reduce quickly after random volatility spikes.",
+                regime="general",
+                category="risk_control",
+                support_count=4,
+                evidence_journal_ids=[77],
+                apply_when=MemoryCondition(
+                    regime=["general"],
+                    volatility=["high"],
+                    trend=["mixed"],
+                ),
+                ignore_when=["Ignore when unknown."],
+            ),
+        ]
+
+        merged = self.updater._merge_candidate_lessons(candidates, generated)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].trigger_context, "volume_surge+range_break+opportunity")
+        self.assertEqual(merged[0].execution_context, "acceptable_spread|deep_book|manageable_invalidation")
+        self.assertEqual(merged[0].apply_when.regime, ["aligned_up_high"])
+
+    def test_promote_candidate_policies_blocks_unbalanced_alpha_candidate(self):
+        class DummyStore:
+            def __init__(self):
+                self.promotions = []
+
+            def build_policy_key(self, domain, regime_key):
+                return f"champion:{domain}:{regime_key}"
+
+            def get_policy_registry_entry(self, policy_key):
+                return {}
+
+            def upsert_policy_registry(self, payload):
+                self.promotions.append(payload)
+
+            def save_policy_promotion(self, payload):
+                self.promotions.append(payload)
+
+        self.updater.state_store = DummyStore()
+        candidates = [
+            {
+                "id": 11,
+                "domain": "alpha_1h",
+                "policy_type": "entry_filter",
+                "regime_key": "aligned_up|normal",
+                "rule_text": "Allow probes when trend is aligned.",
+                "config": {},
+            }
+        ]
+        evaluations = [
+            {
+                "candidate_policy_id": 11,
+                "evaluation_scope": "seed",
+                "sample_count": 6,
+                "score": 0.4,
+                "metrics": {
+                    "regime_key": "aligned_up|normal",
+                    "trading_balance_summary": {
+                        "hold_opportunity_cost": 4.2,
+                        "false_entry_cost": 0.4,
+                        "balance_score": 0.18,
+                        "pressure_ratio": 10.5,
+                    },
+                },
+            }
+        ]
+
+        self.updater._promote_candidate_policies(candidates, evaluations)
+
+        self.assertEqual(self.updater.state_store.promotions, [])
+
+    def test_promote_candidate_policies_blocks_negative_holdout_candidate(self):
+        class DummyStore:
+            def __init__(self):
+                self.promotions = []
+
+            def build_policy_key(self, domain, regime_key):
+                return f"champion:{domain}:{regime_key}"
+
+            def get_policy_registry_entry(self, policy_key):
+                return {}
+
+            def upsert_policy_registry(self, payload):
+                self.promotions.append(payload)
+
+            def save_policy_promotion(self, payload):
+                self.promotions.append(payload)
+
+        self.updater.state_store = DummyStore()
+        candidates = [
+            {
+                "id": 12,
+                "domain": "alpha_1h",
+                "policy_type": "entry_filter",
+                "regime_key": "aligned_up|high",
+                "rule_text": "Probe aligned breakouts with strong execution.",
+                "config": {},
+            }
+        ]
+        evaluations = [
+            {
+                "candidate_policy_id": 12,
+                "evaluation_scope": "shadow",
+                "sample_count": 5,
+                "score": 0.42,
+                "metrics": {
+                    "regime_key": "aligned_up|high",
+                    "confidence_alignment_score": 0.62,
+                    "temporal_holdout_summary": {
+                        "train_count": 3,
+                        "holdout_count": 2,
+                        "train_score": 0.8,
+                        "holdout_score": -0.2,
+                        "score_gap": 1.0,
+                        "stability_score": 0.18,
+                    },
+                    "trading_balance_summary": {
+                        "hold_opportunity_cost": 0.8,
+                        "false_entry_cost": 0.6,
+                        "balance_score": 0.82,
+                        "pressure_ratio": 1.1,
+                        "portfolio_utility_score": 0.74,
+                    },
+                },
+            }
+        ]
+
+        self.updater._promote_candidate_policies(candidates, evaluations)
+
+        self.assertEqual(self.updater.state_store.promotions, [])
+
     def test_retrieval_counterfactual_summary_uses_path_utility_not_only_pnl_sign(self):
         summary = self.updater._apply_retrieval_outcome_counterfactual_summary(
             summary={

@@ -182,6 +182,29 @@ class StateStore:
                     payload JSON
                 );
 
+                CREATE TABLE IF NOT EXISTS market_snapshot_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL,
+                    current_price REAL,
+                    mark_price REAL,
+                    mid_price REAL,
+                    spread_bps REAL,
+                    spread_percentile_1h REAL,
+                    depth_percentile_1h REAL,
+                    depth_notional_top5 REAL,
+                    spread_vs_1h_avg REAL,
+                    volume_ratio_15m REAL,
+                    distance_to_invalid_level REAL,
+                    trigger_active BOOLEAN DEFAULT 0,
+                    risk_trigger_active BOOLEAN DEFAULT 0,
+                    volume_surge_trigger_active BOOLEAN DEFAULT 0,
+                    fast_move_trigger_active BOOLEAN DEFAULT 0,
+                    range_break_trigger_active BOOLEAN DEFAULT 0,
+                    trend_1h TEXT,
+                    payload JSON
+                );
+
                 CREATE TABLE IF NOT EXISTS trade_case_vector_index (
                     trade_case_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
@@ -511,6 +534,9 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_trade_case_snapshots_case_time
                 ON trade_case_snapshots(trade_case_id, timestamp);
 
+                CREATE INDEX IF NOT EXISTS idx_market_snapshot_history_symbol_time
+                ON market_snapshot_history(symbol, timestamp, id);
+
                 CREATE INDEX IF NOT EXISTS idx_trade_case_vector_symbol_closed_at
                 ON trade_case_vector_index(symbol, closed_at);
 
@@ -659,6 +685,12 @@ class StateStore:
         self._ensure_column("order_runtime_state", "lineage_role", "TEXT")
         self._ensure_column("order_runtime_state", "lineage_parent_order_id", "TEXT")
         self._ensure_column("order_runtime_state", "lineage_parent_client_order_id", "TEXT")
+        self._ensure_column("market_snapshot_history", "depth_notional_top5", "REAL")
+        self._ensure_column("market_snapshot_history", "spread_vs_1h_avg", "REAL")
+        self._ensure_column("market_snapshot_history", "volume_surge_trigger_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "fast_move_trigger_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "range_break_trigger_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "trend_1h", "TEXT")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str):
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
@@ -1999,6 +2031,115 @@ class StateStore:
                 )
         except Exception as e:
             logger.error(f"Failed to save trade case snapshots: {e}")
+
+    def save_market_snapshot_history(self, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO market_snapshot_history (
+                        timestamp,
+                        symbol,
+                        current_price,
+                        mark_price,
+                        mid_price,
+                        spread_bps,
+                        spread_percentile_1h,
+                        depth_percentile_1h,
+                        depth_notional_top5,
+                        spread_vs_1h_avg,
+                        volume_ratio_15m,
+                        distance_to_invalid_level,
+                        trigger_active,
+                        risk_trigger_active,
+                        volume_surge_trigger_active,
+                        fast_move_trigger_active,
+                        range_break_trigger_active,
+                        trend_1h,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            entry.get("timestamp"),
+                            entry.get("symbol"),
+                            entry.get("current_price"),
+                            entry.get("mark_price"),
+                            entry.get("mid_price"),
+                            entry.get("spread_bps"),
+                            entry.get("spread_percentile_1h"),
+                            entry.get("depth_percentile_1h"),
+                            entry.get("depth_notional_top5"),
+                            entry.get("spread_vs_1h_avg"),
+                            entry.get("volume_ratio_15m"),
+                            entry.get("distance_to_invalid_level"),
+                            int(bool(entry.get("trigger_active"))),
+                            int(bool(entry.get("risk_trigger_active"))),
+                            int(bool(entry.get("volume_surge_trigger_active"))),
+                            int(bool(entry.get("fast_move_trigger_active"))),
+                            int(bool(entry.get("range_break_trigger_active"))),
+                            entry.get("trend_1h"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                        if entry.get("symbol")
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save market snapshot history: {e}")
+
+    def get_market_snapshot_history_between(
+        self,
+        symbol: str,
+        start_timestamp: datetime,
+        end_timestamp: datetime,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                id,
+                timestamp,
+                symbol,
+                current_price,
+                mark_price,
+                mid_price,
+                spread_bps,
+                spread_percentile_1h,
+                depth_percentile_1h,
+                depth_notional_top5,
+                spread_vs_1h_avg,
+                volume_ratio_15m,
+                distance_to_invalid_level,
+                trigger_active,
+                risk_trigger_active,
+                volume_surge_trigger_active,
+                fast_move_trigger_active,
+                range_break_trigger_active,
+                trend_1h,
+                payload
+            FROM market_snapshot_history
+            WHERE symbol = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            ORDER BY timestamp ASC, id ASC
+        """
+        params: List[Any] = [
+            str(symbol or "").strip().upper(),
+            start_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            end_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
 
     def get_trade_case_snapshots(self, trade_case_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         query = """
@@ -3675,6 +3816,104 @@ class StateStore:
             rows.append(item)
         return rows
 
+    def get_market_path_between(
+        self,
+        symbol: str,
+        start_timestamp: datetime,
+        end_timestamp: datetime,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        history_rows = self.get_market_snapshot_history_between(
+            symbol,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            limit=limit,
+        )
+        merged_rows: Dict[str, Dict[str, Any]] = {}
+        for item in history_rows:
+            timestamp_key = str(item.get("timestamp") or "")
+            merged_rows[timestamp_key] = {
+                "id": item.get("id"),
+                "timestamp": item.get("timestamp"),
+                "symbol": item.get("symbol"),
+                "current_price": item.get("current_price"),
+                "mark_price": item.get("mark_price"),
+                "mid_price": item.get("mid_price"),
+                "spread_bps": item.get("spread_bps"),
+                "spread_percentile_1h": item.get("spread_percentile_1h"),
+                "depth_percentile_1h": item.get("depth_percentile_1h"),
+                "depth_notional_top5": item.get("depth_notional_top5"),
+                "spread_vs_1h_avg": item.get("spread_vs_1h_avg"),
+                "volume_ratio_15m": item.get("volume_ratio_15m"),
+                "distance_to_invalid_level": item.get("distance_to_invalid_level"),
+                "trigger_active": bool(item.get("trigger_active")),
+                "risk_trigger_active": bool(item.get("risk_trigger_active")),
+                "volume_surge_trigger_active": bool(item.get("volume_surge_trigger_active")),
+                "fast_move_trigger_active": bool(item.get("fast_move_trigger_active")),
+                "range_break_trigger_active": bool(item.get("range_break_trigger_active")),
+                "trend_1h": item.get("trend_1h"),
+                "snapshot": item.get("payload") or {},
+                "_source": "market_snapshot_history",
+            }
+        query = """
+            SELECT
+                id,
+                timestamp,
+                market_state
+            FROM audit_logs
+            WHERE timestamp >= ?
+              AND timestamp <= ?
+              AND market_state IS NOT NULL
+            ORDER BY timestamp ASC, id ASC
+        """
+        params: List[Any] = [
+            start_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            end_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        target_symbol = str(symbol or "").strip().upper()
+        for row in cursor.fetchall():
+            item = dict(row)
+            market_state = self._safe_json_loads(item.get("market_state"), default={})
+            snapshot = ((market_state.get("market_snapshots") or {}).get(target_symbol) or {})
+            if not snapshot:
+                continue
+            order_book = snapshot.get("order_book") or {}
+            timestamp_key = str(item.get("timestamp") or "")
+            if timestamp_key in merged_rows:
+                continue
+            merged_rows[timestamp_key] = {
+                "id": item.get("id"),
+                "timestamp": item.get("timestamp"),
+                "symbol": target_symbol,
+                "current_price": snapshot.get("current_price"),
+                "mark_price": snapshot.get("mark_price"),
+                "mid_price": order_book.get("mid_price"),
+                "spread_bps": order_book.get("spread_bps"),
+                "spread_percentile_1h": snapshot.get("spread_percentile_1h"),
+                "depth_percentile_1h": snapshot.get("depth_percentile_1h"),
+                "depth_notional_top5": snapshot.get("depth_notional_top5"),
+                "spread_vs_1h_avg": snapshot.get("spread_vs_1h_avg"),
+                "volume_ratio_15m": snapshot.get("volume_ratio_15m"),
+                "distance_to_invalid_level": snapshot.get("distance_to_invalid_level"),
+                "trigger_active": bool(snapshot.get("is_opportunity_trigger")),
+                "risk_trigger_active": bool(snapshot.get("is_risk_trigger")),
+                "volume_surge_trigger_active": bool(snapshot.get("volume_surge_trigger_active")),
+                "fast_move_trigger_active": bool(snapshot.get("fast_move_trigger_active")),
+                "range_break_trigger_active": bool(snapshot.get("range_break_trigger_active")),
+                "trend_1h": snapshot.get("trend_1h"),
+                "snapshot": snapshot,
+                "_source": "audit_market_state",
+            }
+        rows = [item for _, item in sorted(merged_rows.items(), key=lambda pair: pair[0])]
+        if limit is not None:
+            return rows[:limit]
+        return rows
+
     def get_execution_fills(self, audit_log_id: int) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
             """
@@ -4687,6 +4926,10 @@ class StateStore:
         item["canonical_key"] = metrics.get("canonical_key")
         item["merge_count"] = int(metrics.get("merge_count") or 0)
         item["revive_count"] = int(metrics.get("revive_count") or 0)
+        item["trigger_context"] = str(metrics.get("trigger_context") or "")
+        item["execution_context"] = str(metrics.get("execution_context") or "")
+        item["trend_context"] = str(metrics.get("trend_context") or "")
+        item["hold_quality"] = str(metrics.get("hold_quality") or "")
         return item
 
     def _format_journal_summary(self, row: Dict[str, Any]) -> str:

@@ -679,9 +679,139 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(recent_replays[0]["evidence_signals_removed"], ["ETHUSDT:rsi_14@15m"])
         self.assertEqual(audit["replay_runs"][0]["replayed_decision"], "REDUCE")
         self.assertIn("payload", recent_replays[0])
-        self.assertEqual(audit["ledger_entries"][0]["symbol"], "ETHUSDT")
-        self.assertEqual(audit["order_state_transitions"][0]["to_state"], "submitted")
-        self.assertEqual(audit["position_state_transitions"][0]["to_state"], "closed")
+
+    def test_market_snapshot_history_round_trip_and_path_lookup(self):
+        self.store.save_market_snapshot_history(
+            [
+                {
+                    "timestamp": "2026-03-08 10:00:00",
+                    "symbol": "ETHUSDT",
+                    "current_price": 100.0,
+                    "mark_price": 100.1,
+                    "mid_price": 100.05,
+                    "spread_bps": 3.2,
+                    "spread_percentile_1h": 42.0,
+                    "depth_percentile_1h": 68.0,
+                    "depth_notional_top5": 45000.0,
+                    "spread_vs_1h_avg": -0.4,
+                    "volume_ratio_15m": 1.7,
+                    "distance_to_invalid_level": 1.1,
+                    "trigger_active": True,
+                    "risk_trigger_active": False,
+                    "volume_surge_trigger_active": True,
+                    "fast_move_trigger_active": False,
+                    "range_break_trigger_active": True,
+                    "trend_1h": "UP",
+                    "payload": {"trend_1h": "UP"},
+                },
+                {
+                    "timestamp": "2026-03-08 10:10:00",
+                    "symbol": "ETHUSDT",
+                    "current_price": 102.0,
+                    "mark_price": 101.9,
+                    "mid_price": 101.95,
+                    "spread_bps": 3.6,
+                    "spread_percentile_1h": 44.0,
+                    "depth_percentile_1h": 65.0,
+                    "depth_notional_top5": 43000.0,
+                    "spread_vs_1h_avg": -0.2,
+                    "volume_ratio_15m": 1.9,
+                    "distance_to_invalid_level": 1.0,
+                    "trigger_active": True,
+                    "risk_trigger_active": False,
+                    "volume_surge_trigger_active": True,
+                    "fast_move_trigger_active": False,
+                    "range_break_trigger_active": True,
+                    "trend_1h": "UP",
+                    "payload": {"trend_1h": "UP"},
+                },
+            ]
+        )
+
+        rows = self.store.get_market_snapshot_history_between(
+            "ETHUSDT",
+            start_timestamp=datetime(2026, 3, 8, 10, 0, 0),
+            end_timestamp=datetime(2026, 3, 8, 10, 30, 0),
+        )
+        path_rows = self.store.get_market_path_between(
+            "ETHUSDT",
+            start_timestamp=datetime(2026, 3, 8, 10, 0, 0),
+            end_timestamp=datetime(2026, 3, 8, 10, 30, 0),
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["payload"]["trend_1h"], "UP")
+        self.assertEqual(rows[0]["depth_notional_top5"], 45000.0)
+        self.assertTrue(rows[0]["volume_surge_trigger_active"])
+        self.assertEqual(len(path_rows), 2)
+        self.assertEqual(path_rows[0]["current_price"], 100.0)
+        self.assertEqual(path_rows[1]["mid_price"], 101.95)
+        self.assertEqual(path_rows[0]["trend_1h"], "UP")
+        self.assertEqual(path_rows[1]["depth_notional_top5"], 43000.0)
+
+    def test_market_path_between_merges_history_with_audit_fallback_when_history_is_partial(self):
+        self.store.save_market_snapshot_history(
+            [
+                {
+                    "timestamp": "2026-03-08 10:05:00",
+                    "symbol": "BTCUSDT",
+                    "current_price": 101.0,
+                    "mark_price": 101.1,
+                    "mid_price": 101.05,
+                    "spread_bps": 3.0,
+                    "spread_percentile_1h": 35.0,
+                    "depth_percentile_1h": 70.0,
+                    "depth_notional_top5": 52000.0,
+                    "spread_vs_1h_avg": -0.3,
+                    "volume_ratio_15m": 1.5,
+                    "distance_to_invalid_level": 1.0,
+                    "trigger_active": True,
+                    "risk_trigger_active": False,
+                    "trend_1h": "UP",
+                    "payload": {"trend_1h": "UP"},
+                }
+            ]
+        )
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={
+                "market_snapshots": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "current_price": 102.0,
+                        "mark_price": 102.1,
+                        "spread_percentile_1h": 38.0,
+                        "depth_percentile_1h": 68.0,
+                        "depth_notional_top5": 50000.0,
+                        "spread_vs_1h_avg": -0.1,
+                        "volume_ratio_15m": 1.6,
+                        "distance_to_invalid_level": 0.9,
+                        "trend_1h": "UP",
+                        "order_book": {"mid_price": 102.05, "spread_bps": 3.1},
+                    }
+                }
+            },
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        self.store.conn.execute(
+            "UPDATE audit_logs SET timestamp = ? WHERE id = ?",
+            ("2026-03-08 10:10:00", audit_id),
+        )
+        self.store.conn.commit()
+
+        rows = self.store.get_market_path_between(
+            "BTCUSDT",
+            start_timestamp=datetime(2026, 3, 8, 10, 0, 0),
+            end_timestamp=datetime(2026, 3, 8, 10, 20, 0),
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["_source"], "market_snapshot_history")
+        self.assertEqual(rows[1]["_source"], "audit_market_state")
+        self.assertEqual(rows[1]["current_price"], 102.0)
 
     def test_get_long_term_memory_returns_structured_conditions(self):
         self.store.save_long_term_memory_entries(

@@ -1,5 +1,6 @@
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Dict
 
 from core.models import AccountState, MarketSnapshot, RiskStateSnapshot, coerce_risk_state_snapshot
@@ -102,6 +103,41 @@ class SnapshotService:
                 return True
         return False
 
+    def _build_market_snapshot_history_entries(
+        self,
+        market_snapshots: Dict[str, MarketSnapshot],
+        *,
+        now_epoch: float,
+    ) -> list[Dict[str, Any]]:
+        timestamp = datetime.fromtimestamp(now_epoch, UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        entries: list[Dict[str, Any]] = []
+        for symbol, snapshot in (market_snapshots or {}).items():
+            order_book = getattr(snapshot, "order_book", None)
+            entries.append(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbol,
+                    "current_price": getattr(snapshot, "current_price", None),
+                    "mark_price": getattr(snapshot, "mark_price", None),
+                    "mid_price": getattr(order_book, "mid_price", None) if order_book is not None else None,
+                    "spread_bps": getattr(order_book, "spread_bps", None) if order_book is not None else None,
+                    "spread_percentile_1h": getattr(snapshot, "spread_percentile_1h", None),
+                    "depth_percentile_1h": getattr(snapshot, "depth_percentile_1h", None),
+                    "depth_notional_top5": getattr(snapshot, "depth_notional_top5", None),
+                    "spread_vs_1h_avg": getattr(snapshot, "spread_vs_1h_avg", None),
+                    "volume_ratio_15m": getattr(snapshot, "volume_ratio_15m", None),
+                    "distance_to_invalid_level": getattr(snapshot, "distance_to_invalid_level", None),
+                    "trigger_active": bool(getattr(snapshot, "is_opportunity_trigger", False)),
+                    "risk_trigger_active": bool(getattr(snapshot, "is_risk_trigger", False)),
+                    "volume_surge_trigger_active": bool(getattr(snapshot, "volume_surge_trigger_active", False)),
+                    "fast_move_trigger_active": bool(getattr(snapshot, "fast_move_trigger_active", False)),
+                    "range_break_trigger_active": bool(getattr(snapshot, "range_break_trigger_active", False)),
+                    "trend_1h": getattr(snapshot, "trend_1h", None),
+                    "payload": snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else {},
+                }
+            )
+        return entries
+
     def materialize(self, now_epoch: float | None = None, force: bool = False) -> SnapshotBundle:
         now_epoch = time.time() if now_epoch is None else float(now_epoch)
         current_bucket = self._bucket(now_epoch, self.materialization_minutes)
@@ -138,6 +174,13 @@ class SnapshotService:
             self._last_timeframe_buckets[timeframe] = self._bucket(
                 now_epoch,
                 self.TIMEFRAME_MINUTES[timeframe],
+            )
+        if hasattr(self.state_store, "save_market_snapshot_history"):
+            self.state_store.save_market_snapshot_history(
+                self._build_market_snapshot_history_entries(
+                    market_snapshots,
+                    now_epoch=now_epoch,
+                )
             )
 
         is_trigger_mode = self._should_enable_trigger_mode(market_snapshots)

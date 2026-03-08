@@ -37,6 +37,10 @@ class MemoryLesson(BaseModel):
         description="Counterexamples or conditions where the lesson should be ignored.",
         min_length=1,
     )
+    trigger_context: str = ""
+    execution_context: str = ""
+    trend_context: str = ""
+    hold_quality: str = ""
 
 
 class MemoryUpdater:
@@ -251,6 +255,13 @@ class MemoryUpdater:
             replay_runs=replay_runs,
             retrieval_evaluations=retrieval_evaluations,
         )
+        hold_opportunity_summary = self._build_hold_opportunity_summary(replay_runs, journals=journals)
+        trading_balance_summary = self._build_trading_balance_summary(
+            journals=journals,
+            trade_cases=trade_cases,
+            hold_opportunity_summary=hold_opportunity_summary,
+        )
+        confidence_calibration_summary = self._build_confidence_calibration_summary(journals)
         execution_policy_summary = self._build_execution_policy_summary(execution_policy_evaluations)
         execution_policy_recommendations = self._build_execution_policy_recommendations(
             execution_policy_evaluations
@@ -264,6 +275,14 @@ class MemoryUpdater:
                 winning_evidence_signals=winning_evidence_signals,
                 losing_evidence_signals=losing_evidence_signals,
                 evidence_quality_patterns=evidence_quality_patterns,
+            ),
+            self._build_undertrading_candidate_lessons(
+                hold_opportunity_summary=hold_opportunity_summary,
+                journals=journals,
+            ),
+            self._build_overtrading_candidate_lessons(
+                trading_balance_summary=trading_balance_summary,
+                journals=journals,
             ),
             symbol_candidate_lessons,
             trade_case_candidate_lessons,
@@ -309,6 +328,9 @@ class MemoryUpdater:
             "trade_case_cluster_evaluation": trade_case_cluster_evaluation,
             "retrieval_evaluation_summary": retrieval_evaluation_summary,
             "retrieval_counterfactual_summary": retrieval_counterfactual_summary,
+            "hold_opportunity_summary": hold_opportunity_summary,
+            "trading_balance_summary": trading_balance_summary,
+            "confidence_calibration_summary": confidence_calibration_summary,
             "execution_policy_summary": execution_policy_summary,
             "execution_policy_recommendations": execution_policy_recommendations,
             "shadow_policy_summary": shadow_policy_summary,
@@ -1038,6 +1060,334 @@ class MemoryUpdater:
             "without_retrieval_better_count": 0,
             "outcome_tie_count": 0,
             "avg_outcome_utility_delta": 0.0,
+        }
+
+    def _build_hold_opportunity_summary(
+        self,
+        replay_runs: List[Dict[str, Any]],
+        *,
+        journals: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        journal_by_audit_id = {
+            int(row.get("audit_log_id") or 0): row
+            for row in journals or []
+            if int(row.get("audit_log_id") or 0) > 0
+        }
+        evaluated = 0
+        baseline_beats_hold_count = 0
+        missed_breakout_count = 0
+        opportunity_costs: List[float] = []
+        missed_moves: List[float] = []
+        evidence_journal_ids: List[int] = []
+        regime_counts: Dict[str, int] = {}
+        hold_quality_counts: Dict[str, int] = {}
+        trigger_context_counts: Dict[str, int] = {}
+        execution_context_counts: Dict[str, int] = {}
+        trend_context_counts: Dict[str, int] = {}
+        simple_rule_beats_hold_count = 0
+        for row in replay_runs or []:
+            payload = row.get("payload") or {}
+            counterfactual = payload.get("hold_opportunity_counterfactual") or {}
+            if not counterfactual:
+                continue
+            evaluated += 1
+            if bool(counterfactual.get("baseline_beats_hold")):
+                baseline_beats_hold_count += 1
+            if bool(counterfactual.get("simple_rule_baseline_beats_hold")):
+                simple_rule_beats_hold_count += 1
+            missed_breakout_count += int(counterfactual.get("missed_breakout_count") or 0)
+            cost_value = self._coerce_float(counterfactual.get("hold_opportunity_cost"))
+            if cost_value is not None:
+                opportunity_costs.append(cost_value)
+            move_value = self._coerce_float(counterfactual.get("missed_move_median_pct"))
+            if move_value is not None and move_value > 0:
+                missed_moves.append(move_value)
+            hold_quality = str(counterfactual.get("hold_quality") or "").strip()
+            if hold_quality:
+                hold_quality_counts[hold_quality] = hold_quality_counts.get(hold_quality, 0) + 1
+            trigger_signature = str(((counterfactual.get("trigger_context") or {}).get("signature")) or "").strip()
+            if trigger_signature:
+                trigger_context_counts[trigger_signature] = trigger_context_counts.get(trigger_signature, 0) + 1
+            execution_signature = str(((counterfactual.get("execution_context") or {}).get("signature")) or "").strip()
+            if execution_signature:
+                execution_context_counts[execution_signature] = execution_context_counts.get(execution_signature, 0) + 1
+            trend_signature = str(((counterfactual.get("trend_context") or {}).get("signature")) or "").strip()
+            if trend_signature:
+                trend_context_counts[trend_signature] = trend_context_counts.get(trend_signature, 0) + 1
+            audit_id = int(row.get("audit_log_id") or 0)
+            journal = journal_by_audit_id.get(audit_id) or {}
+            journal_id = int(journal.get("id") or journal.get("journal_id") or 0)
+            if journal_id > 0 and journal_id not in evidence_journal_ids:
+                evidence_journal_ids.append(journal_id)
+            regime_summary = self._extract_market_regime_summary(journal.get("market_state") or {})
+            regime_key = self._derive_regime_label(regime_summary)
+            regime_counts[regime_key] = regime_counts.get(regime_key, 0) + 1
+        if not evaluated:
+            return {
+                "evaluation_count": 0,
+                "baseline_beats_hold_count": 0,
+                "missed_breakout_count": 0,
+                "missed_move_median_pct": 0.0,
+                "hold_opportunity_cost": 0.0,
+                "baseline_beats_hold_rate": 0.0,
+                "evidence_journal_ids": [],
+                "dominant_regime": "general",
+                "hold_quality_counts": {},
+                "simple_rule_beats_hold_count": 0,
+                "dominant_trigger_context": "none",
+                "dominant_execution_context": "unknown",
+                "dominant_trend_context": "UNKNOWN|UNKNOWN",
+            }
+        missed_moves_sorted = sorted(missed_moves)
+        median_move = (
+            missed_moves_sorted[len(missed_moves_sorted) // 2]
+            if missed_moves_sorted
+            else 0.0
+        )
+        dominant_regime = max(regime_counts.items(), key=lambda item: (item[1], item[0]))[0] if regime_counts else "general"
+        return {
+            "evaluation_count": evaluated,
+            "baseline_beats_hold_count": baseline_beats_hold_count,
+            "missed_breakout_count": missed_breakout_count,
+            "missed_move_median_pct": round(median_move, 4),
+            "hold_opportunity_cost": round(sum(opportunity_costs), 4),
+            "baseline_beats_hold_rate": round(baseline_beats_hold_count / max(1, evaluated), 4),
+            "evidence_journal_ids": evidence_journal_ids[:10],
+            "dominant_regime": dominant_regime,
+            "hold_quality_counts": hold_quality_counts,
+            "simple_rule_beats_hold_count": simple_rule_beats_hold_count,
+            "dominant_trigger_context": max(trigger_context_counts.items(), key=lambda item: (item[1], item[0]))[0] if trigger_context_counts else "none",
+            "dominant_execution_context": max(execution_context_counts.items(), key=lambda item: (item[1], item[0]))[0] if execution_context_counts else "unknown",
+            "dominant_trend_context": max(trend_context_counts.items(), key=lambda item: (item[1], item[0]))[0] if trend_context_counts else "UNKNOWN|UNKNOWN",
+        }
+
+    def _build_trading_balance_summary(
+        self,
+        *,
+        journals: List[Dict[str, Any]],
+        trade_cases: List[Dict[str, Any]],
+        hold_opportunity_summary: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        entry_journals = [
+            row for row in journals or []
+            if str(row.get("decision") or "").upper() in {"BUY", "SELL"}
+        ]
+        hold_journals = [
+            row for row in journals or []
+            if str(row.get("decision") or "").upper() == "HOLD"
+        ]
+        closed_entry_cases = [
+            row for row in trade_cases or []
+            if str(row.get("status") or "") == "closed"
+            and str(row.get("entry_decision") or "").upper() in {"BUY", "SELL"}
+        ]
+        false_entry_cost_pct_values: List[float] = []
+        false_entry_cost_amount_values: List[float] = []
+        normalized_loss_count = 0
+        win_count = 0
+        loss_count = 0
+        for row in closed_entry_cases:
+            estimated_pct = self._coerce_float(row.get("estimated_pnl_pct"))
+            realized_amount = self._coerce_float(row.get("realized_pnl"))
+            if estimated_pct is not None and estimated_pct < 0:
+                loss_count += 1
+                normalized_loss_count += 1
+                false_entry_cost_pct_values.append(abs(float(estimated_pct)))
+                if realized_amount is not None and realized_amount < 0:
+                    false_entry_cost_amount_values.append(abs(float(realized_amount)))
+            elif estimated_pct is not None and estimated_pct > 0:
+                win_count += 1
+            elif estimated_pct is None and realized_amount is not None:
+                if realized_amount < 0:
+                    loss_count += 1
+                    false_entry_cost_amount_values.append(abs(float(realized_amount)))
+                elif realized_amount > 0:
+                    win_count += 1
+        false_entry_cost = round(sum(false_entry_cost_pct_values), 4)
+        false_entry_cost_amount = round(sum(false_entry_cost_amount_values), 4)
+        closed_case_count = len(closed_entry_cases)
+        holding_minutes_values = [
+            float(value)
+            for value in (
+                self._coerce_float(row.get("holding_minutes"))
+                for row in closed_entry_cases
+            )
+            if value is not None and value >= 0
+        ]
+        slippage_values = [
+            float(value)
+            for value in (
+                self._coerce_float(row.get("slippage_bps"))
+                for row in closed_entry_cases
+            )
+            if value is not None and value >= 0
+        ]
+        losing_mae_values = [
+            abs(float(value))
+            for row in closed_entry_cases
+            for value in [self._coerce_float(row.get("observed_mae_pct"))]
+            if value is not None
+            and (
+                (self._coerce_float(row.get("estimated_pnl_pct")) is not None and float(self._coerce_float(row.get("estimated_pnl_pct")) or 0.0) < 0)
+                or (self._coerce_float(row.get("realized_pnl")) is not None and float(self._coerce_float(row.get("realized_pnl")) or 0.0) < 0)
+            )
+        ]
+        undertrading_pressure = float(hold_opportunity_summary.get("hold_opportunity_cost") or 0.0)
+        overtrading_pressure = false_entry_cost
+        total_pressure = undertrading_pressure + overtrading_pressure
+        balance_score = 1.0
+        if total_pressure > 0:
+            balance_score = max(
+                0.0,
+                1.0 - (abs(undertrading_pressure - overtrading_pressure) / total_pressure),
+            )
+        if undertrading_pressure > (overtrading_pressure * 1.15):
+            stance = "undertrading"
+        elif overtrading_pressure > (undertrading_pressure * 1.15):
+            stance = "overtrading"
+        else:
+            stance = "balanced"
+        pressure_ratio = 1.0
+        if overtrading_pressure > 0:
+            pressure_ratio = undertrading_pressure / overtrading_pressure
+        elif undertrading_pressure > 0:
+            pressure_ratio = float("inf")
+        journal_count = max(1, len(journals))
+        turnover_rate = closed_case_count / journal_count
+        capital_idle_ratio = len(hold_journals) / journal_count
+        avg_holding_minutes = sum(holding_minutes_values) / max(1, len(holding_minutes_values)) if holding_minutes_values else 0.0
+        avg_entry_slippage_bps = sum(slippage_values) / max(1, len(slippage_values)) if slippage_values else 0.0
+        drawdown_path_penalty = sum(losing_mae_values) / max(1, len(losing_mae_values)) if losing_mae_values else 0.0
+        regime_capacity_penalty = max(
+            0.0,
+            (int(hold_opportunity_summary.get("missed_breakout_count") or 0) * 0.12)
+            - (closed_case_count * 0.03),
+        )
+        portfolio_utility_score = max(
+            0.0,
+            min(
+                1.0,
+                0.55
+                + (balance_score * 0.2)
+                - min(0.18, capital_idle_ratio * 0.18)
+                - min(0.14, turnover_rate * 0.1)
+                - min(0.18, drawdown_path_penalty * 0.06)
+                - min(0.12, avg_entry_slippage_bps * 0.01)
+                - min(0.12, regime_capacity_penalty * 0.05),
+            ),
+        )
+        return {
+            "entry_decision_count": len(entry_journals),
+            "hold_decision_count": len(hold_journals),
+            "closed_entry_case_count": closed_case_count,
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "false_entry_cost": false_entry_cost,
+            "false_entry_cost_amount": false_entry_cost_amount,
+            "false_entry_cost_pct": false_entry_cost,
+            "normalized_false_entry_loss_count": normalized_loss_count,
+            "hold_opportunity_cost": undertrading_pressure,
+            "missed_breakout_count": int(hold_opportunity_summary.get("missed_breakout_count") or 0),
+            "missed_move_median_pct": float(hold_opportunity_summary.get("missed_move_median_pct") or 0.0),
+            "undertrading_pressure": round(undertrading_pressure, 4),
+            "overtrading_pressure": round(overtrading_pressure, 4),
+            "pressure_ratio": round(pressure_ratio, 4) if math.isfinite(pressure_ratio) else None,
+            "balance_score": round(balance_score, 4),
+            "turnover_rate": round(turnover_rate, 4),
+            "capital_idle_ratio": round(capital_idle_ratio, 4),
+            "avg_holding_minutes": round(avg_holding_minutes, 4),
+            "avg_entry_slippage_bps": round(avg_entry_slippage_bps, 4),
+            "drawdown_path_penalty": round(drawdown_path_penalty, 4),
+            "regime_capacity_penalty": round(regime_capacity_penalty, 4),
+            "portfolio_utility_score": round(portfolio_utility_score, 4),
+            "stance": stance,
+        }
+
+    def _classify_confidence_outcome(self, row: Dict[str, Any]) -> float | None:
+        confidence = self._coerce_float(row.get("confidence"))
+        if confidence is None:
+            return None
+        decision = str(row.get("decision") or "").upper().strip()
+        pnl = self._coerce_float(row.get("estimated_pnl_pct"))
+        if pnl is None:
+            return None
+        if decision in {"BUY", "SELL"}:
+            return 1.0 if pnl > 0 else 0.0
+        if decision == "HOLD":
+            return 1.0 if pnl <= 0.2 else 0.0
+        return None
+
+    def _build_confidence_calibration_summary(self, journals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        evaluated_rows = []
+        for row in journals or []:
+            observed = self._classify_confidence_outcome(row)
+            confidence = self._coerce_float(row.get("confidence"))
+            if observed is None or confidence is None:
+                continue
+            evaluated_rows.append((float(confidence), float(observed)))
+        if not evaluated_rows:
+            return {
+                "evaluated_count": 0,
+                "avg_confidence": 0.0,
+                "empirical_success_rate": 0.0,
+                "calibration_gap": 0.0,
+                "brier_score": 0.0,
+                "high_conf_error_rate": 0.0,
+                "low_conf_success_rate": 0.0,
+                "alignment_score": 0.5,
+                "buckets": [],
+            }
+        calibration_gap = sum(abs(conf - observed) for conf, observed in evaluated_rows) / len(evaluated_rows)
+        brier_score = sum((conf - observed) ** 2 for conf, observed in evaluated_rows) / len(evaluated_rows)
+        high_conf_rows = [(conf, observed) for conf, observed in evaluated_rows if conf >= 0.7]
+        low_conf_rows = [(conf, observed) for conf, observed in evaluated_rows if conf <= 0.45]
+        high_conf_error_rate = (
+            sum(1.0 for _, observed in high_conf_rows if observed < 0.5) / len(high_conf_rows)
+            if high_conf_rows
+            else 0.0
+        )
+        low_conf_success_rate = (
+            sum(observed for _, observed in low_conf_rows) / len(low_conf_rows)
+            if low_conf_rows
+            else 0.0
+        )
+        buckets = []
+        for lower, upper in ((0.0, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)):
+            bucket_rows = [(conf, observed) for conf, observed in evaluated_rows if lower <= conf < upper]
+            if not bucket_rows:
+                continue
+            bucket_avg_conf = sum(conf for conf, _ in bucket_rows) / len(bucket_rows)
+            bucket_success = sum(observed for _, observed in bucket_rows) / len(bucket_rows)
+            buckets.append(
+                {
+                    "bucket": f"{lower:.1f}-{min(1.0, upper):.1f}",
+                    "count": len(bucket_rows),
+                    "avg_confidence": round(bucket_avg_conf, 4),
+                    "success_rate": round(bucket_success, 4),
+                    "gap": round(abs(bucket_avg_conf - bucket_success), 4),
+                }
+            )
+        alignment_score = max(
+            0.0,
+            min(
+                1.0,
+                1.0
+                - min(0.6, calibration_gap * 0.9)
+                - min(0.25, brier_score * 0.5)
+                - min(0.2, high_conf_error_rate * 0.35)
+                + min(0.08, low_conf_success_rate * 0.08),
+            ),
+        )
+        return {
+            "evaluated_count": len(evaluated_rows),
+            "avg_confidence": round(sum(conf for conf, _ in evaluated_rows) / len(evaluated_rows), 4),
+            "empirical_success_rate": round(sum(observed for _, observed in evaluated_rows) / len(evaluated_rows), 4),
+            "calibration_gap": round(calibration_gap, 4),
+            "brier_score": round(brier_score, 4),
+            "high_conf_error_rate": round(high_conf_error_rate, 4),
+            "low_conf_success_rate": round(low_conf_success_rate, 4),
+            "alignment_score": round(alignment_score, 4),
+            "buckets": buckets,
         }
 
     def _coerce_float(self, value: Any) -> float | None:
@@ -2198,6 +2548,115 @@ class MemoryUpdater:
             )
         return candidates
 
+    def _build_undertrading_candidate_lessons(
+        self,
+        *,
+        hold_opportunity_summary: Dict[str, Any],
+        journals: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        evaluation_count = int(hold_opportunity_summary.get("evaluation_count") or 0)
+        missed_breakout_count = int(hold_opportunity_summary.get("missed_breakout_count") or 0)
+        hold_opportunity_cost = float(hold_opportunity_summary.get("hold_opportunity_cost") or 0.0)
+        if evaluation_count < 2 or missed_breakout_count < 2 or hold_opportunity_cost <= 0.5:
+            return []
+        journal_id_set = set(hold_opportunity_summary.get("evidence_journal_ids") or [])
+        selected_journals = [
+            row
+            for row in journals
+            if int(row.get("id") or row.get("journal_id") or 0) in journal_id_set
+        ]
+        regime_summary = {}
+        for row in selected_journals:
+            regime_summary = self._extract_market_regime_summary(row.get("market_state") or {})
+            if regime_summary:
+                break
+        if not regime_summary:
+            regime_label = str(hold_opportunity_summary.get("dominant_regime") or "general")
+            trend, _, volatility = regime_label.partition("_")
+            regime_summary = {
+                "portfolio": {
+                    "trend_alignment": trend or "mixed",
+                    "volatility_regime": volatility or "unknown",
+                }
+            }
+        dominant_trigger_context = str(hold_opportunity_summary.get("dominant_trigger_context") or "none")
+        dominant_execution_context = str(hold_opportunity_summary.get("dominant_execution_context") or "unknown")
+        dominant_trend_context = str(hold_opportunity_summary.get("dominant_trend_context") or "UNKNOWN|UNKNOWN")
+        simple_rule_hits = int(hold_opportunity_summary.get("simple_rule_beats_hold_count") or 0)
+        hold_quality_counts = hold_opportunity_summary.get("hold_quality_counts") or {}
+        missed_quality = "missed_opportunity_hold" if hold_quality_counts.get("missed_opportunity_hold") else "probe_only_opportunity_hold"
+        return [
+            {
+                "rule": (
+                    "When "
+                    f"{dominant_trigger_context} triggers appear with {dominant_execution_context} "
+                    f"and trend context {dominant_trend_context}, avoid default HOLD and allow a small probe entry."
+                ),
+                "regime": self._derive_regime_label(regime_summary),
+                "category": "opportunity",
+                "support_count": missed_breakout_count,
+                "evidence_journal_ids": list(journal_id_set)[:10],
+                "hypothesis": evaluation_count < 4,
+                "apply_when": self._derive_memory_condition(regime_summary).model_dump(),
+                "ignore_when": [
+                    "Ignore when the trigger mix changes materially from the stored context.",
+                    "Ignore when spread/depth context degrades relative to the stored execution bucket.",
+                    "Ignore when risk triggers dominate or the 1h trend no longer supports the probe direction.",
+                ],
+                "trigger_context": dominant_trigger_context,
+                "execution_context": dominant_execution_context,
+                "trend_context": dominant_trend_context,
+                "hold_quality": missed_quality,
+                "simple_rule_confirmation_count": simple_rule_hits,
+                "seed_signal": "hold_opportunity_counterfactual",
+                "seed_origin": "hold_opportunity_counterfactual",
+            }
+        ]
+
+    def _build_overtrading_candidate_lessons(
+        self,
+        *,
+        trading_balance_summary: Dict[str, Any],
+        journals: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if str(trading_balance_summary.get("stance") or "") != "overtrading":
+            return []
+        false_entry_cost = float(trading_balance_summary.get("false_entry_cost") or 0.0)
+        loss_count = int(trading_balance_summary.get("loss_count") or 0)
+        if loss_count < 2 or false_entry_cost <= 0.5:
+            return []
+        regime_summary = {}
+        for row in journals or []:
+            regime_summary = self._extract_market_regime_summary(row.get("market_state") or {})
+            if regime_summary:
+                break
+        if not regime_summary:
+            regime_summary = {
+                "portfolio": {
+                    "trend_alignment": "mixed",
+                    "volatility_regime": "unknown",
+                }
+            }
+        return [
+            {
+                "rule": (
+                    "When repeated entry attempts produce losses faster than missed-opportunity cost, "
+                    "tighten entry filters and require stronger confirmation before opening new exposure."
+                ),
+                "regime": self._derive_regime_label(regime_summary),
+                "category": "risk_control",
+                "support_count": loss_count,
+                "evidence_journal_ids": [],
+                "hypothesis": loss_count < 4,
+                "apply_when": self._derive_memory_condition(regime_summary).model_dump(),
+                "ignore_when": [
+                    "Ignore when missed-opportunity pressure exceeds false-entry cost and trigger quality remains strong."
+                ],
+                "seed_signal": "overtrading_balance_summary",
+                "seed_origin": "trading_balance_summary",
+            }
+        ]
+
     def _classify_evidence_quality_bucket(self, factor: float | None) -> str:
         if factor is None:
             return "unknown"
@@ -2388,6 +2847,7 @@ Rules:
 12. When evidence_quality_patterns show low evidence quality or adjusted entry caps clustering with losses, prefer explicit risk_control lessons over generic commentary.
 13. recent_trade_cases and trade_case_patterns are case-level evidence. Prefer them over free-form journal text when they show repeated failure reasons, repeated signal failures, or consistently poor slippage/excursion quality.
 14. trade_case_clusters summarize repeated lifecycle outcomes under similar symbol/failure/regime conditions. Prefer cluster-backed risk_control lessons when a cluster has multiple losses with consistent slippage or MAE pressure.
+15. If a candidate opportunity lesson includes trigger_context, execution_context, trend_context, or hold_quality, preserve them unless the supplied evidence clearly contradicts them.
 
 Computed statistics:
 {stats_json}
@@ -2423,20 +2883,115 @@ Computed statistics:
             )
             return candidate_lessons
 
+    def _find_matching_candidate_lesson(
+        self,
+        candidate_lessons: List[MemoryLesson],
+        lesson: MemoryLesson,
+    ) -> MemoryLesson | None:
+        best_match = None
+        best_score = 0.0
+        lesson_evidence = set(int(item) for item in (lesson.evidence_journal_ids or []))
+        lesson_apply = lesson.apply_when.model_dump()
+        for candidate in candidate_lessons:
+            score = self._memory_rule_similarity(candidate.rule, lesson.rule)
+            candidate_evidence = set(int(item) for item in (candidate.evidence_journal_ids or []))
+            if lesson_evidence and candidate_evidence and lesson_evidence.intersection(candidate_evidence):
+                score += 0.35
+            if candidate.category == lesson.category:
+                score += 0.15
+            if str(candidate.regime or "").strip().lower() == str(lesson.regime or "").strip().lower():
+                score += 0.15
+            candidate_apply = candidate.apply_when.model_dump()
+            if candidate_apply.get("regime") == lesson_apply.get("regime"):
+                score += 0.1
+            if candidate.trigger_context and candidate.trigger_context == lesson.trigger_context:
+                score += 0.1
+            if candidate.execution_context and candidate.execution_context == lesson.execution_context:
+                score += 0.1
+            if candidate.trend_context and candidate.trend_context == lesson.trend_context:
+                score += 0.1
+            if score > best_score:
+                best_score = score
+                best_match = candidate
+        return best_match if best_match is not None and best_score >= 0.45 else None
+
+    def _constrain_generated_lesson(
+        self,
+        seed: MemoryLesson,
+        generated: MemoryLesson,
+    ) -> MemoryLesson:
+        generated_apply = generated.apply_when.model_dump()
+        seed_apply = seed.apply_when.model_dump()
+        constrained_apply = {
+            "regime": seed_apply.get("regime") or generated_apply.get("regime") or [],
+            "volatility": seed_apply.get("volatility") or generated_apply.get("volatility") or [],
+            "trend": seed_apply.get("trend") or generated_apply.get("trend") or [],
+        }
+        return generated.model_copy(
+            update={
+                "regime": seed.regime or generated.regime,
+                "category": seed.category or generated.category,
+                "apply_when": MemoryCondition.model_validate(constrained_apply),
+                "ignore_when": self._merge_unique_list(seed.ignore_when, generated.ignore_when, limit=6),
+                "evidence_journal_ids": self._merge_unique_list(
+                    seed.evidence_journal_ids,
+                    generated.evidence_journal_ids,
+                    limit=20,
+                ),
+                "support_count": max(seed.support_count, generated.support_count),
+                "trigger_context": seed.trigger_context or generated.trigger_context,
+                "execution_context": seed.execution_context or generated.execution_context,
+                "trend_context": seed.trend_context or generated.trend_context,
+                "hold_quality": seed.hold_quality or generated.hold_quality,
+                "hypothesis": bool(seed.hypothesis and generated.hypothesis),
+            }
+        )
+
     def _merge_candidate_lessons(
         self,
         candidate_lessons: List[MemoryLesson],
         generated_lessons: List[MemoryLesson],
     ) -> List[MemoryLesson]:
-        merged: List[MemoryLesson] = []
-        seen_rules = set()
-        for lesson in generated_lessons + candidate_lessons:
+        merged_by_rule: Dict[str, MemoryLesson] = {}
+        for lesson in candidate_lessons:
             key = lesson.rule.strip().lower()
-            if key in seen_rules:
+            if key not in merged_by_rule:
+                merged_by_rule[key] = lesson
+        for lesson in generated_lessons:
+            seed = self._find_matching_candidate_lesson(candidate_lessons, lesson)
+            if candidate_lessons and seed is None:
                 continue
-            seen_rules.add(key)
-            merged.append(lesson)
-        return merged
+            constrained = self._constrain_generated_lesson(seed, lesson) if seed is not None else lesson
+            key = (seed.rule if seed is not None else constrained.rule).strip().lower()
+            existing = merged_by_rule.get(key)
+            if existing is None:
+                merged_by_rule[key] = constrained
+                continue
+            merged_by_rule[key] = existing.model_copy(
+                update={
+                    "rule": existing.rule if seed is not None else (constrained.rule if len(constrained.rule) >= len(existing.rule) else existing.rule),
+                    "support_count": max(existing.support_count, constrained.support_count),
+                    "evidence_journal_ids": self._merge_unique_list(
+                        existing.evidence_journal_ids,
+                        constrained.evidence_journal_ids,
+                        limit=20,
+                    ),
+                    "ignore_when": self._merge_unique_list(
+                        existing.ignore_when,
+                        constrained.ignore_when,
+                        limit=6,
+                    ),
+                    "trigger_context": existing.trigger_context or constrained.trigger_context,
+                    "execution_context": existing.execution_context or constrained.execution_context,
+                    "trend_context": existing.trend_context or constrained.trend_context,
+                    "hold_quality": existing.hold_quality or constrained.hold_quality,
+                    "apply_when": existing.apply_when if seed is not None else constrained.apply_when,
+                    "regime": existing.regime if seed is not None else (existing.regime or constrained.regime),
+                    "category": existing.category if seed is not None else constrained.category,
+                    "hypothesis": bool(existing.hypothesis and constrained.hypothesis),
+                }
+            )
+        return list(merged_by_rule.values())
 
     def _normalize_memory_rule(self, rule: str) -> str:
         text = " ".join(str(rule or "").lower().split())
@@ -2468,10 +3023,26 @@ Computed statistics:
         regime = str(metrics.get("regime") or "general").strip().lower()
         volatility = "-".join(sorted(str(item).strip().lower() for item in (apply_when.get("volatility") or []) if item))
         trend = "-".join(sorted(str(item).strip().lower() for item in (apply_when.get("trend") or []) if item))
+        trigger_context = str(metrics.get("trigger_context") or "").strip().lower()
+        execution_context = str(metrics.get("execution_context") or "").strip().lower()
+        trend_context = str(metrics.get("trend_context") or "").strip().lower()
         normalized_rule = self._normalize_memory_rule(rule)
         rule_anchor = " ".join(normalized_rule.split()[:5])
         anchor = seed_signal or rule_anchor or "memory"
-        return "|".join(part for part in (category, regime, volatility, trend, anchor) if part)
+        return "|".join(
+            part
+            for part in (
+                category,
+                regime,
+                volatility,
+                trend,
+                trigger_context,
+                execution_context,
+                trend_context,
+                anchor,
+            )
+            if part
+        )
 
     def _compute_memory_confidence_score(
         self,
@@ -2498,13 +3069,16 @@ Computed statistics:
             if retrieval_total
             else 0.5
         )
+        calibration_summary = stats_package.get("confidence_calibration_summary") or {}
+        calibration_component = float(calibration_summary.get("alignment_score") or 0.5)
         confidence = (
-            support_component * 0.34
-            + evidence_component * 0.16
+            support_component * 0.31
+            + evidence_component * 0.15
             + status_component * 0.16
             + category_component * 0.08
-            + cluster_quality * 0.16
+            + cluster_quality * 0.14
             + retrieval_component * 0.10
+            + calibration_component * 0.06
         )
         if hypothesis:
             confidence *= 0.78
@@ -2766,6 +3340,10 @@ Computed statistics:
                 "status": status,
                 "apply_when": lesson.apply_when.model_dump(),
                 "ignore_when": lesson.ignore_when,
+                "trigger_context": lesson.trigger_context,
+                "execution_context": lesson.execution_context,
+                "trend_context": lesson.trend_context,
+                "hold_quality": lesson.hold_quality,
                 "win_rate": stats_package["win_rate"],
                 "avg_estimated_pnl_pct": stats_package["avg_estimated_pnl_pct"],
                 "ledger_net_realized_pnl": ledger_stats.get("net_realized_pnl", 0.0),
@@ -2784,6 +3362,9 @@ Computed statistics:
                 "trade_case_cluster_evaluation": stats_package.get("trade_case_cluster_evaluation", {}),
                 "retrieval_evaluation_summary": stats_package.get("retrieval_evaluation_summary", {}),
                 "retrieval_counterfactual_summary": stats_package.get("retrieval_counterfactual_summary", {}),
+                "hold_opportunity_summary": stats_package.get("hold_opportunity_summary", {}),
+                "trading_balance_summary": stats_package.get("trading_balance_summary", {}),
+                "confidence_calibration_summary": stats_package.get("confidence_calibration_summary", {}),
                 "execution_policy_summary": stats_package.get("execution_policy_summary", {}),
                 "confidence_score": confidence_score,
                 "validity_score": confidence_score,
@@ -2808,6 +3389,86 @@ Computed statistics:
             )
         return self._reconcile_long_term_memory_entries(entries, existing_memories or [], now)
 
+    def _temporal_sort_key(self, row: Dict[str, Any]) -> tuple[Any, int]:
+        timestamp = row.get("timestamp") or row.get("created_at") or row.get("closed_at") or row.get("opened_at") or ""
+        return (str(timestamp), int(row.get("audit_log_id") or row.get("id") or 0))
+
+    def _build_temporal_holdout_summary(self, values: List[float]) -> Dict[str, Any]:
+        ordered = [float(value) for value in values]
+        count = len(ordered)
+        if count < 3:
+            avg_score = round(sum(ordered) / max(1, count), 4) if ordered else 0.0
+            return {
+                "train_count": count,
+                "holdout_count": 0,
+                "train_score": avg_score,
+                "holdout_score": None,
+                "score_gap": None,
+                "stability_score": 0.55 if count >= 2 else 0.4,
+            }
+        split_index = max(1, int(math.ceil(count * 0.7)))
+        if split_index >= count:
+            split_index = count - 1
+        train_values = ordered[:split_index]
+        holdout_values = ordered[split_index:]
+        train_score = sum(train_values) / max(1, len(train_values))
+        holdout_score = sum(holdout_values) / max(1, len(holdout_values))
+        score_gap = abs(holdout_score - train_score)
+        stability_score = max(
+            0.0,
+            1.0
+            - min(0.6, score_gap * 0.8)
+            - min(0.25, statistics.pstdev(ordered) if len(ordered) > 1 else 0.0),
+        )
+        return {
+            "train_count": len(train_values),
+            "holdout_count": len(holdout_values),
+            "train_score": round(train_score, 4),
+            "holdout_score": round(holdout_score, 4),
+            "score_gap": round(score_gap, 4),
+            "stability_score": round(stability_score, 4),
+        }
+
+    def _build_shadow_candidate_holdout_summary(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        domain: str,
+    ) -> Dict[str, Any]:
+        ordered_rows = sorted(rows or [], key=self._temporal_sort_key)
+        adjusted_values: List[float] = []
+        for row in ordered_rows:
+            outcome = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+            if outcome is None:
+                continue
+            adjusted = outcome
+            if domain == "alpha_1h" and str(row.get("divergence_type") or "") == "entry_block":
+                adjusted = -outcome
+            elif domain == "safety_5m":
+                divergence_type = str(row.get("divergence_type") or "")
+                if divergence_type == "risk_exit":
+                    adjusted = -outcome
+                elif divergence_type == "risk_reduce":
+                    adjusted = -(outcome * 0.5)
+            adjusted_values.append(adjusted)
+        return self._build_temporal_holdout_summary(adjusted_values)
+
+    def _passes_temporal_holdout_gate(self, summary: Dict[str, Any] | None) -> bool:
+        payload = summary or {}
+        holdout_count = int(payload.get("holdout_count") or 0)
+        holdout_score = self._coerce_float(payload.get("holdout_score"))
+        stability_score = self._coerce_float(payload.get("stability_score"))
+        score_gap = self._coerce_float(payload.get("score_gap"))
+        if holdout_count <= 0:
+            return True
+        if holdout_score is not None and holdout_score < -0.05:
+            return False
+        if stability_score is not None and stability_score < 0.2:
+            return False
+        if score_gap is not None and score_gap > 0.7:
+            return False
+        return True
+
     def _sync_candidate_policies(self, candidate_policies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         saved = []
         for candidate in candidate_policies or []:
@@ -2822,6 +3483,8 @@ Computed statistics:
         candidates: List[Dict[str, Any]],
         shadow_decisions: List[Dict[str, Any]],
         replay_runs: List[Dict[str, Any]] | None = None,
+        trading_balance_summary: Dict[str, Any] | None = None,
+        confidence_calibration_summary: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         shadow_grouped: Dict[int, List[Dict[str, Any]]] = {}
         for row in shadow_decisions or []:
@@ -2832,6 +3495,9 @@ Computed statistics:
             shadow_grouped.setdefault(candidate_id, []).append(row)
         evaluations = []
         replay_summary = self._build_replay_execution_summary(replay_runs or [])
+        trading_balance_summary = trading_balance_summary or {}
+        confidence_calibration_summary = confidence_calibration_summary or {}
+        confidence_alignment_score = float(confidence_calibration_summary.get("alignment_score") or 0.5)
         for candidate in candidates or []:
             candidate_id = candidate.get("id")
             domain = str(candidate.get("domain") or "").strip()
@@ -2840,6 +3506,7 @@ Computed statistics:
             score = float(metrics.get("utility_score") or 0.0)
             sample_count = support_count
             scope = "seed"
+            temporal_holdout_summary = self._build_temporal_holdout_summary([])
             if candidate_id and candidate_id in shadow_grouped:
                 rows = shadow_grouped[candidate_id]
                 realized = []
@@ -2860,16 +3527,36 @@ Computed statistics:
                 sample_count = len(rows)
                 score = round(sum(realized) / max(1, len(realized)), 4) if realized else 0.0
                 scope = "shadow"
+                temporal_holdout_summary = self._build_shadow_candidate_holdout_summary(rows, domain=domain)
+            if domain == "alpha_1h":
+                score += min(
+                    0.25,
+                    (float(replay_summary.get("hold_opportunity_cost") or 0.0) * 0.05)
+                    + (int(replay_summary.get("missed_breakout_count") or 0) * 0.02),
+                )
+                score -= min(
+                    0.25,
+                    float(trading_balance_summary.get("false_entry_cost") or 0.0) * 0.05,
+                )
+            score += min(0.12, float(trading_balance_summary.get("portfolio_utility_score") or 0.0) * 0.12)
+            score += min(0.08, confidence_alignment_score * 0.08)
+            holdout_score = self._coerce_float(temporal_holdout_summary.get("holdout_score"))
+            if holdout_score is not None:
+                score += max(-0.12, min(0.12, holdout_score * 0.12))
             evaluation = {
                 "candidate_policy_id": candidate_id,
                 "evaluation_scope": scope,
                 "sample_count": sample_count,
-                "score": score,
+                "score": round(score, 4),
                 "metrics": {
                     **metrics,
                     "domain": candidate.get("domain"),
                     "policy_type": candidate.get("policy_type"),
                     "replay_execution_summary": replay_summary,
+                    "trading_balance_summary": trading_balance_summary,
+                    "confidence_calibration_summary": confidence_calibration_summary,
+                    "confidence_alignment_score": round(confidence_alignment_score, 4),
+                    "temporal_holdout_summary": temporal_holdout_summary,
                 },
             }
             evaluations.append(evaluation)
@@ -2900,6 +3587,24 @@ Computed statistics:
             score = float(evaluation.get("score") or 0.0)
             evaluation_scope = str(evaluation.get("evaluation_scope") or "seed")
             if domain == "alpha_1h":
+                trading_balance_summary = (evaluation.get("metrics") or {}).get("trading_balance_summary") or {}
+                hold_cost = float(trading_balance_summary.get("hold_opportunity_cost") or 0.0)
+                false_entry_cost = float(trading_balance_summary.get("false_entry_cost") or 0.0)
+                balance_score = float(trading_balance_summary.get("balance_score") or 0.0)
+                portfolio_utility_score = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
+                pressure_ratio = self._coerce_float(trading_balance_summary.get("pressure_ratio"))
+                confidence_alignment_score = float((evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5)
+                temporal_holdout_summary = (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {}
+                if (
+                    hold_cost > 3.5
+                    or false_entry_cost > 3.5
+                    or balance_score < 0.3
+                    or portfolio_utility_score < 0.25
+                    or confidence_alignment_score < 0.3
+                    or (pressure_ratio is not None and (pressure_ratio < 0.55 or pressure_ratio > 1.85))
+                    or not self._passes_temporal_holdout_gate(temporal_holdout_summary)
+                ):
+                    continue
                 if evaluation_scope == "shadow":
                     if sample_count < 2 or score <= 0:
                         continue
@@ -2933,6 +3638,12 @@ Computed statistics:
                     "candidate_policy_id": candidate.get("id"),
                     "rule_text": candidate.get("rule_text"),
                     "regime_key": regime_key or "",
+                    "temporal_holdout_summary": (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {},
+                    "confidence_alignment_score": (evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5,
+                    "portfolio_utility_score": (
+                        ((evaluation.get("metrics") or {}).get("trading_balance_summary") or {}).get("portfolio_utility_score")
+                        or 0.0
+                    ),
                 },
             }
             if hasattr(self.state_store, "upsert_policy_registry"):
@@ -2951,10 +3662,27 @@ Computed statistics:
 
     def _build_replay_execution_summary(self, replay_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not replay_runs:
-            return {"count": 0, "avg_fill_ratio": 0.0, "avg_slippage_bps": 0.0, "avg_latency_seconds": 0.0}
+            return {
+                "count": 0,
+                "avg_fill_ratio": 0.0,
+                "avg_slippage_bps": 0.0,
+                "avg_latency_seconds": 0.0,
+                "hold_opportunity_evaluation_count": 0,
+                "hold_baseline_beats_hold_count": 0,
+                "hold_simple_rule_beats_hold_count": 0,
+                "missed_breakout_count": 0,
+                "missed_move_median_pct": 0.0,
+                "hold_opportunity_cost": 0.0,
+            }
         fill_ratios = []
         slippages = []
         latencies = []
+        hold_opportunity_evaluation_count = 0
+        hold_baseline_beats_hold_count = 0
+        hold_simple_rule_beats_hold_count = 0
+        missed_breakout_count = 0
+        missed_moves: List[float] = []
+        hold_opportunity_cost = 0.0
         for row in replay_runs:
             payload = row.get("payload") or {}
             fill_ratio = self._coerce_float(payload.get("simulated_fill_ratio"))
@@ -2966,11 +3694,36 @@ Computed statistics:
                 slippages.append(slippage)
             if latency is not None:
                 latencies.append(latency)
+            hold_counterfactual = payload.get("hold_opportunity_counterfactual") or {}
+            if hold_counterfactual:
+                hold_opportunity_evaluation_count += 1
+                if bool(hold_counterfactual.get("baseline_beats_hold")):
+                    hold_baseline_beats_hold_count += 1
+                if bool(hold_counterfactual.get("simple_rule_baseline_beats_hold")):
+                    hold_simple_rule_beats_hold_count += 1
+                missed_breakout_count += int(hold_counterfactual.get("missed_breakout_count") or 0)
+                move_value = self._coerce_float(hold_counterfactual.get("missed_move_median_pct"))
+                if move_value is not None and move_value > 0:
+                    missed_moves.append(move_value)
+                cost_value = self._coerce_float(hold_counterfactual.get("hold_opportunity_cost"))
+                if cost_value is not None:
+                    hold_opportunity_cost += cost_value
+        missed_moves_sorted = sorted(missed_moves)
         return {
             "count": len(replay_runs),
             "avg_fill_ratio": round(sum(fill_ratios) / max(1, len(fill_ratios)), 4) if fill_ratios else 0.0,
             "avg_slippage_bps": round(sum(slippages) / max(1, len(slippages)), 4) if slippages else 0.0,
             "avg_latency_seconds": round(sum(latencies) / max(1, len(latencies)), 4) if latencies else 0.0,
+            "hold_opportunity_evaluation_count": hold_opportunity_evaluation_count,
+            "hold_baseline_beats_hold_count": hold_baseline_beats_hold_count,
+            "hold_simple_rule_beats_hold_count": hold_simple_rule_beats_hold_count,
+            "missed_breakout_count": missed_breakout_count,
+            "missed_move_median_pct": (
+                round(missed_moves_sorted[len(missed_moves_sorted) // 2], 4)
+                if missed_moves_sorted
+                else 0.0
+            ),
+            "hold_opportunity_cost": round(hold_opportunity_cost, 4),
         }
 
     def _build_policy_bundles(self) -> List[Dict[str, Any]]:
@@ -2997,22 +3750,57 @@ Computed statistics:
                         "component_scores": {
                             domain: float(((row.get("metrics") or {}).get("score")) or 0.0)
                             for domain, row in domains.items()
-                        }
+                        },
+                        "component_holdout_summaries": {
+                            domain: ((row.get("metrics") or {}).get("temporal_holdout_summary") or {})
+                            for domain, row in domains.items()
+                        },
                     },
                 }
             )
         return bundles
 
-    def _evaluate_policy_bundles(self, bundles: List[Dict[str, Any]], replay_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _evaluate_policy_bundles(
+        self,
+        bundles: List[Dict[str, Any]],
+        replay_runs: List[Dict[str, Any]],
+        trading_balance_summary: Dict[str, Any] | None = None,
+        confidence_calibration_summary: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         replay_summary = self._build_replay_execution_summary(replay_runs)
+        trading_balance_summary = trading_balance_summary or {}
+        confidence_calibration_summary = confidence_calibration_summary or {}
+        confidence_alignment_score = float(confidence_calibration_summary.get("alignment_score") or 0.5)
         evaluations = []
         for bundle in bundles or []:
             component_scores = (bundle.get("metrics") or {}).get("component_scores") or {}
+            component_holdouts = (bundle.get("metrics") or {}).get("component_holdout_summaries") or {}
+            holdout_scores = [
+                float(summary.get("holdout_score"))
+                for summary in component_holdouts.values()
+                if self._coerce_float((summary or {}).get("holdout_score")) is not None
+            ]
+            stability_scores = [
+                float(summary.get("stability_score"))
+                for summary in component_holdouts.values()
+                if self._coerce_float((summary or {}).get("stability_score")) is not None
+            ]
             score = 0.0
             if component_scores:
                 score = sum(float(value or 0.0) for value in component_scores.values()) / max(1, len(component_scores))
             score += max(0.0, (1.0 - float(replay_summary.get("avg_slippage_bps") or 0.0) / 25.0) * 0.1)
             score += min(0.1, float(replay_summary.get("avg_fill_ratio") or 0.0) * 0.1)
+            score -= min(
+                0.2,
+                (float(replay_summary.get("hold_opportunity_cost") or 0.0) * 0.05)
+                + (int(replay_summary.get("missed_breakout_count") or 0) * 0.02),
+            )
+            score -= min(0.2, float(trading_balance_summary.get("false_entry_cost") or 0.0) * 0.04)
+            score += min(0.1, float(trading_balance_summary.get("balance_score") or 0.0) * 0.1)
+            score += min(0.12, float(trading_balance_summary.get("portfolio_utility_score") or 0.0) * 0.12)
+            score += min(0.08, confidence_alignment_score * 0.08)
+            if holdout_scores:
+                score += max(-0.12, min(0.12, (sum(holdout_scores) / len(holdout_scores)) * 0.12))
             evaluation = {
                 "bundle_key": bundle.get("bundle_key"),
                 "evaluation_scope": "bundle_batch",
@@ -3021,7 +3809,13 @@ Computed statistics:
                 "metrics": {
                     "regime_key": bundle.get("regime_key"),
                     "component_scores": component_scores,
+                    "component_holdout_summaries": component_holdouts,
                     "replay_execution_summary": replay_summary,
+                    "trading_balance_summary": trading_balance_summary,
+                    "confidence_calibration_summary": confidence_calibration_summary,
+                    "confidence_alignment_score": round(confidence_alignment_score, 4),
+                    "avg_component_holdout_score": round(sum(holdout_scores) / len(holdout_scores), 4) if holdout_scores else None,
+                    "avg_component_holdout_stability": round(sum(stability_scores) / len(stability_scores), 4) if stability_scores else None,
                 },
             }
             evaluations.append(evaluation)
@@ -3043,6 +3837,25 @@ Computed statistics:
             bundle = payload["bundle"]
             evaluation = payload["evaluation"]
             if int(evaluation.get("sample_count") or 0) < 2 or float(evaluation.get("score") or 0.0) <= 0:
+                continue
+            trading_balance_summary = (evaluation.get("metrics") or {}).get("trading_balance_summary") or {}
+            hold_cost = float(trading_balance_summary.get("hold_opportunity_cost") or 0.0)
+            false_entry_cost = float(trading_balance_summary.get("false_entry_cost") or 0.0)
+            balance_score = float(trading_balance_summary.get("balance_score") or 0.0)
+            portfolio_utility_score = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
+            confidence_alignment_score = float((evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5)
+            pressure_ratio = self._coerce_float(trading_balance_summary.get("pressure_ratio"))
+            component_holdout_summaries = (evaluation.get("metrics") or {}).get("component_holdout_summaries") or {}
+            if (
+                hold_cost > 3.5
+                or false_entry_cost > 3.5
+                or balance_score < 0.3
+                or portfolio_utility_score < 0.25
+                or confidence_alignment_score < 0.3
+                or (pressure_ratio is not None and (pressure_ratio < 0.55 or pressure_ratio > 1.85))
+            ):
+                continue
+            if any(not self._passes_temporal_holdout_gate(summary) for summary in component_holdout_summaries.values()):
                 continue
             existing = self.state_store.get_active_policy_bundle(regime_key=regime_key) if hasattr(self.state_store, "get_active_policy_bundle") else {}
             existing_score = float(((existing.get("metrics") or {}).get("score")) or 0.0) if existing else 0.0
@@ -3177,13 +3990,20 @@ Computed statistics:
             saved_candidates,
             shadow_decisions,
             replay_runs=replay_runs,
+            trading_balance_summary=stats_package.get("trading_balance_summary") or {},
+            confidence_calibration_summary=stats_package.get("confidence_calibration_summary") or {},
         )
         self._promote_candidate_policies(saved_candidates, candidate_evaluations)
         bundles = self._build_policy_bundles()
         if bundles and hasattr(self.state_store, "upsert_policy_bundle"):
             for bundle in bundles:
                 self.state_store.upsert_policy_bundle(bundle)
-        bundle_evaluations = self._evaluate_policy_bundles(bundles, replay_runs)
+        bundle_evaluations = self._evaluate_policy_bundles(
+            bundles,
+            replay_runs,
+            trading_balance_summary=stats_package.get("trading_balance_summary") or {},
+            confidence_calibration_summary=stats_package.get("confidence_calibration_summary") or {},
+        )
         self._promote_policy_bundles(bundles, bundle_evaluations)
         self._rollback_degraded_bundles(shadow_decisions)
         logger.info("Daily Memory Update Completed.")

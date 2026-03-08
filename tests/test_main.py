@@ -668,6 +668,80 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(len(selected[0]["ignore_when"]), 1)
         self.assertNotIn("candidate_lessons", selected[0]["metrics"])
 
+    def test_select_long_term_memory_context_prioritizes_matching_hold_contexts(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                volume_surge_trigger_active=True,
+                range_break_trigger_active=True,
+                is_opportunity_trigger=True,
+                spread_percentile_1h=48.0,
+                depth_percentile_1h=72.0,
+                distance_to_invalid_level=1.1,
+            )
+        }
+        market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
+        market_snapshots["BTCUSDT"].regime.volatility_regime = "high"
+        market_snapshots["BTCUSDT"].timeframes["15m"] = {"trend": "UP"}
+        rows = [
+            {
+                "rule": "Allow a small probe when breakout pressure aligns with tradable execution.",
+                "category": "opportunity",
+                "status": "rule",
+                "support": 4,
+                "regime": "trigger",
+                "apply_when": {
+                    "regime": ["trigger"],
+                    "volatility": ["high"],
+                    "trend": ["aligned_up"],
+                },
+                "ignore_when": ["Ignore when spreads widen."],
+                "metrics": {
+                    "trigger_context": "volume_surge+range_break+opportunity",
+                    "execution_context": "acceptable_spread|deep_book|manageable_invalidation",
+                    "trend_context": "UP|UP",
+                    "hold_quality": "missed_opportunity_hold",
+                },
+            },
+            {
+                "rule": "Allow a small probe when momentum appears eventually.",
+                "category": "opportunity",
+                "status": "rule",
+                "support": 6,
+                "regime": "trigger",
+                "apply_when": {
+                    "regime": ["trigger"],
+                    "volatility": ["high"],
+                    "trend": ["aligned_up"],
+                },
+                "ignore_when": ["Ignore when spreads widen."],
+                "metrics": {
+                    "trigger_context": "fast_move+opportunity",
+                    "execution_context": "wide_spread|thin_book|wide_invalidation",
+                    "trend_context": "DOWN|DOWN",
+                    "hold_quality": "missed_opportunity_hold",
+                },
+            },
+        ]
+
+        selected = orchestrator._select_long_term_memory_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=1,
+            max_ignore_when=1,
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["trigger_context"], "volume_surge+range_break+opportunity")
+        self.assertEqual(selected[0]["execution_context"], "acceptable_spread|deep_book|manageable_invalidation")
+
     def test_build_similar_past_cases_applies_limit(self):
         class DummyRagEngine:
             def get_similar_cases_batch(self, *_args, **_kwargs):

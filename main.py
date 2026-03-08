@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -1867,6 +1868,10 @@ class TradingOrchestrator:
             "apply_when": apply_when,
             "ignore_when": ignore_when[:max_ignore_when],
             "evidence_journal_ids": evidence_ids[:10],
+            "trigger_context": str(row.get("trigger_context") or metrics.get("trigger_context") or ""),
+            "execution_context": str(row.get("execution_context") or metrics.get("execution_context") or ""),
+            "trend_context": str(row.get("trend_context") or metrics.get("trend_context") or ""),
+            "hold_quality": str(row.get("hold_quality") or metrics.get("hold_quality") or ""),
         }
         return {
             "rule": row.get("rule") or "",
@@ -1877,8 +1882,120 @@ class TradingOrchestrator:
             "apply_when": compact_metrics["apply_when"],
             "ignore_when": compact_metrics["ignore_when"],
             "evidence_journal_ids": compact_metrics["evidence_journal_ids"],
+            "trigger_context": compact_metrics["trigger_context"],
+            "execution_context": compact_metrics["execution_context"],
+            "trend_context": compact_metrics["trend_context"],
+            "hold_quality": compact_metrics["hold_quality"],
             "metrics": compact_metrics,
         }
+
+    def _build_memory_context_signatures(self, market_snapshots) -> dict[str, set[str]]:
+        trigger_contexts: set[str] = set()
+        execution_contexts: set[str] = set()
+        trend_contexts: set[str] = set()
+        for snapshot in (market_snapshots or {}).values():
+            active_flags = []
+            if bool(getattr(snapshot, "volume_surge_trigger_active", False)):
+                active_flags.append("volume_surge")
+            if bool(getattr(snapshot, "fast_move_trigger_active", False)):
+                active_flags.append("fast_move")
+            if bool(getattr(snapshot, "range_break_trigger_active", False)):
+                active_flags.append("range_break")
+            if bool(getattr(snapshot, "is_opportunity_trigger", False)):
+                active_flags.append("opportunity")
+            if bool(getattr(snapshot, "is_risk_trigger", False)):
+                active_flags.append("risk")
+            trigger_contexts.add("+".join(active_flags) if active_flags else "none")
+
+            spread_percentile = getattr(snapshot, "spread_percentile_1h", None)
+            depth_percentile = getattr(snapshot, "depth_percentile_1h", None)
+            invalidation_distance = getattr(snapshot, "distance_to_invalid_level", None)
+            if spread_percentile is None:
+                spread_bucket = "unknown_spread"
+            elif float(spread_percentile) <= 40.0:
+                spread_bucket = "tight_spread"
+            elif float(spread_percentile) <= 70.0:
+                spread_bucket = "acceptable_spread"
+            else:
+                spread_bucket = "wide_spread"
+            if depth_percentile is None:
+                depth_bucket = "unknown_depth"
+            elif float(depth_percentile) >= 60.0:
+                depth_bucket = "deep_book"
+            elif float(depth_percentile) >= 25.0:
+                depth_bucket = "tradable_depth"
+            else:
+                depth_bucket = "thin_book"
+            if invalidation_distance is None:
+                invalidation_bucket = "unknown_invalidation"
+            elif float(invalidation_distance) <= 0.8:
+                invalidation_bucket = "tight_invalidation"
+            elif float(invalidation_distance) <= 1.5:
+                invalidation_bucket = "manageable_invalidation"
+            else:
+                invalidation_bucket = "wide_invalidation"
+            execution_contexts.add(f"{spread_bucket}|{depth_bucket}|{invalidation_bucket}")
+
+            trend_1h = str(getattr(snapshot, "trend_1h", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            timeframe_15m = getattr(snapshot, "timeframes", {}).get("15m") if getattr(snapshot, "timeframes", None) else {}
+            trend_15m = str(getattr(timeframe_15m, "trend", None) or (timeframe_15m.get("trend") if isinstance(timeframe_15m, dict) else "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            trend_contexts.add(f"{trend_1h}|{trend_15m}")
+
+        return {
+            "trigger": trigger_contexts,
+            "execution": execution_contexts,
+            "trend": trend_contexts,
+        }
+
+    def _memory_context_gate_score(
+        self,
+        *,
+        category: str,
+        trigger_context: str,
+        execution_context: str,
+        trend_context: str,
+        hold_quality: str,
+        active_contexts: dict[str, set[str]],
+    ) -> float:
+        score = 0.0
+        category_text = str(category or "").strip().lower()
+        trigger_text = str(trigger_context or "").strip().lower()
+        execution_text = str(execution_context or "").strip().lower()
+        trend_text = str(trend_context or "").strip().lower()
+        hold_quality_text = str(hold_quality or "").strip().lower()
+        active_trigger = {item.lower() for item in active_contexts.get("trigger") or set()}
+        active_execution = {item.lower() for item in active_contexts.get("execution") or set()}
+        active_trend = {item.lower() for item in active_contexts.get("trend") or set()}
+
+        if trigger_text:
+            if trigger_text in active_trigger:
+                score += 9.0
+            elif trigger_text != "none":
+                score -= 7.5 if category_text == "opportunity" else 2.0
+        elif category_text == "opportunity":
+            score -= 2.0
+
+        if execution_text:
+            if execution_text in active_execution:
+                score += 7.0
+            elif category_text == "opportunity":
+                score -= 5.5
+            else:
+                score -= 1.5
+
+        if trend_text:
+            if trend_text in active_trend:
+                score += 6.5
+            elif category_text in {"opportunity", "risk_control"}:
+                score -= 4.5
+            else:
+                score -= 1.0
+
+        if hold_quality_text == "missed_opportunity_hold" and trigger_text and trigger_text not in active_trigger:
+            score -= 6.0
+        elif hold_quality_text == "good_hold" and trigger_text == "none" and "none" in active_trigger:
+            score += 3.0
+        return score
 
     def _select_long_term_memory_context(self, rows, market_snapshots, risk_mode: str, limit: int, max_ignore_when: int):
         if not rows:
@@ -1889,6 +2006,7 @@ class TradingOrchestrator:
         for snapshot in market_snapshots.values():
             active_trends.add(str(getattr(snapshot.regime, "trend_alignment", "") or ""))
             active_volatility.add(str(getattr(snapshot.regime, "volatility_regime", "") or ""))
+        active_contexts = self._build_memory_context_signatures(market_snapshots)
 
         scored = []
         for index, row in enumerate(rows):
@@ -1903,6 +2021,10 @@ class TradingOrchestrator:
             validity_score = float(row.get("validity_score") or metrics.get("validity_score") or 0.0)
             freshness_score = float(row.get("freshness_score") or metrics.get("freshness_score") or 0.0)
             lifecycle_status = str(row.get("lifecycle_status") or metrics.get("lifecycle_status") or "active")
+            trigger_context = str(row.get("trigger_context") or metrics.get("trigger_context") or "")
+            execution_context = str(row.get("execution_context") or metrics.get("execution_context") or "")
+            trend_context = str(row.get("trend_context") or metrics.get("trend_context") or "")
+            hold_quality = str(row.get("hold_quality") or metrics.get("hold_quality") or "")
             retired = bool(row.get("retired") or metrics.get("retired"))
             if retired or lifecycle_status == "retired":
                 continue
@@ -1923,6 +2045,14 @@ class TradingOrchestrator:
                 score += 6.0
             if active_volatility and active_volatility.intersection(apply_volatility):
                 score += 5.0
+            score += self._memory_context_gate_score(
+                category=category,
+                trigger_context=trigger_context,
+                execution_context=execution_context,
+                trend_context=trend_context,
+                hold_quality=hold_quality,
+                active_contexts=active_contexts,
+            )
             if current_symbols and any(symbol in rule_text for symbol in current_symbols):
                 score += 4.0
             score += max(0.0, 4.0 - (index * 0.15))
