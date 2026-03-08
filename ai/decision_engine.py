@@ -202,6 +202,33 @@ class DecisionEngine:
             rationale = raw.get("rationale") or []
             evidence_quality = raw.get("evidence_quality") or {}
             entry_size_cap = raw.get("entry_size_cap") or {}
+            rationale_items = []
+            for rationale_item in (raw.get("rationale_items") or [])[:2]:
+                evidence_payload = []
+                for evidence in ((rationale_item or {}).get("evidence") or [])[:3]:
+                    evidence_payload.append(
+                        self._drop_empty(
+                            {
+                                "signal": evidence.get("signal"),
+                                "symbol": evidence.get("symbol"),
+                                "timeframe": evidence.get("timeframe"),
+                                "operator": evidence.get("operator"),
+                                "observed_value": evidence.get("observed_value"),
+                                "threshold": evidence.get("threshold"),
+                                "source": evidence.get("source"),
+                            }
+                        )
+                    )
+                rationale_items.append(
+                    self._drop_empty(
+                        {
+                            "summary": self._truncate_text((rationale_item or {}).get("summary"), limit=140),
+                            "failure_mode": self._truncate_text((rationale_item or {}).get("failure_mode"), limit=140),
+                            "trade_implication": self._truncate_text((rationale_item or {}).get("trade_implication"), limit=120),
+                            "evidence": evidence_payload,
+                        }
+                    )
+                )
             payload.append(
                 self._drop_empty(
                     {
@@ -224,6 +251,7 @@ class DecisionEngine:
                             "factor": evidence_quality.get("factor"),
                             "issues": (evidence_quality.get("issues") or [])[:2],
                         },
+                        "rationale_items": rationale_items,
                         "entry_size_cap": {
                             "adjusted": entry_size_cap.get("adjusted"),
                             "effective_cap_pct": entry_size_cap.get("effective_cap_pct"),
@@ -254,7 +282,7 @@ class DecisionEngine:
                             "support": raw.get("support"),
                             "regime": raw.get("regime"),
                             "apply_when": raw.get("apply_when") or {},
-                            "ignore_when": (raw.get("ignore_when") or [])[:1],
+                            "ignore_when": (raw.get("ignore_when") or [])[:2],
                             "metrics": {
                                 "confidence_score": metrics.get("confidence_score"),
                                 "validity_score": metrics.get("validity_score"),
@@ -329,6 +357,10 @@ trigger_mode_active:
 
 MARKET INTERPRETATION
 0. market_snapshots, recent_journal_context, long_term_memory, and similar_past_cases are compact decision views. They intentionally remove low-value duplication while preserving decision-critical structure, trigger, execution, and outcome information.
+0a. The retrieved contexts are sampled aides, not ground truth. Do not follow their majority vote mechanically.
+0b. If retrieved context conflicts with the current market_snapshots or risk_state, prefer the live snapshot evidence.
+0c. Treat fallback, retired, and error-like context as cautionary metadata, not as direct trading instructions.
+0d. policy_summary is an extracted policy digest, not a full document. Treat it as the binding summary of enforceable limits and execution guards.
 1. Prefer derived fields such as change, percentile, distance, and trigger-state over raw values when making decisions.
 2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_trigger_active is the stabilized trigger state after hysteresis. Do not treat them as interchangeable.
 3. fast_move_trigger_active, volume_surge_trigger_active, and range_break_trigger_active represent stabilized trigger states and matter more for cadence and follow-through than one-bar noise.

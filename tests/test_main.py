@@ -2,7 +2,7 @@ import unittest
 import time
 from unittest.mock import patch
 
-from main import TradingOrchestrator
+from main import StartupConfigurationError, TradingOrchestrator, main as run_main
 from core.alpha_policy import AlphaPolicyEngine
 from core.execution_policy import ExecutionPolicyEngine
 from core.models import AccountState, MarketSnapshot, OpenOrderState, OrderIntent, PositionState, RiskStateSnapshot, TradeIntent
@@ -94,6 +94,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             self.shadow_decisions = []
             self.policy_bundles = {}
             self.bundle_promotions = []
+            self.learning_artifacts = {}
 
         def get_active_trade_case(self, symbol):
             return dict(self.active_cases.get(symbol, {}))
@@ -282,6 +283,12 @@ class TestTradingOrchestrator(unittest.TestCase):
             if regime_key is not None:
                 rows = [row for row in rows if str(row.get("regime_key") or "") == str(regime_key or "")]
             return rows[:limit]
+
+        def get_learning_artifact(self, artifact_key):
+            payload = self.learning_artifacts.get(artifact_key)
+            if payload is None:
+                return {}
+            return {"artifact_key": artifact_key, "payload": dict(payload), "updated_at": "2026-03-09 00:00:00"}
 
         def get_trade_case_vector_candidates(self, limit=200, symbols=None, statuses=None, since=None):
             symbols = set(symbols or [])
@@ -526,6 +533,165 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertTrue(any(str(item).startswith("vector_similarity:") for item in selected[0]["matched_features"]))
         self.assertTrue(any(str(item).startswith("vector_source:band_index") for item in selected[0]["matched_features"]))
 
+    def test_select_recent_journal_context_balances_buckets_and_excludes_fallback(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            )
+        }
+        rows = [
+            {
+                "journal_id": 1,
+                "decision": "HOLD",
+                "rationale": ["No trigger, waiting for clarity."],
+                "rationale_items": [],
+                "risk_reason": "Safe action.",
+                "risk_mode": "normal",
+                "loss_signal": False,
+                "trigger_symbols": [],
+                "risk_trigger_symbols": [],
+                "summary": "HOLD: good hold",
+            },
+            {
+                "journal_id": 2,
+                "decision": "BUY",
+                "rationale": ["Momentum long"],
+                "rationale_items": [],
+                "risk_reason": "Approved",
+                "risk_mode": "trigger",
+                "loss_signal": False,
+                "trigger_symbols": ["BTCUSDT"],
+                "risk_trigger_symbols": [],
+                "summary": "BUY: action",
+            },
+            {
+                "journal_id": 3,
+                "decision": "HOLD",
+                "rationale": ["Fallback due to json validation error from AI."],
+                "rationale_items": [],
+                "risk_reason": "Safe action.",
+                "risk_mode": "normal",
+                "loss_signal": False,
+                "trigger_symbols": [],
+                "risk_trigger_symbols": [],
+                "summary": "HOLD: fallback",
+                "execution_summary": {"ai_usage": {"validation_error": True}},
+            },
+        ]
+
+        selected = orchestrator._select_recent_journal_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=2,
+            max_rationale_items=1,
+            max_evidence_per_item=1,
+            trade_cases=[],
+            account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
+            risk_state={"daily_pnl_pct": 0.0},
+        )
+
+        self.assertEqual([row["journal_id"] for row in selected], [1, 2])
+        summary = orchestrator.last_context_selection_summary["recent_journal_context"]
+        self.assertEqual(summary["excluded_bucket_counts"]["system_fallback"], 1)
+        self.assertEqual(summary["selected_bucket_counts"]["good_hold"], 1)
+        self.assertEqual(summary["selected_bucket_counts"]["entry_action"], 1)
+
+    def test_select_recent_journal_context_keeps_conservative_priority(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            )
+        }
+        rows = [
+            {
+                "journal_id": 10,
+                "decision": "BUY",
+                "rationale": ["Momentum entry."],
+                "rationale_items": [],
+                "risk_reason": "Approved",
+                "risk_mode": "trigger",
+                "loss_signal": False,
+                "trigger_symbols": ["BTCUSDT"],
+                "risk_trigger_symbols": [],
+                "summary": "BUY: action",
+            },
+            {
+                "journal_id": 11,
+                "decision": "EXIT",
+                "rationale": ["Cut exposure on deterioration."],
+                "rationale_items": [],
+                "risk_reason": "Approved with risk advisories",
+                "risk_mode": "trigger",
+                "loss_signal": True,
+                "trigger_symbols": [],
+                "risk_trigger_symbols": ["BTCUSDT"],
+                "summary": "EXIT: risk outcome",
+            },
+        ]
+
+        selected = orchestrator._select_recent_journal_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=1,
+            max_rationale_items=1,
+            max_evidence_per_item=1,
+            trade_cases=[],
+            account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
+            risk_state={"daily_pnl_pct": 0.0},
+        )
+
+        self.assertEqual(selected[0]["journal_id"], 11)
+
+    def test_score_journal_case_similarity_applies_learned_profile_adjustment(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.state_store.learning_artifacts["journal_reranker_profile"] = {
+            "bucket_weights": {"good_hold": 1.2},
+            "decision_weights": {"HOLD": 0.4},
+            "loss_signal_weight": 0.0,
+            "pnl_presence_weight": 0.0,
+        }
+        score, features = orchestrator._score_journal_case_similarity(
+            row={
+                "decision": "HOLD",
+                "rationale_items": [{"hold_quality": "good_hold"}],
+                "loss_signal": False,
+                "risk_mode": "normal",
+                "estimated_pnl_pct": None,
+                "trigger_symbols": [],
+                "risk_trigger_symbols": [],
+                "risk_reason": "Safe action.",
+                "case_statuses": {},
+                "trade_case_ids": [],
+            },
+            current_signature={
+                "risk_mode": "normal",
+                "symbols": set(),
+                "trigger_reasons": set(),
+                "risk_trigger_reasons": set(),
+                "regime_tags": set(),
+            },
+            trade_case_lookup={},
+            vector_match_lookup={},
+            row_index=0,
+        )
+
+        self.assertGreater(score, 7.0)
+        self.assertIn("learned_bucket:good_hold", features)
+
     def test_build_similar_past_cases_prefers_trade_case_vector_matches(self):
         orchestrator = self._make_orchestrator()
         orchestrator.state_store = self.DummyCaseStore()
@@ -567,6 +733,70 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertIn("failure_reason=execution_quality_degraded:wide_spread", cases[0])
         self.assertIn("source=band_index", cases[0])
         self.assertEqual(orchestrator.last_similar_case_matches[0]["trade_case_id"], "BTCUSDT-case-9")
+
+    def test_build_similar_past_cases_returns_background_support_in_normal_mode(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.state_store = self.DummyCaseStore()
+        orchestrator.state_store.learning_artifacts["similar_case_reranker_profile"] = {
+            "similarity_weight": 0.6,
+            "final_score_weight": 0.25,
+            "matched_band_weight": 0.1,
+            "source_weights": {"band_index": 0.3},
+            "failure_reason_weight": 0.5,
+            "negative_outcome_weight": 0.4,
+        }
+        orchestrator.state_store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-risk",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "risk_mode": "normal",
+                "estimated_pnl_pct": -1.2,
+                "slippage_bps": 9.0,
+                "thesis_failure_reason": "execution_quality_degraded:wide_spread",
+                "feature_vector": [30000.0, 120.0, 240.0],
+                "payload": {},
+            }
+        )
+        orchestrator.state_store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-win",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "risk_mode": "normal",
+                "estimated_pnl_pct": 1.8,
+                "slippage_bps": 1.5,
+                "thesis_failure_reason": "none",
+                "feature_vector": [30000.0, 120.0, 240.0],
+                "payload": {},
+            }
+        )
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+                is_opportunity_trigger=False,
+            )
+        }
+
+        cases = orchestrator._build_similar_past_cases(
+            market_snapshots=market_snapshots,
+            account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
+            risk_state={"daily_pnl_pct": 0.0},
+            is_trigger_mode=False,
+            limit=2,
+        )
+
+        self.assertEqual(len(cases), 2)
+        self.assertIn("failure_reason=execution_quality_degraded:wide_spread", cases[0])
+        self.assertEqual(
+            orchestrator.last_context_selection_summary["similar_past_cases"]["selection_mode"],
+            "background_support",
+        )
 
     def test_save_retrieval_evaluations_for_audit_persists_aligned_flags(self):
         orchestrator = self._make_orchestrator()
@@ -741,6 +971,126 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["trigger_context"], "volume_surge+range_break+opportunity")
         self.assertEqual(selected[0]["execution_context"], "acceptable_spread|deep_book|manageable_invalidation")
+
+    def test_select_long_term_memory_context_balances_categories(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                is_opportunity_trigger=True,
+            )
+        }
+        market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
+        market_snapshots["BTCUSDT"].regime.volatility_regime = "high"
+        rows = [
+            {
+                "rule": "Reduce size when execution quality degrades.",
+                "category": "risk_control",
+                "status": "rule",
+                "support": 8,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when spread snaps back immediately."],
+                "metrics": {"confidence_score": 0.9, "validity_score": 0.82, "freshness_score": 0.75},
+            },
+            {
+                "rule": "Allow a small continuation probe when trigger evidence aligns.",
+                "category": "opportunity",
+                "status": "rule",
+                "support": 5,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when depth collapses."],
+                "metrics": {
+                    "confidence_score": 0.72,
+                    "validity_score": 0.71,
+                    "freshness_score": 0.68,
+                    "trigger_context": "opportunity",
+                },
+            },
+            {
+                "rule": "Only act when execution quality stays tradable.",
+                "category": "execution_quality",
+                "status": "rule",
+                "support": 4,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when invalidation becomes too wide."],
+                "metrics": {
+                    "confidence_score": 0.7,
+                    "validity_score": 0.73,
+                    "freshness_score": 0.69,
+                },
+            },
+        ]
+
+        selected = orchestrator._select_long_term_memory_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=3,
+            max_ignore_when=2,
+        )
+
+        self.assertEqual(len(selected), 3)
+        self.assertEqual({row["category"] for row in selected}, {"risk_control", "opportunity", "execution_quality"})
+        summary = orchestrator.last_context_selection_summary["long_term_memory"]
+        self.assertEqual(summary["selected_bucket_counts"]["risk_control"], 1)
+        self.assertEqual(summary["selected_bucket_counts"]["opportunity"], 1)
+        self.assertEqual(summary["selected_bucket_counts"]["execution_quality"], 1)
+
+    def test_select_long_term_memory_context_keeps_risk_control_priority(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                is_opportunity_trigger=True,
+            )
+        }
+        market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
+        market_snapshots["BTCUSDT"].regime.volatility_regime = "high"
+        rows = [
+            {
+                "rule": "Avoid entries when execution quality deteriorates.",
+                "category": "execution_quality",
+                "status": "rule",
+                "support": 6,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when spread normalizes."],
+                "metrics": {"confidence_score": 0.8, "validity_score": 0.8, "freshness_score": 0.7},
+            },
+            {
+                "rule": "Cut size aggressively during repeated failure patterns.",
+                "category": "risk_control",
+                "status": "rule",
+                "support": 5,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when portfolio is flat and clean."],
+                "metrics": {"confidence_score": 0.72, "validity_score": 0.7, "freshness_score": 0.68},
+            },
+        ]
+
+        selected = orchestrator._select_long_term_memory_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=1,
+            max_ignore_when=2,
+        )
+
+        self.assertEqual(selected[0]["category"], "risk_control")
 
     def test_build_similar_past_cases_applies_limit(self):
         class DummyRagEngine:
@@ -1639,3 +1989,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(cancel_entry["action_type"], "cancel")
         self.assertEqual(cancel_entry["order_type"], "CANCEL")
         self.assertEqual(cancel_entry["fill_ratio"], 1.0)
+
+    def test_main_returns_nonzero_on_startup_configuration_error(self):
+        with patch("main.TradingOrchestrator", side_effect=StartupConfigurationError("bad config")):
+            self.assertEqual(run_main(), 1)

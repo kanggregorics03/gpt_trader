@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
@@ -41,6 +42,10 @@ from utils.logger import log
 
 load_dotenv()
 
+class StartupConfigurationError(RuntimeError):
+    """Raised when the orchestrator cannot start with the current configuration."""
+
+
 class TradingOrchestrator:
     ALERT_STATE_UNSET = object()
     DEFAULT_EXECUTION_GUARDS = {
@@ -55,11 +60,13 @@ class TradingOrchestrator:
     }
     DEFAULT_CONTEXT_BUDGET = {
         "journal_fetch_limit": 24,
+        "journal_anchor_limit": 24,
         "journal_keep_limit": 6,
         "memory_keep_limit": 8,
         "similar_case_keep_limit": 5,
+        "similar_case_normal_keep_limit": 2,
         "max_rationale_items_per_journal": 2,
-        "max_evidence_per_rationale_item": 2,
+        "max_evidence_per_rationale_item": 3,
         "max_ignore_when_per_memory": 2,
     }
     DEFAULT_REPLAY_BATCH = {
@@ -127,16 +134,17 @@ class TradingOrchestrator:
         self.db_path = os.getenv("DB_PATH", "data/gpt_trader.db")
 
         if not all([self.api_key, self.api_secret]):
-            log.error("Missing required environment variables. Please check .env")
-            exit(1)
+            raise StartupConfigurationError("Missing required environment variables. Please check .env")
         try:
             self._validate_ai_configuration()
         except ValueError as exc:
-            log.error(str(exc))
-            exit(1)
+            raise StartupConfigurationError(str(exc)) from exc
 
         self.state_store = StateStore(self.db_path)
-        self.risk_engine = RiskEngine()
+        try:
+            self.risk_engine = RiskEngine()
+        except ValueError as exc:
+            raise StartupConfigurationError(str(exc)) from exc
         self.rag_engine = RagEngine(self.db_path)
         self.symbols = self.risk_engine.get_trading_symbols()
         self.symbol = self.risk_engine.get_trading_symbol()
@@ -739,9 +747,14 @@ class TradingOrchestrator:
         budget = dict(self.DEFAULT_CONTEXT_BUDGET)
         budget.update(configured or {})
         budget["journal_fetch_limit"] = max(6, int(budget.get("journal_fetch_limit", 24) or 24))
+        budget["journal_anchor_limit"] = max(0, int(budget.get("journal_anchor_limit", 24) or 24))
         budget["journal_keep_limit"] = max(3, int(budget.get("journal_keep_limit", 6) or 6))
         budget["memory_keep_limit"] = max(3, int(budget.get("memory_keep_limit", 8) or 8))
         budget["similar_case_keep_limit"] = max(1, int(budget.get("similar_case_keep_limit", 5) or 5))
+        budget["similar_case_normal_keep_limit"] = max(
+            1,
+            int(budget.get("similar_case_normal_keep_limit", 2) or 2),
+        )
         budget["max_rationale_items_per_journal"] = max(
             1,
             int(budget.get("max_rationale_items_per_journal", 2) or 2),
@@ -834,11 +847,60 @@ class TradingOrchestrator:
         self.last_daily_batch_date = None
         self.last_trade_case_snapshot_at = 0.0
         self.last_similar_case_matches = []
+        self._learning_artifact_cache = {}
+        self.last_context_selection_summary = self._build_empty_context_selection_summary()
         self._daily_kill_switch_active = None
         self._drawdown_mode_active = None
         self._cooldown_extension_signature = self.ALERT_STATE_UNSET
         self._public_ws_stale = None
         self._private_ws_stale = None
+        self._learning_artifact_cache = {}
+
+    def _build_empty_context_selection_summary(self) -> dict:
+        return {
+            "recent_journal_context": {
+                "available_total": 0,
+                "selected_total": 0,
+                "available_bucket_counts": {},
+                "selected_bucket_counts": {},
+                "excluded_bucket_counts": {},
+                "selected_journal_ids": [],
+            },
+            "long_term_memory": {
+                "available_total": 0,
+                "selected_total": 0,
+                "available_bucket_counts": {},
+                "selected_bucket_counts": {},
+                "excluded_bucket_counts": {},
+                "selected_rules": [],
+            },
+            "similar_past_cases": {
+                "trigger_mode": False,
+                "available_total": 0,
+                "selected_total": 0,
+                "selected_sources": {},
+            },
+        }
+
+    def _get_learning_artifact_payload(self, artifact_key: str) -> dict:
+        cache = getattr(self, "_learning_artifact_cache", None)
+        if cache is None:
+            self._learning_artifact_cache = {}
+            cache = self._learning_artifact_cache
+        key = str(artifact_key or "").strip()
+        if not key:
+            return {}
+        if key in cache:
+            return dict(cache[key])
+        if not hasattr(self.state_store, "get_learning_artifact"):
+            cache[key] = {}
+            return {}
+        artifact = self.state_store.get_learning_artifact(key) or {}
+        payload = artifact.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        cache[key] = dict(payload)
+        return dict(payload)
 
     def _coerce_risk_state(self, risk_state) -> RiskStateSnapshot:
         return coerce_risk_state_snapshot(risk_state)
@@ -1484,6 +1546,94 @@ class TradingOrchestrator:
             "summary": row.get("summary"),
         }
 
+    def _is_system_fallback_context_row(self, row) -> bool:
+        execution_summary = row.get("execution_summary") or {}
+        if str(execution_summary.get("error") or "").strip():
+            return True
+        ai_usage = execution_summary.get("ai_usage") or {}
+        if bool(ai_usage.get("validation_error")) or bool(ai_usage.get("semantic_validation_error")):
+            return True
+
+        text_markers = (
+            "system error",
+            "structured rationale validation failed",
+            "fallback due to json validation error from ai",
+            "fallback due to invalid structured rationale from ai",
+            "loop error during",
+        )
+        text_values: list[str] = []
+        for value in (row.get("rationale") or []):
+            text_values.append(str(value or "").strip().lower())
+        for value in (row.get("risk_notes") or []):
+            text_values.append(str(value or "").strip().lower())
+        summary = row.get("summary")
+        if summary:
+            text_values.append(str(summary).strip().lower())
+        risk_reason = row.get("risk_reason")
+        if risk_reason:
+            text_values.append(str(risk_reason).strip().lower())
+        return any(any(marker in text for marker in text_markers) for text in text_values if text)
+
+    def _classify_recent_journal_bucket(self, row) -> str:
+        if self._is_system_fallback_context_row(row):
+            return "system_fallback"
+
+        decision = str(row.get("decision") or "HOLD").upper()
+        has_trigger = bool(row.get("trigger_symbols") or [])
+        has_risk_trigger = bool(row.get("risk_trigger_symbols") or [])
+        has_loss_signal = bool(row.get("loss_signal"))
+        risk_reason = str(row.get("risk_reason") or "").strip().lower()
+        is_non_default_risk_reason = risk_reason not in ("", "approved", "safe action.")
+
+        if decision == "HOLD":
+            if has_trigger and not has_risk_trigger:
+                return "missed_opportunity_hold"
+            if not has_trigger and not has_risk_trigger and not has_loss_signal and not is_non_default_risk_reason:
+                return "good_hold"
+            return "hold"
+        if decision in ("BUY", "SELL"):
+            return "entry_action"
+        if decision in ("REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY") or has_loss_signal or has_risk_trigger:
+            return "risk_outcome"
+        return "other_action"
+
+    def _journal_decision_diversity_key(self, row) -> str:
+        decision = str(row.get("decision") or "HOLD").upper()
+        if decision == "HOLD":
+            bucket = str(row.get("context_bucket") or "")
+            if bucket in {"good_hold", "missed_opportunity_hold"}:
+                return bucket
+            return "hold"
+        if decision in ("BUY", "SELL"):
+            return "entry_action"
+        if decision in ("REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"):
+            return "risk_outcome"
+        return "other_action"
+
+    def _classify_memory_bucket(self, row, metrics: dict | None = None) -> str:
+        metrics = metrics or {}
+        category_text = str(row.get("category") or metrics.get("category") or "lesson").strip().lower()
+        hold_quality = str(row.get("hold_quality") or metrics.get("hold_quality") or "").strip().lower()
+        lifecycle_status = str(row.get("lifecycle_status") or metrics.get("lifecycle_status") or "").strip().lower()
+        retired = bool(row.get("retired") or metrics.get("retired") or lifecycle_status == "retired")
+        support = int(row.get("support") or metrics.get("support") or 0)
+
+        if retired:
+            return "retired_counterpoint"
+        if hold_quality == "good_hold":
+            return "good_hold"
+        if hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
+            return "missed_opportunity_hold"
+        if category_text == "risk_control":
+            return "risk_control"
+        if category_text in {"opportunity", "setup", "entry"}:
+            return "opportunity"
+        if category_text in {"execution_quality", "execution", "microstructure"}:
+            return "execution_quality"
+        if support <= 2:
+            return "emerging"
+        return "general"
+
     def _build_market_case_signature(self, market_snapshots, risk_mode: str) -> dict:
         symbols = set(market_snapshots.keys())
         trigger_reasons = set()
@@ -1681,6 +1831,38 @@ class TradingOrchestrator:
         ranked.sort(key=lambda item: item[0], reverse=True)
         return {item["trade_case_id"]: item for _, item in ranked[: max(1, limit)]}
 
+    def _apply_recent_journal_reranker_adjustment(self, row) -> tuple[float, list[str]]:
+        profile = self._get_learning_artifact_payload("journal_reranker_profile")
+        if not profile:
+            return 0.0, []
+        adjustment = 0.0
+        features: list[str] = []
+        bucket = self._classify_recent_journal_bucket(row)
+        decision = str(row.get("decision") or "HOLD").upper()
+        bucket_weights = profile.get("bucket_weights") or {}
+        decision_weights = profile.get("decision_weights") or {}
+        if bucket in bucket_weights:
+            value = float(bucket_weights.get(bucket) or 0.0)
+            adjustment += value
+            if value:
+                features.append(f"learned_bucket:{bucket}")
+        if decision in decision_weights:
+            value = float(decision_weights.get(decision) or 0.0)
+            adjustment += value
+            if value:
+                features.append(f"learned_decision:{decision}")
+        if bool(row.get("loss_signal")):
+            value = float(profile.get("loss_signal_weight") or 0.0)
+            adjustment += value
+            if value:
+                features.append("learned_loss_signal")
+        if row.get("estimated_pnl_pct") is not None:
+            value = float(profile.get("pnl_presence_weight") or 0.0)
+            adjustment += value
+            if value:
+                features.append("learned_pnl_presence")
+        return round(adjustment, 4), features
+
     def _score_journal_case_similarity(
         self,
         row,
@@ -1692,9 +1874,20 @@ class TradingOrchestrator:
         score = 0.0
         matched_features: list[str] = []
         decision = str(row.get("decision") or "HOLD").upper()
-        if decision in ("BUY", "SELL", "REDUCE", "EXIT"):
-            score += 12.0
+        if decision in ("REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"):
+            score += 8.0
             matched_features.append(f"decision:{decision}")
+        elif decision in ("BUY", "SELL"):
+            score += 6.0
+            matched_features.append(f"decision:{decision}")
+        elif decision == "HOLD":
+            bucket = self._classify_recent_journal_bucket(row)
+            if bucket == "good_hold":
+                score += 4.5
+                matched_features.append("good_hold")
+            elif bucket == "missed_opportunity_hold":
+                score += 1.5
+                matched_features.append("missed_opportunity_hold")
         if bool(row.get("loss_signal")):
             score += 8.0
             matched_features.append("loss_signal")
@@ -1781,7 +1974,11 @@ class TradingOrchestrator:
                 if vector_match.get("thesis_failure_reason"):
                     matched_features.append("vector_failure_reason")
 
-        score += max(0.0, 5.0 - (row_index * 0.2))
+        learned_adjustment, learned_features = self._apply_recent_journal_reranker_adjustment(row)
+        if learned_adjustment:
+            score += learned_adjustment
+            matched_features.extend(learned_features)
+        score += max(0.0, 2.5 - (row_index * 0.08))
         deduped_features = list(dict.fromkeys(matched_features))
         return score, deduped_features
 
@@ -1798,6 +1995,14 @@ class TradingOrchestrator:
         risk_state=None,
     ):
         if not rows:
+            self.last_context_selection_summary["recent_journal_context"] = {
+                "available_total": 0,
+                "selected_total": 0,
+                "available_bucket_counts": {},
+                "selected_bucket_counts": {},
+                "excluded_bucket_counts": {},
+                "selected_journal_ids": [],
+            }
             return []
         current_signature = self._build_market_case_signature(market_snapshots, risk_mode=risk_mode)
         current_feature_vectors = self._build_current_market_vectors(
@@ -1821,6 +2026,8 @@ class TradingOrchestrator:
                 if trade_case:
                     trade_case_lookup[trade_case_id] = trade_case
         scored = []
+        available_bucket_counts: dict[str, int] = defaultdict(int)
+        excluded_bucket_counts: dict[str, int] = defaultdict(int)
         for index, row in enumerate(rows):
             score, matched_features = self._score_journal_case_similarity(
                 row=row,
@@ -1832,12 +2039,82 @@ class TradingOrchestrator:
             enriched_row = dict(row)
             enriched_row["similarity_score"] = round(score, 4)
             enriched_row["matched_features"] = matched_features
+            bucket = self._classify_recent_journal_bucket(enriched_row)
+            enriched_row["context_bucket"] = bucket
+            enriched_row["row_index"] = index
+            available_bucket_counts[bucket] += 1
+            if bucket == "system_fallback":
+                excluded_bucket_counts[bucket] += 1
             scored.append((score, index, enriched_row))
 
-        selected = sorted(scored, key=lambda item: (-item[0], item[1]))[: max(1, limit)]
-        selected_indices = {index for _, index, _ in selected}
-        selected_rows = {index: row for _, index, row in selected}
+        usable = [item for item in scored if str(item[2].get("context_bucket") or "") != "system_fallback"]
+        bucket_priority = [
+            "risk_outcome",
+            "good_hold",
+            "hold",
+            "entry_action",
+            "missed_opportunity_hold",
+            "other_action",
+        ]
+        selected_rows_meta: list[dict] = []
+        selected_indices: set[int] = set()
+        selected_bucket_counts: dict[str, int] = defaultdict(int)
+        diversity_counts: dict[str, int] = defaultdict(int)
+
+        if max(1, limit) == 1 and usable:
+            best = sorted(usable, key=lambda item: (-item[0], item[1]))[0]
+            selected_rows_meta.append(best[2])
+            selected_indices.add(best[1])
+            selected_bucket_counts[str(best[2].get("context_bucket") or "")] += 1
+            diversity_counts[self._journal_decision_diversity_key(best[2])] += 1
+
+        for bucket in bucket_priority:
+            if len(selected_rows_meta) >= max(1, limit):
+                break
+            bucket_candidates = [
+                item for item in usable
+                if item[1] not in selected_indices and str(item[2].get("context_bucket") or "") == bucket
+            ]
+            if not bucket_candidates:
+                continue
+            best = sorted(bucket_candidates, key=lambda item: (-item[0], item[1]))[0]
+            selected_rows_meta.append(best[2])
+            selected_indices.add(best[1])
+            selected_bucket_counts[bucket] += 1
+            diversity_counts[self._journal_decision_diversity_key(best[2])] += 1
+
+        while len(selected_rows_meta) < max(1, limit):
+            remaining = [item for item in usable if item[1] not in selected_indices]
+            if not remaining:
+                break
+            best = max(
+                remaining,
+                key=lambda item: (
+                    item[0]
+                    - (selected_bucket_counts[str(item[2].get("context_bucket") or "")] * 1.5)
+                    - (diversity_counts[self._journal_decision_diversity_key(item[2])] * 2.5),
+                    -item[1],
+                ),
+            )
+            selected_rows_meta.append(best[2])
+            selected_indices.add(best[1])
+            selected_bucket_counts[str(best[2].get("context_bucket") or "")] += 1
+            diversity_counts[self._journal_decision_diversity_key(best[2])] += 1
+
+        selected_rows = {int(row["row_index"]): row for row in selected_rows_meta}
         ordered_rows = [selected_rows[index] for index in range(len(rows)) if index in selected_indices]
+        self.last_context_selection_summary["recent_journal_context"] = {
+            "available_total": len(rows),
+            "selected_total": len(ordered_rows),
+            "available_bucket_counts": dict(sorted(available_bucket_counts.items())),
+            "selected_bucket_counts": dict(sorted(selected_bucket_counts.items())),
+            "excluded_bucket_counts": dict(sorted(excluded_bucket_counts.items())),
+            "selected_journal_ids": [
+                row.get("journal_id") or row.get("id")
+                for row in ordered_rows
+                if row.get("journal_id") or row.get("id")
+            ],
+        }
         return [
             self._compact_recent_journal_row(
                 row,
@@ -1999,6 +2276,14 @@ class TradingOrchestrator:
 
     def _select_long_term_memory_context(self, rows, market_snapshots, risk_mode: str, limit: int, max_ignore_when: int):
         if not rows:
+            self.last_context_selection_summary["long_term_memory"] = {
+                "available_total": 0,
+                "selected_total": 0,
+                "available_bucket_counts": {},
+                "selected_bucket_counts": {},
+                "excluded_bucket_counts": {},
+                "selected_rules": [],
+            }
             return []
         current_symbols = set(market_snapshots.keys())
         active_trends = set()
@@ -2009,6 +2294,8 @@ class TradingOrchestrator:
         active_contexts = self._build_memory_context_signatures(market_snapshots)
 
         scored = []
+        available_bucket_counts: dict[str, int] = defaultdict(int)
+        excluded_bucket_counts: dict[str, int] = defaultdict(int)
         for index, row in enumerate(rows):
             score = 0.0
             metrics = row.get("metrics") or {}
@@ -2024,10 +2311,15 @@ class TradingOrchestrator:
             trigger_context = str(row.get("trigger_context") or metrics.get("trigger_context") or "")
             execution_context = str(row.get("execution_context") or metrics.get("execution_context") or "")
             trend_context = str(row.get("trend_context") or metrics.get("trend_context") or "")
-            hold_quality = str(row.get("hold_quality") or metrics.get("hold_quality") or "")
-            retired = bool(row.get("retired") or metrics.get("retired"))
+            hold_quality = str(row.get("hold_quality") or metrics.get("hold_quality") or "").strip().lower()
+            retired = bool(row.get("retired") or metrics.get("retired") or lifecycle_status == "retired")
+            bucket = self._classify_memory_bucket(row, metrics=metrics)
+            available_bucket_counts[bucket] += 1
             if retired or lifecycle_status == "retired":
-                continue
+                if support < 4 or confidence_score < 0.65 or validity_score < 0.65:
+                    excluded_bucket_counts[bucket] += 1
+                    continue
+                score -= 7.0
             apply_regimes = set(apply_when.get("regime") or [])
             apply_trends = set(apply_when.get("trend") or [])
             apply_volatility = set(apply_when.get("volatility") or [])
@@ -2039,6 +2331,12 @@ class TradingOrchestrator:
             score += freshness_score * 4.0
             if category == "risk_control":
                 score += 4.0
+            elif category in {"execution_quality", "execution", "microstructure"}:
+                score += 2.5
+            if hold_quality == "good_hold":
+                score += 2.5
+            elif hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
+                score += 0.75
             if str(risk_mode or "") in apply_regimes:
                 score += 8.0
             if active_trends and active_trends.intersection(apply_trends):
@@ -2055,12 +2353,65 @@ class TradingOrchestrator:
             )
             if current_symbols and any(symbol in rule_text for symbol in current_symbols):
                 score += 4.0
-            score += max(0.0, 4.0 - (index * 0.15))
-            scored.append((score, index, row))
+            score += max(0.0, 2.0 - (index * 0.08))
+            enriched_row = dict(row)
+            enriched_row["memory_bucket"] = bucket
+            enriched_row["row_index"] = index
+            enriched_row["selection_score"] = round(score, 4)
+            scored.append((score, index, enriched_row))
 
-        selected = sorted(scored, key=lambda item: (-item[0], item[1]))[: max(1, limit)]
-        selected_indices = {index for _, index, _ in selected}
+        bucket_priority = [
+            "risk_control",
+            "execution_quality",
+            "good_hold",
+            "opportunity",
+            "missed_opportunity_hold",
+            "general",
+            "emerging",
+            "retired_counterpoint",
+        ]
+        selected_rows_meta: list[dict] = []
+        selected_indices: set[int] = set()
+        selected_bucket_counts: dict[str, int] = defaultdict(int)
+
+        for bucket in bucket_priority:
+            if len(selected_rows_meta) >= max(1, limit):
+                break
+            bucket_candidates = [
+                item for item in scored
+                if item[1] not in selected_indices and str(item[2].get("memory_bucket") or "") == bucket
+            ]
+            if not bucket_candidates:
+                continue
+            best = sorted(bucket_candidates, key=lambda item: (-item[0], item[1]))[0]
+            selected_rows_meta.append(best[2])
+            selected_indices.add(best[1])
+            selected_bucket_counts[bucket] += 1
+
+        while len(selected_rows_meta) < max(1, limit):
+            remaining = [item for item in scored if item[1] not in selected_indices]
+            if not remaining:
+                break
+            best = max(
+                remaining,
+                key=lambda item: (
+                    item[0] - (selected_bucket_counts[str(item[2].get("memory_bucket") or "")] * 1.25),
+                    -item[1],
+                ),
+            )
+            selected_rows_meta.append(best[2])
+            selected_indices.add(best[1])
+            selected_bucket_counts[str(best[2].get("memory_bucket") or "")] += 1
+
         ordered_rows = [rows[index] for index in range(len(rows)) if index in selected_indices]
+        self.last_context_selection_summary["long_term_memory"] = {
+            "available_total": len(rows),
+            "selected_total": len(ordered_rows),
+            "available_bucket_counts": dict(sorted(available_bucket_counts.items())),
+            "selected_bucket_counts": dict(sorted(selected_bucket_counts.items())),
+            "excluded_bucket_counts": dict(sorted(excluded_bucket_counts.items())),
+            "selected_rules": [str(row.get("rule") or "")[:120] for row in ordered_rows],
+        }
         return [
             self._compact_memory_record(
                 row,
@@ -2068,6 +2419,43 @@ class TradingOrchestrator:
             )
             for row in ordered_rows
         ]
+
+    def _score_similar_past_case_candidate(self, trade_case, match, is_trigger_mode: bool) -> float:
+        similarity = float((match or {}).get("similarity") or 0.0)
+        final_score = float((match or {}).get("final_score") or 0.0)
+        retrieval_source = str((match or {}).get("retrieval_source") or "full_scan").strip().lower() or "full_scan"
+        status = str((trade_case or {}).get("status") or "").strip().lower()
+        failure_reason = str((trade_case or {}).get("thesis_failure_reason") or "none").strip().lower()
+        pnl = (trade_case or {}).get("realized_pnl")
+        if pnl is None:
+            pnl = (trade_case or {}).get("estimated_pnl_pct")
+        try:
+            pnl_value = float(pnl)
+        except (TypeError, ValueError):
+            pnl_value = 0.0
+
+        score = (final_score * 10.0) + (similarity * 8.0)
+        if status == "closed":
+            score += 2.0
+        if pnl_value < 0:
+            score += 3.5 if is_trigger_mode else 5.0
+        elif pnl_value > 0:
+            score += 1.0 if is_trigger_mode else 0.25
+        if failure_reason and failure_reason != "none":
+            score += 2.5 if is_trigger_mode else 4.0
+        if retrieval_source == "band_index":
+            score += 0.75
+        profile = self._get_learning_artifact_payload("similar_case_reranker_profile")
+        if profile:
+            score += similarity * float(profile.get("similarity_weight") or 0.0)
+            score += final_score * float(profile.get("final_score_weight") or 0.0)
+            score += float((match or {}).get("matched_band_count") or 0.0) * float(profile.get("matched_band_weight") or 0.0)
+            score += float((profile.get("source_weights") or {}).get(retrieval_source, 0.0) or 0.0)
+            if failure_reason and failure_reason != "none":
+                score += float(profile.get("failure_reason_weight") or 0.0)
+            if pnl_value < 0:
+                score += float(profile.get("negative_outcome_weight") or 0.0)
+        return score
 
     def _build_similar_past_cases(
         self,
@@ -2078,8 +2466,8 @@ class TradingOrchestrator:
         limit: int = 5,
     ):
         self.last_similar_case_matches = []
-        if not is_trigger_mode:
-            return []
+        selection_mode = "trigger" if is_trigger_mode else "background_support"
+        target_limit = max(1, int(limit or 1))
         current_feature_vectors = self._build_current_market_vectors(
             market_snapshots,
             account_state=account_state,
@@ -2088,18 +2476,29 @@ class TradingOrchestrator:
         vector_matches = self._search_trade_case_vector_matches(
             current_feature_vectors=current_feature_vectors,
             risk_mode="trigger" if is_trigger_mode else "",
-            limit=max(limit * 3, 12),
+            limit=max(target_limit * 4, 12),
         )
         cases = []
         seen = set()
-        for trade_case_id, match in sorted(
-            vector_matches.items(),
-            key=lambda item: float((item[1] or {}).get("final_score") or 0.0),
-            reverse=True,
-        ):
+        selected_sources: dict[str, int] = defaultdict(int)
+        ranked_matches = []
+        for trade_case_id, match in vector_matches.items():
             trade_case = self.state_store.get_trade_case(trade_case_id)
             if not trade_case:
                 continue
+            ranked_matches.append(
+                (
+                    self._score_similar_past_case_candidate(
+                        trade_case,
+                        match,
+                        is_trigger_mode=is_trigger_mode,
+                    ),
+                    trade_case_id,
+                    match,
+                    trade_case,
+                )
+            )
+        for _, trade_case_id, match, trade_case in sorted(ranked_matches, key=lambda item: item[0], reverse=True):
             symbol = str(trade_case.get("symbol") or match.get("matched_symbol") or "UNKNOWN")
             if symbol in market_snapshots and not market_snapshots[symbol].is_opportunity_trigger and any(
                 snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
@@ -2137,12 +2536,27 @@ class TradingOrchestrator:
                     },
                 }
             )
+            selected_sources[str(match.get("retrieval_source") or "full_scan")] += 1
             cases.append(case_text)
-            if len(cases) >= max(1, int(limit or 1)):
-                return cases[: max(1, int(limit or 1))]
+            if len(cases) >= target_limit:
+                self.last_context_selection_summary["similar_past_cases"] = {
+                    "trigger_mode": bool(is_trigger_mode),
+                    "selection_mode": selection_mode,
+                    "available_total": len(vector_matches),
+                    "selected_total": len(cases),
+                    "selected_sources": dict(sorted(selected_sources.items())),
+                }
+                return cases[:target_limit]
 
         if cases:
-            return cases[: max(1, int(limit or 1))]
+            self.last_context_selection_summary["similar_past_cases"] = {
+                "trigger_mode": bool(is_trigger_mode),
+                "selection_mode": selection_mode,
+                "available_total": len(vector_matches),
+                "selected_total": len(cases),
+                "selected_sources": dict(sorted(selected_sources.items())),
+            }
+            return cases[:target_limit]
 
         account_payload = (
             account_state.model_dump(mode="json")
@@ -2185,10 +2599,25 @@ class TradingOrchestrator:
                         "payload": {"raw_case": case},
                     }
                 )
+                selected_sources["rag_fallback"] += 1
                 cases.append(tagged_case)
-                if len(cases) >= max(1, int(limit or 1)):
-                    return cases[: max(1, int(limit or 1))]
-        return cases[: max(1, int(limit or 1))]
+                if len(cases) >= target_limit:
+                    self.last_context_selection_summary["similar_past_cases"] = {
+                        "trigger_mode": bool(is_trigger_mode),
+                        "selection_mode": selection_mode,
+                        "available_total": max(len(vector_matches), len(cases)),
+                        "selected_total": len(cases),
+                        "selected_sources": dict(sorted(selected_sources.items())),
+                    }
+                    return cases[:target_limit]
+        self.last_context_selection_summary["similar_past_cases"] = {
+            "trigger_mode": bool(is_trigger_mode),
+            "selection_mode": selection_mode,
+            "available_total": max(len(vector_matches), len(cases)),
+            "selected_total": len(cases),
+            "selected_sources": dict(sorted(selected_sources.items())),
+        }
+        return cases[:target_limit]
 
     def _save_retrieval_evaluations_for_audit(
         self,
@@ -3641,6 +4070,7 @@ class TradingOrchestrator:
     def run_cycle(self, loop_type: str, snapshot_bundle=None, loop_mode: str | None = None):
         log.info(f"--- Starting {loop_type} Cycle ---")
         execution_guards = self._build_execution_guards()
+        self.last_context_selection_summary = self._build_empty_context_selection_summary()
         loop_mode = loop_mode or self.active_loop_mode
         loop_lock_name = "trading_orchestrator_loop"
         loop_lock_owner = f"{loop_type}:{os.getpid()}:{int(time.time() * 1000)}"
@@ -3833,7 +4263,15 @@ class TradingOrchestrator:
             else:
                 context_budget = self._build_context_budget()
                 raw_recent_journal_context = self.state_store.get_recent_journal_context(
-                    limit=context_budget["journal_fetch_limit"]
+                    limit=context_budget["journal_fetch_limit"],
+                    candidate_limit=max(
+                        context_budget["journal_fetch_limit"] * 4,
+                        context_budget["journal_keep_limit"] * 10,
+                    ),
+                    anchor_limit=max(
+                        context_budget.get("journal_anchor_limit", 0),
+                        context_budget["journal_keep_limit"] * 4,
+                    ),
                 )
                 raw_recent_trade_cases = self.state_store.get_recent_trade_cases(
                     limit=max(
@@ -3865,7 +4303,11 @@ class TradingOrchestrator:
                     account_state=account_state,
                     risk_state=risk_state,
                     is_trigger_mode=is_trigger_mode,
-                    limit=context_budget["similar_case_keep_limit"],
+                    limit=(
+                        context_budget["similar_case_keep_limit"]
+                        if is_trigger_mode
+                        else context_budget.get("similar_case_normal_keep_limit", 2)
+                    ),
                 )
                 log.info(
                     "Context budget applied: journals {}->{}, trade_cases={}, memory {}->{}, similar_cases={}",
@@ -3967,6 +4409,9 @@ class TradingOrchestrator:
                 "execution_policy": execution_policy_summary,
                 "evidence_quality": evidence_quality_summary,
                 "entry_size_cap": entry_size_cap_summary,
+                "context_selection_summary": self._serialize_json_payload(
+                    getattr(self, "last_context_selection_summary", {}) or {}
+                ),
                 "executed_order_count": 0,
                 "unknown_order_states_before_execution": unresolved_timeout_count,
             }
@@ -4455,6 +4900,15 @@ class TradingOrchestrator:
             )
             time.sleep(sleep_seconds)
 
-if __name__ == "__main__":
-    orchestrator = TradingOrchestrator()
+def main() -> int:
+    try:
+        orchestrator = TradingOrchestrator()
+    except StartupConfigurationError as exc:
+        log.error("Startup failed: {}", exc)
+        return 1
     orchestrator.start_scheduler()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

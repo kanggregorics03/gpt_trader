@@ -643,6 +643,8 @@ class TestDecisionEngine(unittest.TestCase):
 
         self.assertIn('"confidence_score":0.81', prompt)
         self.assertIn('"entry_size_cap":{"adjusted":true,"effective_cap_pct":20.0,"base_cap_pct":30.0}', prompt)
+        self.assertIn('"ignore_when":["Ignore when retest holds with strong follow-through.","Ignore when trend is flat."]', prompt)
+        self.assertIn("Do not follow their majority vote mechanically", prompt)
         self.assertNotIn("previous_values", prompt)
         self.assertNotIn("candidate_lessons", prompt)
         self.assertNotIn("long detail", prompt)

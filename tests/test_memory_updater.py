@@ -115,6 +115,71 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual([row["audit_log_id"] for row in eligible], [101])
         self.assertEqual([row["audit_log_id"] for row in excluded], [102, 103])
 
+    def test_build_recent_journal_reranker_profile_learns_bucket_biases(self):
+        profile = self.updater._build_recent_journal_reranker_profile(
+            [
+                {
+                    "decision": "HOLD",
+                    "estimated_pnl_pct": 1.2,
+                    "rationale_json": [{"hold_quality": "good_hold"}],
+                    "loss_signal": False,
+                },
+                {
+                    "decision": "BUY",
+                    "estimated_pnl_pct": -0.8,
+                    "rationale_json": [],
+                    "loss_signal": True,
+                },
+            ]
+        )
+
+        self.assertEqual(profile["model_kind"], "bucket_bias_profile_v1")
+        self.assertIn("good_hold", profile["bucket_weights"])
+        self.assertIn("BUY", profile["decision_weights"])
+
+    def test_build_similar_case_reranker_profile_uses_counterfactual_and_outcomes(self):
+        profile = self.updater._build_similar_case_reranker_profile(
+            retrieval_evaluations=[
+                {
+                    "audit_log_id": 1,
+                    "similarity": 0.9,
+                    "final_score": 1.2,
+                    "matched_band_count": 4,
+                    "retrieval_source": "band_index",
+                    "outcome_realized_pnl": 1.1,
+                    "payload": {"thesis_failure_reason": "wide_spread"},
+                },
+                {
+                    "audit_log_id": 2,
+                    "similarity": 0.4,
+                    "final_score": 0.3,
+                    "matched_band_count": 1,
+                    "retrieval_source": "full_scan",
+                    "outcome_realized_pnl": -0.9,
+                    "payload": {},
+                },
+            ],
+            replay_runs=[
+                {
+                    "audit_log_id": 1,
+                    "payload": {"retrieval_counterfactual": {"with_vs_without_comparison": {"with_retrieval_better": True}}},
+                }
+            ],
+        )
+
+        self.assertEqual(profile["model_kind"], "linear_profile_v1")
+        self.assertIn("band_index", profile["source_weights"])
+        self.assertNotEqual(profile["similarity_weight"], 0.0)
+
+    def test_learning_promotions_allowed_respects_liveness_gate(self):
+        class DummyStore:
+            def get_learning_artifact(self, artifact_key):
+                return {"payload": {"promotion_blocked": artifact_key == "learning_liveness"}}
+
+        self.updater.state_store = DummyStore()
+
+        self.assertFalse(self.updater._learning_promotions_allowed())
+
     def test_build_stats_package_aggregates_pnl_and_reasons(self):
         class DummyStore:
             def get_position_ledger_stats(self, hours):

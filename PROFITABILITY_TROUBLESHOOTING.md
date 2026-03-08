@@ -60,6 +60,7 @@
 7. `execution_policy_evaluations`, `shadow_decisions`, `bundle_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
 8. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
 9. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
+10. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, promotion blocked 상태를 확인한다.
 
 ## 4. 원인별 해석 가이드
 
@@ -207,6 +208,10 @@
 
 - `decision_breakdown`
 - `recent_journal_context`
+- 대시보드 `Context Mix`
+  - `good_hold`, `missed_opportunity_hold`, `action`, `fallback` 비율이 retrieval 후보군 왜곡 없이 유지되는지 본다.
+- 대시보드 `Learning Liveness`
+  - reranker artifact가 stale이면 retrieval 품질 문제가 heuristic drift인지 운영 정지인지 먼저 구분한다.
 - `decision_fingerprints`
 - `decision_cooldown_blocked`
 - 모드별 거래 수
@@ -288,6 +293,9 @@
 - `replay_runs`
 - `retrieval_evaluations`
 - `long_term_memory`
+  - runtime retrieval과 batch reconciliation이 같은 lifecycle pool을 읽는지 본다. 오래된 active rule이 recent cap 때문에 사라지면 해석이 틀어진다.
+- `learning_artifacts`
+  - `journal_reranker_profile`, `similar_case_reranker_profile`, `shadow_model_dataset`, `learning_liveness`가 최근 배치에서 갱신됐는지 본다.
 - `candidate_lessons`
 - `policy_evaluations`
 - `bundle_evaluations`
@@ -500,6 +508,7 @@
 3. 파라미터 하나만 바꾼다.
 4. demo 또는 축소 size로 관찰한다.
 5. 비용 전/후 손익, 거래 수, HOLD 비율, 장애 알림을 같이 본다.
+7. context mix에서 `action` 과대표집이나 `fallback` 급증이 없는지 같이 본다.
 6. 개선이 확인되면 다음 항목으로 넘어간다.
 
 권장 순서:

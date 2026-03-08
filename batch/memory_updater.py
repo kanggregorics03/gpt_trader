@@ -3,6 +3,7 @@ import math
 import os
 import statistics
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Literal
 
 from dotenv import load_dotenv
@@ -447,6 +448,273 @@ class MemoryUpdater:
                 if ((row.get("payload") or {}).get("retrieval_counterfactual") or {})
             ],
         }
+
+    def _average(self, values: List[float]) -> float:
+        clean = [float(value) for value in values if value is not None]
+        if not clean:
+            return 0.0
+        return float(sum(clean) / len(clean))
+
+    def _linear_slope(self, pairs: List[tuple[float, float]], clip: float = 2.0) -> float:
+        clean = [(float(x), float(y)) for x, y in pairs if x is not None and y is not None]
+        if len(clean) < 2:
+            return 0.0
+        x_mean = self._average([x for x, _ in clean])
+        y_mean = self._average([y for _, y in clean])
+        variance = sum((x - x_mean) ** 2 for x, _ in clean)
+        if variance <= 1e-9:
+            return 0.0
+        covariance = sum((x - x_mean) * (y - y_mean) for x, y in clean)
+        return round(max(-clip, min(clip, covariance / variance)), 4)
+
+    def _classify_journal_learning_bucket(self, row: Dict[str, Any]) -> str:
+        decision = str(row.get("decision") or "HOLD").strip().upper()
+        rationale_items = row.get("rationale_json") or row.get("rationale_items") or []
+        hold_quality = ""
+        if rationale_items and isinstance(rationale_items, list):
+            for item in rationale_items:
+                hold_quality = str((item or {}).get("hold_quality") or "").strip().lower()
+                if hold_quality:
+                    break
+        if hold_quality == "good_hold":
+            return "good_hold"
+        if hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
+            return "missed_opportunity_hold"
+        if bool(row.get("loss_signal")) or decision in {"EXIT", "REDUCE", "CANCEL", "REPLACE_ENTRY"}:
+            return "risk_outcome"
+        if decision in {"BUY", "SELL"}:
+            return "entry_action"
+        if decision == "HOLD":
+            return "hold"
+        return "other_action"
+
+    def _build_recent_journal_reranker_profile(self, journals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        targets: List[float] = []
+        bucket_targets: Dict[str, List[float]] = {}
+        decision_targets: Dict[str, List[float]] = {}
+        loss_targets = {True: [], False: []}
+        pnl_presence_targets = {True: [], False: []}
+        for row in journals or []:
+            target = self._coerce_float(row.get("estimated_pnl_pct")) or 0.0
+            bucket = self._classify_journal_learning_bucket(row)
+            decision = str(row.get("decision") or "HOLD").strip().upper()
+            targets.append(target)
+            bucket_targets.setdefault(bucket, []).append(target)
+            decision_targets.setdefault(decision, []).append(target)
+            loss_targets[bool(row.get("loss_signal"))].append(target)
+            pnl_presence_targets[row.get("estimated_pnl_pct") is not None].append(target)
+        baseline = self._average(targets)
+        return {
+            "model_kind": "bucket_bias_profile_v1",
+            "sample_count": len(targets),
+            "baseline_utility": round(baseline, 4),
+            "bucket_weights": {
+                key: round(self._average(values) - baseline, 4)
+                for key, values in sorted(bucket_targets.items())
+            },
+            "decision_weights": {
+                key: round(self._average(values) - baseline, 4)
+                for key, values in sorted(decision_targets.items())
+            },
+            "loss_signal_weight": round(self._average(loss_targets[True]) - baseline, 4) if loss_targets[True] else 0.0,
+            "pnl_presence_weight": round(self._average(pnl_presence_targets[True]) - baseline, 4) if pnl_presence_targets[True] else 0.0,
+        }
+
+    def _build_similar_case_reranker_profile(
+        self,
+        retrieval_evaluations: List[Dict[str, Any]],
+        replay_runs: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        counterfactual_bonus_by_audit: Dict[int, float] = {}
+        for replay_row in replay_runs or []:
+            audit_id = int(replay_row.get("audit_log_id") or 0)
+            if not audit_id:
+                continue
+            comparison = (((replay_row.get("payload") or {}).get("retrieval_counterfactual") or {}).get("with_vs_without_comparison") or {})
+            if comparison.get("with_retrieval_better") is True:
+                counterfactual_bonus_by_audit[audit_id] = 0.25
+            elif comparison.get("without_retrieval_better") is True:
+                counterfactual_bonus_by_audit[audit_id] = -0.25
+            else:
+                counterfactual_bonus_by_audit.setdefault(audit_id, 0.0)
+
+        targets: List[float] = []
+        similarity_pairs: List[tuple[float, float]] = []
+        final_score_pairs: List[tuple[float, float]] = []
+        band_pairs: List[tuple[float, float]] = []
+        source_targets: Dict[str, List[float]] = {}
+        failure_reason_targets = {True: [], False: []}
+        negative_case_targets = {True: [], False: []}
+        for row in retrieval_evaluations or []:
+            outcome = self._build_retrieval_outcome_metrics(row)
+            target = float(outcome.get("utility_score") or 0.0) + float(counterfactual_bonus_by_audit.get(int(row.get("audit_log_id") or 0), 0.0))
+            targets.append(target)
+            similarity = self._coerce_float(row.get("similarity"))
+            final_score = self._coerce_float(row.get("final_score"))
+            matched_bands = self._coerce_float(row.get("matched_band_count"))
+            if similarity is not None:
+                similarity_pairs.append((similarity, target))
+            if final_score is not None:
+                final_score_pairs.append((final_score, target))
+            if matched_bands is not None:
+                band_pairs.append((matched_bands, target))
+            source = str(row.get("retrieval_source") or "full_scan").strip().lower() or "full_scan"
+            source_targets.setdefault(source, []).append(target)
+            payload = row.get("payload") or {}
+            has_failure = bool(str(payload.get("thesis_failure_reason") or "").strip())
+            failure_reason_targets[has_failure].append(target)
+            pnl = self._coerce_float(row.get("outcome_realized_pnl"))
+            if pnl is None:
+                pnl = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+            negative_case_targets[bool(pnl is not None and pnl < 0)].append(target)
+        baseline = self._average(targets)
+        return {
+            "model_kind": "linear_profile_v1",
+            "sample_count": len(targets),
+            "baseline_utility": round(baseline, 4),
+            "similarity_weight": self._linear_slope(similarity_pairs, clip=1.5),
+            "final_score_weight": self._linear_slope(final_score_pairs, clip=0.75),
+            "matched_band_weight": self._linear_slope(band_pairs, clip=0.5),
+            "source_weights": {
+                key: round(self._average(values) - baseline, 4)
+                for key, values in sorted(source_targets.items())
+            },
+            "failure_reason_weight": round(self._average(failure_reason_targets[True]) - baseline, 4) if failure_reason_targets[True] else 0.0,
+            "negative_outcome_weight": round(self._average(negative_case_targets[True]) - baseline, 4) if negative_case_targets[True] else 0.0,
+        }
+
+    def _build_shadow_model_dataset(
+        self,
+        journals: List[Dict[str, Any]],
+        replay_runs: List[Dict[str, Any]],
+        shadow_decisions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        replay_by_audit: Dict[int, List[Dict[str, Any]]] = {}
+        shadow_by_audit: Dict[int, List[Dict[str, Any]]] = {}
+        for row in replay_runs or []:
+            audit_id = int(row.get("audit_log_id") or 0)
+            if audit_id:
+                replay_by_audit.setdefault(audit_id, []).append(row)
+        for row in shadow_decisions or []:
+            audit_id = int(row.get("audit_log_id") or 0)
+            if audit_id:
+                shadow_by_audit.setdefault(audit_id, []).append(row)
+
+        dataset: List[Dict[str, Any]] = []
+        for row in journals or []:
+            audit_id = int(row.get("audit_log_id") or 0)
+            replay_rows = replay_by_audit.get(audit_id, [])
+            shadow_rows = shadow_by_audit.get(audit_id, [])
+            estimated_pnl = self._coerce_float(row.get("estimated_pnl_pct")) or 0.0
+            hold_quality = self._classify_journal_learning_bucket(row)
+            replay_changed = any(bool((item.get("payload") or {}).get("retrieval_counterfactual")) for item in replay_rows)
+            shadow_outcomes = [self._coerce_float(item.get("outcome_estimated_pnl_pct")) for item in shadow_rows]
+            shadow_outcomes = [value for value in shadow_outcomes if value is not None]
+            dataset.append(
+                {
+                    "audit_log_id": audit_id,
+                    "journal_id": int(row.get("id") or 0),
+                    "decision": str(row.get("decision") or "HOLD"),
+                    "risk_mode": str(row.get("risk_mode") or ""),
+                    "confidence": float(row.get("confidence") or 0.0),
+                    "estimated_pnl_pct": round(estimated_pnl, 4),
+                    "hold_quality_bucket": hold_quality,
+                    "evidence_count": len(self._extract_evidence_keys(row.get("rationale_json") or [])),
+                    "replay_counterfactual_available": replay_changed,
+                    "shadow_decision_count": len(shadow_rows),
+                    "shadow_avg_outcome_estimated_pnl_pct": round(self._average(shadow_outcomes), 4) if shadow_outcomes else None,
+                }
+            )
+        return dataset
+
+    def _summarize_shadow_model_dataset(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ordered = list(rows or [])
+        if not ordered:
+            return {
+                "sample_count": 0,
+                "train_count": 0,
+                "holdout_count": 0,
+                "avg_estimated_pnl_pct": 0.0,
+                "holdout_avg_estimated_pnl_pct": None,
+                "positive_rate": 0.0,
+                "holdout_positive_rate": None,
+            }
+        split_index = max(1, int(math.floor(len(ordered) * 0.8)))
+        if split_index >= len(ordered):
+            split_index = max(1, len(ordered) - 1)
+        train_rows = ordered[:split_index]
+        holdout_rows = ordered[split_index:]
+        holdout_pnls = [float(row.get("estimated_pnl_pct") or 0.0) for row in holdout_rows]
+        return {
+            "sample_count": len(ordered),
+            "train_count": len(train_rows),
+            "holdout_count": len(holdout_rows),
+            "avg_estimated_pnl_pct": round(self._average([float(row.get("estimated_pnl_pct") or 0.0) for row in ordered]), 4),
+            "holdout_avg_estimated_pnl_pct": round(self._average(holdout_pnls), 4) if holdout_rows else None,
+            "positive_rate": round(sum(1 for row in ordered if float(row.get("estimated_pnl_pct") or 0.0) > 0) / max(1, len(ordered)), 4),
+            "holdout_positive_rate": (
+                round(sum(1 for row in holdout_rows if float(row.get("estimated_pnl_pct") or 0.0) > 0) / max(1, len(holdout_rows)), 4)
+                if holdout_rows else None
+            ),
+        }
+
+    def _shadow_dataset_export_path(self) -> Path:
+        db_parent = Path(self.db_path).resolve().parent
+        learning_dir = db_parent / "learning"
+        learning_dir.mkdir(parents=True, exist_ok=True)
+        return learning_dir / "shadow_decision_dataset.jsonl"
+
+    def _export_shadow_model_dataset(self, rows: List[Dict[str, Any]]) -> str:
+        path = self._shadow_dataset_export_path()
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows or []:
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+        return str(path)
+
+    def _build_learning_liveness_payload(
+        self,
+        *,
+        window_hours: int,
+        replay_runs: List[Dict[str, Any]],
+        shadow_dataset_summary: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        since = now - timedelta(hours=max(1, int(window_hours or 24)))
+        replay_candidates = []
+        if hasattr(self.state_store, "get_replay_batch_candidates"):
+            replay_candidates = self.state_store.get_replay_batch_candidates(since=since, limit=500)
+        replay_processed_rate = 1.0
+        if replay_candidates:
+            replay_processed_rate = min(1.0, len(replay_runs or []) / max(1, len(replay_candidates)))
+        replay_heartbeat = self.state_store.get_learning_artifact("replay_batch_heartbeat") if hasattr(self.state_store, "get_learning_artifact") else {}
+        replay_heartbeat_at = str(replay_heartbeat.get("updated_at") or "")
+        stale_reasons: List[str] = []
+        if not replay_heartbeat_at:
+            stale_reasons.append("replay_batch_missing")
+        if replay_candidates and replay_processed_rate < 0.5:
+            stale_reasons.append("replay_coverage_low")
+        if int(shadow_dataset_summary.get("holdout_count") or 0) <= 0:
+            stale_reasons.append("shadow_holdout_missing")
+        return {
+            "window_hours": int(window_hours or 24),
+            "last_memory_update_at": now.isoformat(),
+            "last_replay_batch_at": replay_heartbeat_at or None,
+            "replay_candidate_count_24h": len(replay_candidates),
+            "replay_run_count_24h": len(replay_runs or []),
+            "replay_processed_rate_24h": round(replay_processed_rate, 4),
+            "shadow_dataset_sample_count": int(shadow_dataset_summary.get("sample_count") or 0),
+            "shadow_dataset_holdout_count": int(shadow_dataset_summary.get("holdout_count") or 0),
+            "stale_reasons": stale_reasons,
+            "stale": bool(stale_reasons),
+            "promotion_blocked": bool(stale_reasons),
+        }
+
+    def _learning_promotions_allowed(self) -> bool:
+        if not hasattr(self.state_store, "get_learning_artifact"):
+            return True
+        artifact = self.state_store.get_learning_artifact("learning_liveness")
+        payload = artifact.get("payload") or {}
+        return not bool(payload.get("promotion_blocked"))
 
     def _build_symbol_evidence_signal_counts(self, symbol_journals: List[Dict[str, Any]]) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -3565,6 +3833,9 @@ Computed statistics:
         return evaluations
 
     def _promote_candidate_policies(self, candidates: List[Dict[str, Any]], evaluations: List[Dict[str, Any]]):
+        if not self._learning_promotions_allowed():
+            logger.warning("Skipping candidate policy promotion because learning liveness is stale.")
+            return
         best_by_domain: Dict[tuple[str, str], Dict[str, Any]] = {}
         for candidate in candidates or []:
             candidate_id = candidate.get("id")
@@ -3824,6 +4095,9 @@ Computed statistics:
         return evaluations
 
     def _promote_policy_bundles(self, bundles: List[Dict[str, Any]], evaluations: List[Dict[str, Any]]):
+        if not self._learning_promotions_allowed():
+            logger.warning("Skipping bundle promotion because learning liveness is stale.")
+            return
         best_by_regime: Dict[str, Dict[str, Any]] = {}
         for bundle in bundles or []:
             evaluation = next((row for row in evaluations if row.get("bundle_key") == bundle.get("bundle_key")), None)
@@ -3972,8 +4246,62 @@ Computed statistics:
             stats_package["evaluated_trade_count"],
             stats_package["win_rate"],
         )
+        journal_reranker_profile = self._build_recent_journal_reranker_profile(journals)
+        similar_case_reranker_profile = self._build_similar_case_reranker_profile(
+            retrieval_evaluations,
+            replay_runs,
+        )
+        shadow_dataset_rows = self._build_shadow_model_dataset(journals, replay_runs, shadow_decisions)
+        shadow_dataset_summary = self._summarize_shadow_model_dataset(shadow_dataset_rows)
+        shadow_dataset_path = self._export_shadow_model_dataset(shadow_dataset_rows)
+        if hasattr(self.state_store, "upsert_learning_artifact"):
+            self.state_store.upsert_learning_artifact(
+                "journal_reranker_profile",
+                journal_reranker_profile,
+                artifact_type="retrieval_model",
+            )
+            self.state_store.upsert_learning_artifact(
+                "similar_case_reranker_profile",
+                similar_case_reranker_profile,
+                artifact_type="retrieval_model",
+            )
+            self.state_store.upsert_learning_artifact(
+                "shadow_model_dataset",
+                {
+                    **shadow_dataset_summary,
+                    "dataset_path": shadow_dataset_path,
+                },
+                artifact_type="shadow_dataset",
+            )
+            liveness_payload = self._build_learning_liveness_payload(
+                window_hours=window_hours,
+                replay_runs=replay_runs,
+                shadow_dataset_summary=shadow_dataset_summary,
+            )
+            self.state_store.upsert_learning_artifact(
+                "learning_liveness",
+                {
+                    **liveness_payload,
+                    "reranker_ready": {
+                        "recent_journal": int(journal_reranker_profile.get("sample_count") or 0) > 0,
+                        "similar_cases": int(similar_case_reranker_profile.get("sample_count") or 0) > 0,
+                    },
+                },
+                artifact_type="learning_liveness",
+            )
+            self.state_store.upsert_learning_artifact(
+                "memory_updater_heartbeat",
+                {
+                    "window_hours": int(window_hours or 24),
+                    "journal_count": stats_package["journal_count"],
+                    "trade_case_count": stats_package["trade_case_count"],
+                    "replay_run_count": len(replay_runs),
+                    "shadow_dataset_path": shadow_dataset_path,
+                },
+                artifact_type="heartbeat",
+            )
         lessons = self._generate_lessons(stats_package)
-        existing_memories = self.state_store.get_recent_long_term_memory(limit=200)
+        existing_memories = self.state_store.get_long_term_memory_pool()
         entries = self._prepare_memory_entries(stats_package, lessons, existing_memories=existing_memories)
 
         if entries:

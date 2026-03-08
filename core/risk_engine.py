@@ -13,9 +13,164 @@ from core.models import (
 )
 
 class RiskEngine:
+    DEFAULT_PROMPT_EXECUTION_GUARDS: Dict[str, Any] = {
+        "symbol_reentry_close_cooldown_minutes": 10,
+        "symbol_reentry_loss_cooldown_minutes": 30,
+        "symbol_reentry_loss_threshold_pct": 0.0,
+    }
+    PROMPT_POLICY_CONTRACT: List[Dict[str, Any]] = [
+        {"summary_path": "trading.symbols", "source_path": "trading.symbols", "required": True},
+        {"summary_path": "trading.allowed_order_types", "source_path": "execution_policy.allowed_order_types", "required": True},
+        {"summary_path": "risk_limits.daily_max_loss_pct", "source_path": "risk_limits.daily_max_loss_pct", "required": True},
+        {"summary_path": "risk_limits.drawdown_activate_pct", "source_path": "risk_limits.drawdown_activate_pct", "required": True},
+        {"summary_path": "risk_limits.max_consecutive_losses", "source_path": "risk_limits.max_consecutive_losses", "required": True},
+        {"summary_path": "risk_limits.max_open_positions", "source_path": "risk_limits.max_open_positions", "required": True},
+        {"summary_path": "risk_limits.mode_profiles.normal.allowed_actions", "source_path": "risk_limits.mode_profiles.normal.allowed_actions", "required": True},
+        {"summary_path": "risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", "source_path": "risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", "required": True},
+        {"summary_path": "risk_limits.mode_profiles.cooldown.allowed_actions", "source_path": "risk_limits.mode_profiles.cooldown.allowed_actions", "required": True},
+        {"summary_path": "execution_guards.symbol_reentry_close_cooldown_minutes", "source_path": "execution_guards.symbol_reentry_close_cooldown_minutes", "required": True},
+        {"summary_path": "execution_guards.symbol_reentry_loss_cooldown_minutes", "source_path": "execution_guards.symbol_reentry_loss_cooldown_minutes", "required": True},
+        {"summary_path": "execution_guards.symbol_reentry_loss_threshold_pct", "source_path": "execution_guards.symbol_reentry_loss_threshold_pct", "required": True},
+        {"summary_path": "stale_order_controls.position_policy.stale_order_minutes", "source_path": "position_policy.stale_order_minutes", "required_if_source_present": True},
+        {
+            "summary_path": "stale_order_controls.position_policy.stale_order_reprice_spread_percentile_max",
+            "source_path": "position_policy.stale_order_reprice_spread_percentile_max",
+            "required_if_source_present": True,
+        },
+        {"summary_path": "stale_order_controls.safety_policy.stale_order_minutes", "source_path": "safety_policy.stale_order_minutes", "required_if_source_present": True},
+        {
+            "summary_path": "stale_order_controls.safety_policy.stale_order_reprice_spread_percentile_max",
+            "source_path": "safety_policy.stale_order_reprice_spread_percentile_max",
+            "required_if_source_present": True,
+        },
+    ]
+
     def __init__(self, config_path: str = "policy.yaml"):
         self.config_path = Path(config_path)
         self.policy = self._validate_policy(self._normalize_single_symbol_policy(self._load_policy()))
+        self.policy_summary = self._build_policy_summary()
+        self._validate_prompt_policy_contract(self.policy_summary)
+
+    @staticmethod
+    def _get_nested_value(payload: Dict[str, Any], path: str) -> Any:
+        current: Any = payload
+        for part in str(path or "").split("."):
+            if isinstance(current, dict) and part in current:
+                current = current.get(part)
+            else:
+                return None
+        return current
+
+    @classmethod
+    def get_prompt_policy_contract_registry(cls) -> List[Dict[str, Any]]:
+        return [dict(item) for item in cls.PROMPT_POLICY_CONTRACT]
+
+    def _build_policy_summary(self) -> Dict[str, Any]:
+        risk_limits = dict(self.policy.get("risk_limits") or {})
+        execution_guards = self._get_effective_prompt_execution_guards()
+        trading_policy = dict(self.policy.get("trading") or {})
+        execution_policy = dict(self.policy.get("execution_policy") or {})
+        summary = {
+            "summary_version": 2,
+            "trading": {
+                "symbols": [self.get_trading_symbol()],
+                "allowed_order_types": self.get_allowed_order_types(),
+                "default_order_type": str(trading_policy.get("order_type") or "").strip().upper() or None,
+                "max_leverage": trading_policy.get("max_leverage"),
+            },
+            "risk_limits": {
+                "daily_max_loss_pct": risk_limits.get("daily_max_loss_pct"),
+                "drawdown_activate_pct": risk_limits.get("drawdown_activate_pct"),
+                "max_consecutive_losses": risk_limits.get("max_consecutive_losses"),
+                "cooldown_minutes": risk_limits.get("cooldown_minutes"),
+                "max_open_positions": risk_limits.get("max_open_positions"),
+                "mode_profiles": {},
+            },
+            "execution_guards": {
+                "symbol_reentry_close_cooldown_minutes": execution_guards["symbol_reentry_close_cooldown_minutes"],
+                "symbol_reentry_loss_cooldown_minutes": execution_guards["symbol_reentry_loss_cooldown_minutes"],
+                "symbol_reentry_loss_threshold_pct": execution_guards["symbol_reentry_loss_threshold_pct"],
+            },
+            "stale_order_controls": {
+                "position_policy": {
+                    "stale_order_minutes": (self.policy.get("position_policy") or {}).get("stale_order_minutes"),
+                    "stale_order_reprice_spread_percentile_max": (
+                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_spread_percentile_max")
+                    ),
+                    "stale_order_reprice_depth_percentile_min": (
+                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_depth_percentile_min")
+                    ),
+                    "stale_order_reprice_limit_offset_bps": (
+                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_limit_offset_bps")
+                    ),
+                },
+                "safety_policy": {
+                    "stale_order_minutes": (self.policy.get("safety_policy") or {}).get("stale_order_minutes"),
+                    "stale_order_reprice_spread_percentile_max": (
+                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_spread_percentile_max")
+                    ),
+                    "stale_order_reprice_depth_percentile_min": (
+                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_depth_percentile_min")
+                    ),
+                    "stale_order_reprice_limit_offset_bps": (
+                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_limit_offset_bps")
+                    ),
+                },
+            },
+            "execution_policy": {
+                "time_in_force": execution_policy.get("time_in_force"),
+                "post_only_default": execution_policy.get("post_only_default"),
+                "reduce_only_exit": execution_policy.get("reduce_only_exit"),
+            },
+        }
+        for mode_name, profile in self.get_risk_profiles().items():
+            summary["risk_limits"]["mode_profiles"][mode_name] = {
+                "max_open_positions": profile.get("max_open_positions"),
+                "max_order_notional_pct_balance": profile.get("max_order_notional_pct_balance"),
+                "allowed_actions": profile.get("allowed_actions") or [],
+                "block_additional_entries_when_position_exists": bool(
+                    profile.get("block_additional_entries_when_position_exists", False)
+                ),
+            }
+        return summary
+
+    def _get_effective_prompt_execution_guards(self) -> Dict[str, Any]:
+        configured = dict(self.policy.get("execution_guards") or {})
+        guards = dict(self.DEFAULT_PROMPT_EXECUTION_GUARDS)
+        guards.update({key: value for key, value in configured.items() if value is not None})
+        guards["symbol_reentry_close_cooldown_minutes"] = max(
+            0,
+            int(guards.get("symbol_reentry_close_cooldown_minutes", 10) or 0),
+        )
+        guards["symbol_reentry_loss_cooldown_minutes"] = max(
+            guards["symbol_reentry_close_cooldown_minutes"],
+            int(guards.get("symbol_reentry_loss_cooldown_minutes", 30) or 0),
+        )
+        guards["symbol_reentry_loss_threshold_pct"] = min(
+            0.0,
+            float(guards.get("symbol_reentry_loss_threshold_pct", 0.0) or 0.0),
+        )
+        return guards
+
+    def _validate_prompt_policy_contract(self, summary: Dict[str, Any]) -> None:
+        missing: List[str] = []
+        for item in self.get_prompt_policy_contract_registry():
+            source_path = str(item.get("source_path") or "")
+            summary_path = str(item.get("summary_path") or "")
+            source_value = self._get_nested_value(self.policy, source_path) if source_path else None
+            summary_value = self._get_nested_value(summary, summary_path)
+            required = bool(item.get("required"))
+            required_if_present = bool(item.get("required_if_source_present"))
+            should_require = required or (required_if_present and source_value is not None)
+            if not should_require:
+                continue
+            if summary_value is None or summary_value == "" or summary_value == []:
+                missing.append(summary_path)
+        if missing:
+            raise ValueError(
+                "policy_summary contract validation failed; missing critical prompt fields: "
+                + ", ".join(sorted(missing))
+            )
 
     def _load_policy(self) -> dict:
         try:
@@ -99,8 +254,8 @@ class RiskEngine:
         return policy
 
     def get_summary(self) -> str:
-        """Returns a string representation of the policy for Gemini context"""
-        return yaml.dump(self.policy)
+        """Return a compact policy summary for the decision prompt."""
+        return yaml.safe_dump(self.policy_summary, sort_keys=False, allow_unicode=False)
 
     def get_trading_symbol(self) -> str:
         trading_policy = self.policy.get("trading", {}) or {}

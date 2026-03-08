@@ -428,6 +428,13 @@ class StateStore:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS learning_artifacts (
+                    artifact_key TEXT PRIMARY KEY,
+                    artifact_type TEXT,
+                    payload JSON,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS order_state_transitions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     audit_log_id INTEGER NOT NULL,
@@ -948,7 +955,7 @@ class StateStore:
             logger.error(f"Failed to fetch journals: {e}")
             return []
 
-    def get_recent_journal_context(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def _build_journal_context_base_query(self, where_clause: str = "", order_clause: str = "") -> str:
         query = """
             SELECT
                 j.id,
@@ -980,35 +987,104 @@ class StateStore:
                 GROUP BY audit_log_id
             ) ledger ON ledger.audit_log_id = j.audit_log_id
             LEFT JOIN audit_logs a ON a.id = j.audit_log_id
-            ORDER BY j.id DESC
-            LIMIT ?
         """
+        if where_clause:
+            query += f"\n            {where_clause}"
+        if order_clause:
+            query += f"\n            {order_clause}"
+        return query
+
+    def _fetch_journal_context_ids(self, query: str, params: tuple[Any, ...]) -> List[int]:
+        cursor = self.conn.execute(query, params)
+        ids: List[int] = []
+        for row in cursor.fetchall():
+            try:
+                ids.append(int(row["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return ids
+
+    def _fetch_journal_context_rows_by_ids(self, ids: List[int]) -> List[Dict[str, Any]]:
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        query = self._build_journal_context_base_query(
+            where_clause=f"WHERE j.id IN ({placeholders})",
+            order_clause="ORDER BY j.id DESC",
+        )
         rows = []
-        cursor = self.conn.execute(query, (limit,))
+        cursor = self.conn.execute(query, tuple(ids))
         for row in cursor.fetchall():
             rows.append(self._decode_journal_context_row(dict(row)))
         return rows
 
+    def get_recent_journal_context(
+        self,
+        limit: int = 10,
+        candidate_limit: Optional[int] = None,
+        anchor_limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if candidate_limit is None and anchor_limit is None:
+            query = self._build_journal_context_base_query(order_clause="ORDER BY j.id DESC\n            LIMIT ?")
+            rows = []
+            cursor = self.conn.execute(query, (limit,))
+            for row in cursor.fetchall():
+                rows.append(self._decode_journal_context_row(dict(row)))
+            return rows
+
+        recent_limit = max(int(limit or 0), int(candidate_limit or 0), 1)
+        semantic_anchor_limit = max(int(anchor_limit or 0), 0)
+        recent_ids = self._fetch_journal_context_ids(
+            "SELECT id FROM journal ORDER BY id DESC LIMIT ?",
+            (recent_limit,),
+        )
+        anchor_ids: List[int] = []
+        if semantic_anchor_limit > 0:
+            anchor_ids = self._fetch_journal_context_ids(
+                """
+                SELECT id
+                FROM journal
+                ORDER BY
+                    CASE
+                        WHEN COALESCE(rationale_json, '') LIKE '%good_hold%' THEN 6
+                        WHEN COALESCE(rationale_json, '') LIKE '%missed_opportunity_hold%' THEN 6
+                        WHEN COALESCE(rationale_json, '') LIKE '%probe_only_opportunity_hold%' THEN 5
+                        WHEN COALESCE(loss_signal, 0) = 1 THEN 5
+                        WHEN decision IN ('EXIT', 'REDUCE', 'CANCEL', 'REPLACE_ENTRY') THEN 4
+                        WHEN decision IN ('BUY', 'SELL') THEN 3
+                        ELSE 0
+                    END DESC,
+                    ABS(COALESCE(estimated_pnl_pct, 0)) DESC,
+                    id DESC
+                LIMIT ?
+                """,
+                (semantic_anchor_limit,),
+            )
+        candidate_ids = list(dict.fromkeys(recent_ids + anchor_ids))
+        return self._fetch_journal_context_rows_by_ids(candidate_ids)
+
+    def get_long_term_memory_pool(self) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT id, timestamp, rule, version, metrics
+            FROM long_term_memory
+            """
+        )
+        rows = [self._format_memory_row(dict(row)) for row in cursor.fetchall()]
+        rows.sort(
+            key=lambda row: (
+                1 if bool(row.get("retired")) else 0,
+                -float(row.get("confidence_score") or 0.0),
+                -float(row.get("validity_score") or 0.0),
+                -float(row.get("freshness_score") or 0.0),
+                -int(row.get("id") or 0),
+            )
+        )
+        return rows
+
     def get_long_term_memory(self) -> List[Dict[str, Any]]:
         try:
-            cursor = self.conn.execute(
-                """
-                SELECT id, timestamp, rule, version, metrics
-                FROM long_term_memory
-                ORDER BY id DESC
-                LIMIT 200
-                """
-            )
-            rows = [self._format_memory_row(dict(row)) for row in cursor.fetchall()]
-            rows.sort(
-                key=lambda row: (
-                    1 if bool(row.get("retired")) else 0,
-                    -float(row.get("confidence_score") or 0.0),
-                    -float(row.get("validity_score") or 0.0),
-                    -float(row.get("freshness_score") or 0.0),
-                    -int(row.get("id") or 0),
-                )
-            )
+            rows = self.get_long_term_memory_pool()
             if not rows:
                 return [
                     {
@@ -2730,7 +2806,7 @@ class StateStore:
                         new_candidate_policy_id,
                         reason,
                         metrics
-                    ) VALUES (?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.get("domain"),
@@ -2791,6 +2867,76 @@ class StateStore:
                 )
         except Exception as e:
             logger.error(f"Failed to save shadow decisions: {e}")
+
+    def upsert_learning_artifact(
+        self,
+        artifact_key: str,
+        payload: Dict[str, Any],
+        *,
+        artifact_type: Optional[str] = None,
+    ) -> None:
+        key = str(artifact_key or "").strip()
+        if not key:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO learning_artifacts (
+                        artifact_key,
+                        artifact_type,
+                        payload,
+                        updated_at
+                    ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(artifact_key) DO UPDATE SET
+                        artifact_type = excluded.artifact_type,
+                        payload = excluded.payload,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        key,
+                        artifact_type or key,
+                        json.dumps(payload or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to upsert learning artifact {key}: {e}")
+
+    def get_learning_artifact(self, artifact_key: str) -> Dict[str, Any]:
+        key = str(artifact_key or "").strip()
+        if not key:
+            return {}
+        cursor = self.conn.execute(
+            """
+            SELECT artifact_key, artifact_type, payload, updated_at
+            FROM learning_artifacts
+            WHERE artifact_key = ?
+            LIMIT 1
+            """,
+            (key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+        return item
+
+    def list_learning_artifacts(self, prefix: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        query = "SELECT artifact_key, artifact_type, payload, updated_at FROM learning_artifacts"
+        params: List[Any] = []
+        if prefix:
+            query += " WHERE artifact_key LIKE ?"
+            params.append(f"{prefix}%")
+        query += " ORDER BY updated_at DESC, artifact_key DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
 
     def upsert_policy_bundle(self, record: Dict[str, Any]):
         bundle_key = str(record.get("bundle_key") or "").strip()
@@ -3408,6 +3554,79 @@ class StateStore:
         )
         return rows
 
+    def _parse_db_timestamp(self, value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for parser in (datetime.fromisoformat,):
+            try:
+                parsed = parser(text)
+                if parsed.tzinfo is not None:
+                    return parsed.astimezone(UTC).replace(tzinfo=None)
+                return parsed
+            except ValueError:
+                continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _build_learning_liveness_summary(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        now = now or self._utcnow()
+        since = now - timedelta(hours=24)
+        replay_batch = self.get_learning_artifact("replay_batch_heartbeat")
+        memory_batch = self.get_learning_artifact("memory_updater_heartbeat")
+        shadow_dataset = self.get_learning_artifact("shadow_model_dataset")
+        journal_reranker = self.get_learning_artifact("journal_reranker_profile")
+        similar_case_reranker = self.get_learning_artifact("similar_case_reranker_profile")
+        replay_run_count_24h = int(
+            (self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM replay_runs
+                WHERE created_at >= ?
+                """,
+                (since.strftime("%Y-%m-%d %H:%M:%S"),),
+            ).fetchone() or {})["count"] or 0
+        )
+        replay_candidate_count_24h = len(self.get_replay_batch_candidates(since=since, limit=500))
+        processed_rate = 1.0
+        if replay_candidate_count_24h > 0:
+            processed_rate = min(1.0, replay_run_count_24h / max(1, replay_candidate_count_24h))
+
+        replay_updated_at = self._parse_db_timestamp(replay_batch.get("updated_at"))
+        memory_updated_at = self._parse_db_timestamp(memory_batch.get("updated_at"))
+        shadow_dataset_updated_at = self._parse_db_timestamp(shadow_dataset.get("updated_at"))
+        stale_reasons: List[str] = []
+        if replay_updated_at is None or (now - replay_updated_at) > timedelta(hours=30):
+            stale_reasons.append("replay_batch_stale")
+        if memory_updated_at is None or (now - memory_updated_at) > timedelta(hours=30):
+            stale_reasons.append("memory_update_stale")
+        if replay_candidate_count_24h > 0 and processed_rate < 0.5:
+            stale_reasons.append("replay_coverage_low")
+        if shadow_dataset_updated_at is None or (now - shadow_dataset_updated_at) > timedelta(hours=48):
+            stale_reasons.append("shadow_dataset_stale")
+
+        payload = {
+            "last_replay_batch_at": replay_updated_at.isoformat() if replay_updated_at else None,
+            "last_memory_update_at": memory_updated_at.isoformat() if memory_updated_at else None,
+            "last_shadow_dataset_at": shadow_dataset_updated_at.isoformat() if shadow_dataset_updated_at else None,
+            "replay_candidate_count_24h": replay_candidate_count_24h,
+            "replay_run_count_24h": replay_run_count_24h,
+            "replay_processed_rate_24h": round(processed_rate, 4),
+            "stale_reasons": stale_reasons,
+            "stale": bool(stale_reasons),
+            "promotion_blocked": bool(stale_reasons),
+            "reranker_ready": {
+                "recent_journal": bool(journal_reranker.get("payload")),
+                "similar_cases": bool(similar_case_reranker.get("payload")),
+            },
+            "shadow_dataset_ready": bool(shadow_dataset.get("payload")),
+        }
+        return payload
+
     def get_monitoring_snapshot(self, now: Optional[datetime] = None) -> Dict[str, Any]:
         now = now or self._utcnow()
         since = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
@@ -3455,6 +3674,8 @@ class StateStore:
         ).fetchone()
         recent_logs = self.get_recent_audits(limit=20)
         semantic_validation_summary = self._build_semantic_validation_summary(now=now)
+        context_bias_summary = self._build_context_bias_summary(now=now)
+        learning_liveness = self._build_learning_liveness_summary(now=now)
 
         snapshot = {
             "total_audits_24h": int(stats.get("total_audits") or 0),
@@ -3470,6 +3691,8 @@ class StateStore:
             "latest_memory": self._decode_metrics_row(latest_memory_row),
             "recent_logs": recent_logs,
             "semantic_validation_summary": semantic_validation_summary,
+            "context_bias_summary": context_bias_summary,
+            "learning_liveness": learning_liveness,
             "recent_memory": self.get_recent_long_term_memory(limit=5),
             "recent_symbol_journal": self.get_recent_symbol_journal(limit=10),
             "recent_fills": self.get_recent_fills(limit=10),
@@ -3479,6 +3702,78 @@ class StateStore:
             "recent_position_states": self.get_recent_position_state_transitions(limit=10),
         }
         return snapshot
+
+    def _summarize_context_mix_counts(self, counts: Dict[str, int]) -> Dict[str, Any]:
+        raw_counts = {str(key): int(value) for key, value in (counts or {}).items() if int(value or 0) > 0}
+        total = sum(raw_counts.values())
+        group_counts = {
+            "good_hold": raw_counts.get("good_hold", 0),
+            "missed_opportunity_hold": raw_counts.get("missed_opportunity_hold", 0),
+            "fallback": raw_counts.get("system_fallback", 0),
+            "other_hold": raw_counts.get("hold", 0),
+            "action": (
+                raw_counts.get("entry_action", 0)
+                + raw_counts.get("risk_outcome", 0)
+                + raw_counts.get("other_action", 0)
+            ),
+        }
+        group_counts = {key: value for key, value in group_counts.items() if value > 0}
+        group_total = sum(group_counts.values())
+        return {
+            "bucket_counts": raw_counts,
+            "bucket_ratios": {
+                key: round((value / total), 4) for key, value in raw_counts.items()
+            } if total else {},
+            "group_counts": group_counts,
+            "group_ratios": {
+                key: round((value / group_total), 4) for key, value in group_counts.items()
+            } if group_total else {},
+            "total": total,
+        }
+
+    def _build_context_bias_summary(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        now = now or self._utcnow()
+        recent_logs = self.get_recent_audits(limit=500, since=now - timedelta(hours=24))
+        journal_selected: Dict[str, int] = {}
+        journal_available: Dict[str, int] = {}
+        journal_excluded: Dict[str, int] = {}
+        memory_selected: Dict[str, int] = {}
+        memory_available: Dict[str, int] = {}
+        memory_excluded: Dict[str, int] = {}
+        audits_with_context = 0
+
+        for row in recent_logs:
+            execution_summary = row.get("execution_summary") or {}
+            context_summary = execution_summary.get("context_selection_summary") or {}
+            journal_summary = context_summary.get("recent_journal_context") or {}
+            memory_summary = context_summary.get("long_term_memory") or {}
+            if journal_summary or memory_summary:
+                audits_with_context += 1
+            for key, value in (journal_summary.get("selected_bucket_counts") or {}).items():
+                journal_selected[str(key)] = journal_selected.get(str(key), 0) + int(value or 0)
+            for key, value in (journal_summary.get("available_bucket_counts") or {}).items():
+                journal_available[str(key)] = journal_available.get(str(key), 0) + int(value or 0)
+            for key, value in (journal_summary.get("excluded_bucket_counts") or {}).items():
+                journal_excluded[str(key)] = journal_excluded.get(str(key), 0) + int(value or 0)
+            for key, value in (memory_summary.get("selected_bucket_counts") or {}).items():
+                memory_selected[str(key)] = memory_selected.get(str(key), 0) + int(value or 0)
+            for key, value in (memory_summary.get("available_bucket_counts") or {}).items():
+                memory_available[str(key)] = memory_available.get(str(key), 0) + int(value or 0)
+            for key, value in (memory_summary.get("excluded_bucket_counts") or {}).items():
+                memory_excluded[str(key)] = memory_excluded.get(str(key), 0) + int(value or 0)
+
+        return {
+            "last_24h": {
+                "audit_count": len(recent_logs),
+                "audits_with_context": audits_with_context,
+                "journal_selected": self._summarize_context_mix_counts(journal_selected),
+                "journal_available": self._summarize_context_mix_counts(journal_available),
+                "journal_excluded": self._summarize_context_mix_counts(journal_excluded),
+                "memory_selected": self._summarize_context_mix_counts(memory_selected),
+                "memory_available": self._summarize_context_mix_counts(memory_available),
+                "memory_excluded": self._summarize_context_mix_counts(memory_excluded),
+            }
+        }
 
     def _build_semantic_validation_summary(self, now: Optional[datetime] = None) -> Dict[str, Any]:
         now = now or self._utcnow()

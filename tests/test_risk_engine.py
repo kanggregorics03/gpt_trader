@@ -3,6 +3,7 @@ import gc
 import time
 import yaml
 from pathlib import Path
+from unittest.mock import patch
 from core.risk_engine import RiskEngine
 from core.models import (
     AccountState,
@@ -18,6 +19,8 @@ from core.models import (
 )
 
 class TestRiskEngine(unittest.TestCase):
+    POLICY_SUMMARY_SNAPSHOT_PATH = Path("tests/snapshots/policy_summary_snapshot.yaml")
+
     def setUp(self):
         # Create a dummy policy.yaml for testing
         self.dummy_policy_path = Path("test_policy.yaml")
@@ -70,6 +73,35 @@ class TestRiskEngine(unittest.TestCase):
             self.engine.policy["risk_limits"]["mode_profiles"]["normal"]["max_open_positions"],
             1,
         )
+
+    def test_get_summary_returns_compact_policy_digest(self):
+        summary = yaml.safe_load(self.engine.get_summary())
+
+        self.assertEqual(summary["summary_version"], 2)
+        self.assertEqual(summary["trading"]["symbols"], ["BTCUSDT"])
+        self.assertEqual(summary["trading"]["allowed_order_types"], ["MARKET"])
+        self.assertIn("mode_profiles", summary["risk_limits"])
+        self.assertIn("execution_guards", summary)
+        self.assertIn("stale_order_controls", summary)
+
+    def test_prompt_policy_contract_registry_contains_critical_paths(self):
+        registry = self.engine.get_prompt_policy_contract_registry()
+        summary_paths = {item["summary_path"] for item in registry}
+
+        self.assertIn("risk_limits.daily_max_loss_pct", summary_paths)
+        self.assertIn("risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", summary_paths)
+        self.assertIn("execution_guards.symbol_reentry_loss_cooldown_minutes", summary_paths)
+
+    def test_prompt_policy_contract_validation_fails_on_missing_critical_field(self):
+        with patch.object(RiskEngine, "_build_policy_summary", return_value={"summary_version": 2}):
+            with self.assertRaises(ValueError):
+                RiskEngine(config_path="test_policy.yaml")
+
+    def test_policy_yaml_prompt_digest_matches_snapshot(self):
+        engine = RiskEngine(config_path="policy.yaml")
+        expected = self.POLICY_SUMMARY_SNAPSHOT_PATH.read_text(encoding="utf-8")
+
+        self.assertEqual(engine.get_summary(), expected)
 
     def tearDown(self):
         self.engine = None

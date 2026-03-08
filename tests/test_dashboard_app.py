@@ -27,6 +27,33 @@ class FakeStateStore:
                 "last_7d": {"failure_count": 2, "top_models": []},
                 "latest_50": {"failure_count": 1, "top_models": []},
             },
+            "context_bias_summary": {
+                "last_24h": {
+                    "journal_selected": {
+                        "total": 10,
+                        "group_counts": {
+                            "good_hold": 2,
+                            "missed_opportunity_hold": 1,
+                            "action": 6,
+                            "fallback": 1,
+                        },
+                        "group_ratios": {
+                            "good_hold": 0.2,
+                            "missed_opportunity_hold": 0.1,
+                            "action": 0.6,
+                            "fallback": 0.1,
+                        },
+                    }
+                }
+            },
+            "learning_liveness": {
+                "stale": False,
+                "promotion_blocked": False,
+                "replay_candidate_count_24h": 5,
+                "replay_run_count_24h": 4,
+                "replay_processed_rate_24h": 0.8,
+                "stale_reasons": [],
+            },
             "recent_memory": [],
             "recent_symbol_journal": [],
             "recent_fills": [],
@@ -144,6 +171,8 @@ class TestDashboardApp(unittest.TestCase):
         self.assertIn("trade_case_summary", payload)
         self.assertIn("retrieval_summary", payload)
         self.assertIn("memory_summary", payload)
+        self.assertIn("context_bias_summary", payload)
+        self.assertIn("learning_liveness", payload)
         self.assertIn("recent_trade_cases", payload)
         self.assertIn("recent_retrieval_evaluations", payload)
         self.assertEqual(payload["models"]["provider"], "openai")
@@ -156,6 +185,7 @@ class TestDashboardApp(unittest.TestCase):
         self.assertEqual(payload["trade_case_summary"]["total_count"], 2)
         self.assertEqual(payload["retrieval_summary"]["settled_count"], 1)
         self.assertEqual(payload["memory_summary"]["active_count"], 1)
+        self.assertEqual(payload["context_bias_summary"]["last_24h"]["journal_selected"]["group_counts"]["action"], 6)
 
     def test_audit_detail_endpoint_includes_linked_trade_case_and_retrieval_data(self):
         response = self.client.get("/api/audits/101")

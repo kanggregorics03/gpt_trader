@@ -2,8 +2,8 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request
+from dotenv import load_dotenv
 
 from ai.llm_provider import (
     normalize_provider_name,
@@ -13,10 +13,9 @@ from ai.llm_provider import (
 from db.state_store import StateStore
 from tools.replay_audit import build_replay_engine, replay_and_optionally_save
 
-load_dotenv()
-
 app = Flask(__name__)
 DEFAULT_DB_PATH = str(Path(__file__).resolve().parents[1] / "data" / "gpt_trader.db")
+_env_loaded = False
 
 
 def _resolve_db_path() -> str:
@@ -24,8 +23,22 @@ def _resolve_db_path() -> str:
     return configured or DEFAULT_DB_PATH
 
 
-DB_PATH = _resolve_db_path()
-state_store = StateStore(DB_PATH)
+state_store = None
+
+
+def _ensure_dashboard_environment() -> None:
+    global _env_loaded
+    if not _env_loaded:
+        load_dotenv()
+        _env_loaded = True
+
+
+def _get_state_store():
+    global state_store
+    if state_store is None:
+        _ensure_dashboard_environment()
+        state_store = StateStore(_resolve_db_path())
+    return state_store
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -102,20 +115,21 @@ def _build_memory_summary(rows):
 
 def _build_dashboard_snapshot():
     now = datetime.now(UTC).replace(tzinfo=None)
-    snapshot = state_store.get_monitoring_snapshot(now=now)
-    snapshot["symbol_report"] = state_store.get_symbol_performance_report(hours=24, now=now)
-    snapshot["daily_report"] = state_store.get_daily_ledger_report(days=7, now=now)
-    snapshot["recent_trade_cases"] = state_store.get_recent_trade_cases(limit=10)
-    snapshot["active_trade_cases"] = state_store.get_all_active_trade_cases()
-    retrieval_rows = state_store.get_retrieval_evaluations_since(
+    store = _get_state_store()
+    snapshot = store.get_monitoring_snapshot(now=now)
+    snapshot["symbol_report"] = store.get_symbol_performance_report(hours=24, now=now)
+    snapshot["daily_report"] = store.get_daily_ledger_report(days=7, now=now)
+    snapshot["recent_trade_cases"] = store.get_recent_trade_cases(limit=10)
+    snapshot["active_trade_cases"] = store.get_all_active_trade_cases()
+    retrieval_rows = store.get_retrieval_evaluations_since(
         now - timedelta(hours=24),
         limit=400,
     )
     snapshot["recent_retrieval_evaluations"] = list(reversed(retrieval_rows[-12:]))
-    recent_memory = state_store.get_recent_long_term_memory(limit=12)
+    recent_memory = store.get_recent_long_term_memory(limit=12)
     snapshot["recent_memory"] = recent_memory
     snapshot["trade_case_summary"] = _build_trade_case_summary(
-        state_store.get_trade_cases_since(now - timedelta(hours=24), limit=500)
+        store.get_trade_cases_since(now - timedelta(hours=24), limit=500)
     )
     snapshot["retrieval_summary"] = _build_retrieval_summary(retrieval_rows)
     snapshot["memory_summary"] = _build_memory_summary(recent_memory)
@@ -320,6 +334,18 @@ HTML_TEMPLATE = """
                 <p class="eyebrow">Memory Health</p>
                 <p class="value" id="val-memory">-</p>
                 <p class="sub" id="val-memory-meta">High confidence - • Retired -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Context Mix</p>
+                <p class="value" id="val-context-mix">-</p>
+                <p class="sub" id="val-context-mix-meta">good hold - • missed hold -</p>
+                <p class="sub" id="val-context-mix-extra">fallback - • other hold -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Learning Liveness</p>
+                <p class="value" id="val-learning-liveness">-</p>
+                <p class="sub" id="val-learning-liveness-meta">replay coverage -</p>
+                <p class="sub" id="val-learning-liveness-extra">promotion gate -</p>
             </article>
         </section>
 
@@ -932,6 +958,10 @@ HTML_TEMPLATE = """
                 const tradeCaseSummary = data.trade_case_summary || {};
                 const retrievalSummary = data.retrieval_summary || {};
                 const memorySummary = data.memory_summary || {};
+                const contextBiasSummary = (((data.context_bias_summary || {}).last_24h || {}).journal_selected || {});
+                const learningLiveness = data.learning_liveness || {};
+                const contextGroupCounts = contextBiasSummary.group_counts || {};
+                const contextGroupRatios = contextBiasSummary.group_ratios || {};
                 document.getElementById('val-trade-cases').innerText = tradeCaseSummary.total_count || 0;
                 document.getElementById('val-trade-cases-meta').innerText =
                     `Closed ${tradeCaseSummary.closed_count || 0} • Win rate ${(tradeCaseSummary.win_rate || 0).toFixed(1)}%`;
@@ -941,6 +971,18 @@ HTML_TEMPLATE = """
                 document.getElementById('val-memory').innerText = memorySummary.active_count || 0;
                 document.getElementById('val-memory-meta').innerText =
                     `High confidence ${memorySummary.high_confidence_count || 0} • Retired ${memorySummary.retired_count || 0}`;
+                document.getElementById('val-context-mix').innerText =
+                    `${contextBiasSummary.total || 0}`;
+                document.getElementById('val-context-mix-meta').innerText =
+                    `good hold ${(((contextGroupRatios.good_hold || 0) * 100).toFixed(0))}% • missed hold ${(((contextGroupRatios.missed_opportunity_hold || 0) * 100).toFixed(0))}%`;
+                document.getElementById('val-context-mix-extra').innerText =
+                    `action ${(((contextGroupRatios.action || 0) * 100).toFixed(0))}% • fallback ${(((contextGroupRatios.fallback || 0) * 100).toFixed(0))}% • other hold ${(((contextGroupRatios.other_hold || 0) * 100).toFixed(0))}%`;
+                document.getElementById('val-learning-liveness').innerText =
+                    learningLiveness.stale ? 'STALE' : 'LIVE';
+                document.getElementById('val-learning-liveness-meta').innerText =
+                    `replay ${(Number(learningLiveness.replay_processed_rate_24h || 0) * 100).toFixed(0)}% ??runs ${learningLiveness.replay_run_count_24h || 0}/${learningLiveness.replay_candidate_count_24h || 0}`;
+                document.getElementById('val-learning-liveness-extra').innerText =
+                    `promotion gate ${learningLiveness.promotion_blocked ? 'blocked' : 'open'} ??${(learningLiveness.stale_reasons || []).join(', ') || 'healthy'}`;
                 const rejectRate = data.total_audits_24h > 0
                     ? ((data.rejected_24h / data.total_audits_24h) * 100).toFixed(1) + '%'
                     : '0%';
@@ -1114,7 +1156,7 @@ def api_stats():
 @app.route("/api/audits/<int:audit_id>")
 def api_audit_detail(audit_id: int):
     try:
-        detail = state_store.get_audit_log(audit_id)
+        detail = _get_state_store().get_audit_log(audit_id)
         if detail is None:
             return jsonify({"error": "not found"}), 404
         return jsonify(detail)
@@ -1127,8 +1169,9 @@ def api_audit_replay(audit_id: int):
     try:
         payload = request.get_json(silent=True) or {}
         engine = build_replay_engine()
+        store = _get_state_store()
         result = replay_and_optionally_save(
-            state_store,
+            store,
             audit_id=audit_id,
             engine=engine,
             save=bool(payload.get("save", True)),

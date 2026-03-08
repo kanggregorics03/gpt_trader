@@ -300,6 +300,8 @@ fast_price_move_15m, volume_surge_15m, range_break_1h에는 ON/OFF 기준을 분
 5.1 LLM 입력(DecisionRequest)
 
 policy_summary: 현재 정책 핵심(레버리지/한도/쿨다운 등)
+  - Implementation note: `policy_summary` is now a compact digest of enforceable limits, mode profiles, re-entry guards, and stale-order controls. The prompt no longer receives a raw `policy.yaml` dump.
+  - Contract note: digest는 `RiskEngine.PROMPT_POLICY_CONTRACT`에 등록된 critical path를 반드시 포함해야 하며, 누락 시 런타임 시작 자체를 실패시킨다.
 
 account_state: 계좌 스냅샷 시각, 잔고, 총 미실현손익, 마진비율, 포지션 위험정보, 미체결 주문 상세(사실)
 
@@ -322,14 +324,24 @@ market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 
 risk_state: 일일 손익률, 연속 손실, 최근 손실 강도, 동적 쿨다운 길이, 쿨다운 잔여 시간, 반복 실패 패턴 점수/대표 사유, 드로우다운 상태, 현재 심볼의 recent close/loss 재진입 가드 상태
 
 recent_journal_context: 같은 최근 일지 정보를 구조화 객체로 전달
+  - Retrieval note: candidate rows are no longer a pure recent-only slice. Runtime mixes a recent pool with semantic anchors such as `good_hold`, `missed_opportunity_hold`, and risk/loss outcomes before reranking.
+  - Learning note: reranking의 마지막 단계에서는 daily batch가 남긴 `journal_reranker_profile` artifact가 버킷별 가산/감산을 제공해 hand-tuned heuristic을 보정한다.
 
 문자열 파싱 대신 rationale_items, evidence_quality, entry_size_cap, trigger 정보를 직접 참조할 수 있게 함
 
-운영 시에는 context_budget으로 recent_journal_context를 점수 기반 상위 N개로 압축해 토큰을 제어
+운영 시에는 context_budget으로 recent_journal_context를 압축해 토큰을 제어하되,
+단순 점수 상위 N개가 아니라 `good_hold / missed_opportunity_hold / entry_action / risk_outcome` 버킷을 섞어
+action bias를 줄인다
+
+semantic validation 실패, JSON validation fallback, loop error로 만들어진 fallback HOLD는
+retrieval context에서 기본 제외해 "시장 판단 HOLD"와 "시스템 오류 HOLD"가 섞이지 않게 한다
 
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
+  - Lifecycle note: runtime retrieval and daily reconciliation now read the same lifecycle-managed memory pool, so older active rules are not silently dropped by a separate recent cap.
 
-long_term_memory도 현재 risk_mode/시장 레짐/심볼 관련성이 높은 항목만 상위 N개를 전달
+long_term_memory도 현재 risk_mode/시장 레짐/심볼 관련성이 높은 항목만 상위 N개를 전달하되,
+`risk_control`, `opportunity`, `execution_quality`, `good_hold/missed_hold` 축이 한쪽으로만 쏠리지 않도록
+카테고리 균형을 강제한다
 
 최근에는 long_term_memory를 append-only 로그로 두지 않고,
 - confidence_score로 support / cluster quality / retrieval 효과를 함께 반영하고
@@ -350,6 +362,10 @@ constraints: “JSON only”, 출력 최대 길이, 허용 행동 제한
 시장 데이터 수집은 OHLCV 롤링 캐시와 ticker/order book/funding/open interest TTL 캐시를 사용해 네트워크 부하를 줄임
 
 RAG는 audit 저장 시 심볼별 feature vector를 함께 저장하고, 조회 시에는 심볼별 반복 스캔 대신 배치 유사도 계산으로 DB 부하를 줄임
+similar_past_cases:
+  - Trigger mode still gets the deepest analog retrieval.
+  - Normal mode now keeps a small background-support case set so `good HOLD` vs `missed HOLD` judgments do not lose all analog history outside trigger loops.
+  - Similar-case scoring also reads a learned `similar_case_reranker_profile` so replay/counterfactual outcome가 좋았던 retrieval signature를 약하게 우대한다.
 
 RAG vector는 시장 13차원만 쓰지 않고, 리스크/계좌/포지션 컨텍스트 13차원을 합쳐 26차원으로 구성한다
 
@@ -467,6 +483,8 @@ LLM provider는 통계 해석과 교훈 구조화만 수행
 4. 레짐별 `policy_registry` champion을 승격
 5. `alpha + position + safety + execution` champion 조합을 `policy_bundle`로 묶어 다시 평가/승격
 6. 최근 shadow 성과가 크게 악화되면 이전 bundle로 rollback
+7. 같은 배치에서 retrieval reranker artifact와 `shadow_decision_dataset.jsonl`을 생성해 retrieval/decision 보조 모델 학습 기반을 축적
+8. replay batch heartbeat, memory updater heartbeat, replay 처리율로 `learning_liveness`를 계산하고 stale 시 자동 승격을 중지
 
 8) 리스크 관리(필수 안전장치)
 8.1 회로차단기(Kill switch)
@@ -695,6 +713,9 @@ symbol_journal 조회 효율을 위해 symbol+id, timestamp+id, audit_log_id 인
 recent_journal_context 선별도 단순 recency score가 아니라 trade_cases의 symbol overlap, trigger overlap,
 risk_mode 일치, regime tag, closed win/loss 결과를 함께 보는 similarity score로 확장한다
 
+다만 최근성/행동 사례 쏠림이 그대로 프롬프트 편향이 되지 않도록,
+recency 가중치는 낮추고, action bonus는 완화하며, 다중 슬롯에서는 diversity penalty를 함께 적용한다
+
 여기에 trade_cases.feature_vector와 현재 market snapshot vector의 cosine similarity를 섞어,
 태그 규칙만으로는 포착되지 않는 수치적 유사성도 retrieval에 반영한다
 
@@ -748,6 +769,9 @@ latest replay가 있으면 같은 source에 대한 original observed_value와 re
 이 replay source diff는 표 형태로 요약해 source / original / replayed / delta를 한 줄씩 비교할 수 있게 한다
 
 대시보드 상단에는 최근 audit 기준 semantic validation fallback 횟수와 최다 실패 유형도 함께 노출한다
+
+추가로 최근 24시간 기준 context mix도 노출해,
+`good_hold / missed_hold / action / fallback / other_hold` 비율을 바로 확인할 수 있게 한다
 
 source lookup에는 current value뿐 아니라 previous value와 original/replay threshold도 함께 보여준다
 

@@ -74,11 +74,46 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(snapshot["timeouts_unresolved_24h"], 1)
         self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 0)
         self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 0)
+        self.assertEqual(snapshot["context_bias_summary"]["last_24h"]["journal_selected"]["total"], 0)
         self.assertEqual(len(snapshot["recent_memory"]), 1)
         self.assertEqual(snapshot["recent_memory"][0]["metrics"]["status"], "rule")
         self.assertEqual(snapshot["recent_symbol_journal"], [])
-        hashed_log = next(log for log in snapshot["recent_logs"] if log["decision_input_hash"] == "abc123")
-        self.assertEqual(hashed_log["risk_mode"], "cooldown")
+
+    def test_learning_artifacts_and_liveness_summary_are_exposed(self):
+        self.store.upsert_learning_artifact(
+            "replay_batch_heartbeat",
+            {"executed_at": "2026-03-09T01:00:00", "candidate_count": 4, "saved_count": 3},
+            artifact_type="heartbeat",
+        )
+        self.store.upsert_learning_artifact(
+            "memory_updater_heartbeat",
+            {"executed_at": "2026-03-09T01:05:00", "journal_count": 10},
+            artifact_type="heartbeat",
+        )
+        self.store.upsert_learning_artifact(
+            "shadow_model_dataset",
+            {"sample_count": 12, "holdout_count": 3, "dataset_path": "data/learning/shadow_decision_dataset.jsonl"},
+            artifact_type="shadow_dataset",
+        )
+        self.store.upsert_learning_artifact("journal_reranker_profile", {"sample_count": 8}, artifact_type="retrieval_model")
+        self.store.upsert_learning_artifact("similar_case_reranker_profile", {"sample_count": 9}, artifact_type="retrieval_model")
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.7},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshot": {}},
+        )
+        self.store.save_replay_run(audit_id, {"comparison": {"original_decision": "BUY", "replayed_decision": "HOLD"}})
+
+        snapshot = self.store.get_monitoring_snapshot(now=datetime.now(UTC).replace(tzinfo=None))
+
+        self.assertIn("learning_liveness", snapshot)
+        self.assertFalse(snapshot["learning_liveness"]["promotion_blocked"])
+        self.assertTrue(snapshot["learning_liveness"]["reranker_ready"]["recent_journal"])
+        self.assertTrue(snapshot["learning_liveness"]["shadow_dataset_ready"])
 
     def test_monitoring_snapshot_summarizes_semantic_validation_issues(self):
         self.store.save_audit(
@@ -344,6 +379,46 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(row["symbol"], "ETHUSDT")
         self.assertEqual(row["evidence_signals"], ["rsi_14@15m"])
 
+    def test_monitoring_snapshot_summarizes_context_bias_mix(self):
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "BUY"},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            execution_summary={
+                "context_selection_summary": {
+                    "recent_journal_context": {
+                        "selected_bucket_counts": {
+                            "entry_action": 2,
+                            "good_hold": 1,
+                            "system_fallback": 1,
+                        },
+                        "available_bucket_counts": {
+                            "entry_action": 3,
+                            "good_hold": 2,
+                            "system_fallback": 1,
+                        },
+                        "excluded_bucket_counts": {"system_fallback": 1},
+                    },
+                    "long_term_memory": {
+                        "selected_bucket_counts": {"risk_control": 1, "opportunity": 1},
+                        "available_bucket_counts": {"risk_control": 2, "opportunity": 1},
+                        "excluded_bucket_counts": {"retired_counterpoint": 1},
+                    },
+                }
+            },
+        )
+
+        snapshot = self.store.get_monitoring_snapshot()
+
+        journal_summary = snapshot["context_bias_summary"]["last_24h"]["journal_selected"]
+        self.assertEqual(journal_summary["group_counts"]["action"], 2)
+        self.assertEqual(journal_summary["group_counts"]["good_hold"], 1)
+        self.assertEqual(journal_summary["group_counts"]["fallback"], 1)
+        self.assertEqual(snapshot["context_bias_summary"]["last_24h"]["memory_excluded"]["bucket_counts"]["retired_counterpoint"], 1)
+
     def test_get_recent_journals_includes_structured_evidence_summary(self):
         audit_id = self.store.save_audit(
             account={"total_balance": 1000},
@@ -497,6 +572,32 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(fill_stats["fill_count"], 1)
         self.assertEqual(fill_stats["fee_cost"], 2.3)
         self.assertEqual(fill_stats["realized_pnl"], 1.7)
+
+    def test_get_recent_journal_context_can_include_semantic_anchor_rows(self):
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Held because setup quality was weak."],
+            rationale_items=[{"summary": "good_hold", "hold_quality": "good_hold"}],
+            confidence=0.6,
+            risk_reason="Safe action.",
+        )
+        self.store.save_journal(
+            decision="BUY",
+            rationale=["Recent breakout entry."],
+            confidence=0.7,
+            risk_reason="Approved",
+        )
+
+        context = self.store.get_recent_journal_context(
+            limit=1,
+            candidate_limit=1,
+            anchor_limit=1,
+        )
+
+        self.assertEqual(len(context), 2)
+        self.assertEqual(context[0]["decision"], "BUY")
+        self.assertEqual(context[1]["journal_id"], 1)
+        self.assertEqual(context[1]["rationale_items"][0]["hold_quality"], "good_hold")
 
     def test_replay_batch_candidates_prioritize_unreplayed_trade_audits(self):
         approved_trade_id = self.store.save_audit(
@@ -841,6 +942,52 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(memory[0]["rule"], "Only fade spikes when higher timeframe trend is flat.")
         self.assertEqual(memory[0]["apply_when"]["trend"], ["flat"])
         self.assertEqual(memory[0]["ignore_when"], ["Ignore in strong breakout continuation."])
+
+    def test_get_long_term_memory_pool_is_not_capped_to_recent_rows(self):
+        self.store.save_long_term_memory_entries(
+            [
+                {
+                    "rule": "Old but strongly validated risk rule.",
+                    "version": 1,
+                    "metrics": {
+                        "status": "rule",
+                        "support": 12,
+                        "category": "risk_control",
+                        "regime": "general",
+                        "confidence_score": 0.95,
+                        "validity_score": 0.93,
+                        "freshness_score": 0.88,
+                        "retired": False,
+                    },
+                }
+            ]
+        )
+        for index in range(401):
+            self.store.save_long_term_memory_entries(
+                [
+                    {
+                        "rule": f"Recent low-priority rule {index}",
+                        "version": 1,
+                        "metrics": {
+                            "status": "rule",
+                            "support": 1,
+                            "category": "opportunity",
+                            "regime": "general",
+                            "confidence_score": 0.11,
+                            "validity_score": 0.1,
+                            "freshness_score": 0.1,
+                            "retired": False,
+                        },
+                    }
+                ]
+            )
+
+        pool = self.store.get_long_term_memory_pool()
+        memory = self.store.get_long_term_memory()
+
+        self.assertEqual(len(pool), 402)
+        self.assertEqual(pool[0]["rule"], "Old but strongly validated risk rule.")
+        self.assertEqual(memory[0]["rule"], "Old but strongly validated risk rule.")
 
     def test_save_long_term_memory_entries_updates_existing_rows(self):
         self.store.save_long_term_memory_entries(

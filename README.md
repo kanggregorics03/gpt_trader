@@ -361,7 +361,10 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 - `recent_journal_context`
   - 최근 journal 문맥을 구조화 객체로 전달
   - `rationale_items`, `evidence_quality`, `entry_size_cap`, trigger 정보까지 포함
+  - 단순 점수 상위 N개가 아니라 `good_hold / missed_opportunity_hold / entry_action / risk_outcome` 버킷을 섞는 방식으로 편향을 줄인다.
+  - semantic validation 실패나 loop error로 생긴 fallback `HOLD`는 기본 컨텍스트에서 제외한다.
 - `long_term_memory`
+  - `risk_control / opportunity / execution_quality / hold_quality` 축을 함께 보고 균형 있게 선별한다.
 - `similar_past_cases`
 - `is_trigger_mode`
 - `risk_mode`
@@ -625,11 +628,13 @@ execution_guards:
 
 context_budget:
   journal_fetch_limit: 24
+  journal_anchor_limit: 24
   journal_keep_limit: 6
   memory_keep_limit: 8
   similar_case_keep_limit: 5
+  similar_case_normal_keep_limit: 2
   max_rationale_items_per_journal: 2
-  max_evidence_per_rationale_item: 2
+  max_evidence_per_rationale_item: 3
   max_ignore_when_per_memory: 2
 ```
 
@@ -650,7 +655,15 @@ context_budget:
   - recent symbol re-entry guard는 `완전히 flat`일 때만 강하게 적용된다. 포지션, working order, active trade case가 남아 있으면 재진입 가드는 cycle risk state에 실리지 않는다.
   - startup 시 policy validator가 단일 심볼 구성, stale reprice 값 범위, re-entry cooldown 관계를 함께 검증한다.
 - `context_budget`
+  - Retrieval note: recent journal candidates now mix a recent slice with semantic anchor rows such as `good_hold`, `missed_opportunity_hold`, and loss/risk outcomes.
+  - Lifecycle note: runtime `long_term_memory` retrieval and batch reconciliation now read the same full lifecycle-managed pool instead of separate recent caps.
+  - Support note: `similar_past_cases` stays dense in trigger mode, but normal mode still receives a small background-support case set.
+  - Policy note: `policy_summary` is now a compact digest of enforceable limits, mode profiles, and execution guards rather than a raw `policy.yaml` dump.
+  - Contract note: critical policy paths are registered in `RiskEngine.PROMPT_POLICY_CONTRACT`. Startup fails if the prompt digest cannot carry those fields.
+  - Learning note: runtime retrieval scores are additionally adjusted by batch-produced `journal_reranker_profile` and `similar_case_reranker_profile` artifacts instead of relying on static heuristics alone.
   - 최근 journal/long_term_memory/similar case를 전부 보내지 않고, 관련성 높은 상위 컨텍스트만 압축해 전달한다.
+  - recent_journal_context는 action 사례만 몰리지 않도록 hold/action/fallback 버킷을 분산 선택한다.
+  - long_term_memory는 `risk_control`, `opportunity`, `execution_quality`를 한쪽으로 쏠리지 않게 섞고, retired/저신뢰 항목은 기본 제외한다.
 
 ## 실행 엔진 상세
 
@@ -1357,6 +1370,8 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 - 리스크 거절 비율
 - 루프 에러 수
 - 미복구 타임아웃 수
+- 최근 context mix
+  - `good_hold / missed_hold / action / fallback / other_hold`
 - 최근 수수료
 - 최근 ledger net pnl
 - 최근 audit 목록
@@ -1370,6 +1385,9 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 - 일별 ledger 리포트
 - 특정 audit 상세
 - 특정 audit replay 실행
+
+대시보드 상단 `Context Mix` 카드는 최근 24시간 audit에 저장된 `execution_summary.context_selection_summary`를 집계해
+실제 프롬프트 컨텍스트가 action-heavy인지, fallback이 과도한지, good hold가 충분히 회수되는지 확인하는 용도다.
 
 ### audit 상세에서 볼 수 있는 것
 
@@ -1513,8 +1531,21 @@ python main.py
 대시보드 실행:
 
 ```powershell
-python dashboard/app.py
+python -m dashboard.app
 ```
+
+Dashboard startup now resolves `.env` and opens `StateStore` lazily on the first request, so importing the module for tests or tooling no longer opens the DB immediately.
+
+대시보드의 `Learning Liveness` 카드에는 다음이 함께 표시된다.
+
+- 마지막 replay batch 시각
+- 마지막 memory update 시각
+- 최근 24시간 replay candidate 처리율
+- recent journal / similar case reranker artifact 준비 여부
+- shadow dataset 준비 여부
+- stale learning으로 인한 promotion 차단 여부
+
+`Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도 `policy_promotions`, `bundle_promotions`는 자동으로 멈춘다.
 
 대시보드는 `.env`의 `DB_PATH`를 사용해 같은 SQLite를 읽는다.  
 audit replay를 대시보드에서 실행할 때는 `REPLAY_PROVIDER`, `REPLAY_API_KEY`, `REPLAY_MODEL`을 우선 보고, 비어 있으면 `AI_PROVIDER`, `AI_API_KEY`, `AI_DEFAULT_MODEL` 계열 설정으로 fallback 한다.
@@ -1705,12 +1736,16 @@ python -m unittest discover -s tests
 수익률이 기대에 못 미칠 때는 모델을 바로 교체하기보다, 원인을 `엣지 / 비용 / 과잉거래 / 사이징 / 데이터 품질 / 운영 안정성 / LLM 품질`로 분리해서 봐야 한다.  
 상세 체크리스트와 원인별 개선 실험은 [`PROFITABILITY_TROUBLESHOOTING.md`](./PROFITABILITY_TROUBLESHOOTING.md)에 정리되어 있다.
 
+프로젝트의 철학, 의도된 편향, 프롬프트 계약, 학습/승격 원칙은 [`SYSTEM_PHILOSOPHY.md`](./SYSTEM_PHILOSOPHY.md)에 따로 정리했다.
+현재 한계와 다음 단계 우선순위는 [`IMPROVEMENT_ROADMAP.md`](./IMPROVEMENT_ROADMAP.md)에 정리했다.
+
 ## 권장 운영 순서
 
 1. Bybit Demo Trading 키로 시작하고 `BYBIT_TRADING_MODE=demo`로 둔다.
 2. `policy.yaml`의 손실 한도와 `mode_profiles`를 보수적으로 설정한다.
 3. `python main.py`로 로그와 audit를 충분히 쌓는다.
-4. `python dashboard/app.py`에서 input hash, risk mode, 상태 전이, replay diff를 확인한다.
+   - startup config error는 now structured startup failure로 처리되고, 명시적인 non-zero exit로 끝난다.
+4. `python -m dashboard.app`에서 input hash, risk mode, 상태 전이, replay diff, context mix, learning liveness를 확인한다.
 5. `python tools/replay_audit.py --list`와 `--audit-id`로 과거 결정 변화 양상을 점검한다.
 6. 장기 메모리에 저장된 `apply_when`, `ignore_when`가 실제 운영 관점에서 타당한지 검토한다.
 7. 문제가 없을 때만 `BYBIT_TRADING_MODE=live` 전환을 검토한다.
@@ -1726,6 +1761,8 @@ python -m unittest discover -s tests
 - 실행 엔진: [`exchange/execution_engine.py`](/c:/gpt_trader/exchange/execution_engine.py)
 - 메모리 배치: [`batch/memory_updater.py`](/c:/gpt_trader/batch/memory_updater.py)
 - 리플레이 도구: [`tools/replay_audit.py`](/c:/gpt_trader/tools/replay_audit.py)
+- 시스템 철학: [`SYSTEM_PHILOSOPHY.md`](/c:/gpt_trader/SYSTEM_PHILOSOPHY.md)
+- 개선 로드맵: [`IMPROVEMENT_ROADMAP.md`](/c:/gpt_trader/IMPROVEMENT_ROADMAP.md)
 - 대시보드: [`dashboard/app.py`](/c:/gpt_trader/dashboard/app.py)
 ## 실행 정책
 

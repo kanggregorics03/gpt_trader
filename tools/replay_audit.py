@@ -944,11 +944,22 @@ def run_incremental_replay_batch(
         replayed_audit_ids.append(audit_id)
         if save and payload:
             saved_count += 1
-    return {
+    summary = {
         "candidate_count": len(candidates),
         "saved_count": saved_count,
         "replayed_audit_ids": replayed_audit_ids,
     }
+    if hasattr(store, "upsert_learning_artifact"):
+        store.upsert_learning_artifact(
+            "replay_batch_heartbeat",
+            {
+                **summary,
+                "window_hours": max(1, int(window_hours or 24)),
+                "executed_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
+            },
+            artifact_type="heartbeat",
+        )
+    return summary
 
 
 def build_replay_payload(
