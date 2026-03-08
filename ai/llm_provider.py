@@ -1,6 +1,9 @@
+import inspect
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from pydantic import BaseModel
 
 try:
     import anthropic
@@ -246,7 +249,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             "temperature": temperature,
         }
         if schema is not None:
-            config_kwargs["response_schema"] = schema
+            config_kwargs["response_json_schema"] = self._build_response_json_schema(schema)
         if max_output_tokens is not None:
             config_kwargs["max_output_tokens"] = int(max_output_tokens)
         response = self.client.models.generate_content(
@@ -259,6 +262,29 @@ class GeminiLLMProvider(BaseLLMProvider):
             text=self._strip_code_fences(getattr(response, "text", "")),
             usage_metadata=usage,
         )
+
+    def _build_response_json_schema(self, schema: Any) -> Any:
+        if inspect.isclass(schema) and issubclass(schema, BaseModel):
+            schema_payload = schema.model_json_schema()
+        elif isinstance(schema, BaseModel):
+            schema_payload = type(schema).model_json_schema()
+        elif hasattr(schema, "model_json_schema"):
+            schema_payload = schema.model_json_schema()
+        else:
+            schema_payload = schema
+        return self._strip_unsupported_schema_keywords(schema_payload)
+
+    def _strip_unsupported_schema_keywords(self, schema: Any) -> Any:
+        if isinstance(schema, dict):
+            cleaned = {}
+            for key, value in schema.items():
+                if key == "additionalProperties":
+                    continue
+                cleaned[key] = self._strip_unsupported_schema_keywords(value)
+            return cleaned
+        if isinstance(schema, list):
+            return [self._strip_unsupported_schema_keywords(item) for item in schema]
+        return schema
 
     def _extract_usage_metadata(self, response: Any) -> dict[str, Any]:
         usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)

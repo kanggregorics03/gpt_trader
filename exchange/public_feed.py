@@ -24,6 +24,8 @@ TIMEFRAME_TO_INTERVAL = {
     "1d": "D",
 }
 
+SUPPORTED_LINEAR_ORDERBOOK_DEPTHS = (1, 50, 200, 1000)
+
 
 class BybitPublicMarketFeed:
     def __init__(
@@ -39,7 +41,7 @@ class BybitPublicMarketFeed:
     ):
         self.symbols = sorted(set(symbols))
         self.timeframes = list(timeframes) if timeframes is not None else ["5m", "15m", "1h", "4h"]
-        self.orderbook_depth = orderbook_depth
+        self.orderbook_depth = self._normalize_orderbook_depth(orderbook_depth)
         self.stream_ticker = bool(stream_ticker)
         self.stream_orderbook = bool(stream_orderbook)
         self.max_kline_rows = max(20, int(max_kline_rows or 240))
@@ -66,6 +68,26 @@ class BybitPublicMarketFeed:
             "orderbook": {"last_ms": None, "max_ms": 0.0},
             "kline": {"last_ms": None, "max_ms": 0.0},
         }
+
+    @staticmethod
+    def _normalize_orderbook_depth(depth: int) -> int:
+        requested = max(1, int(depth or 0))
+        for supported in SUPPORTED_LINEAR_ORDERBOOK_DEPTHS:
+            if requested <= supported:
+                if requested != supported:
+                    logger.warning(
+                        "Unsupported Bybit linear orderbook depth {} requested; using supported depth {}.",
+                        requested,
+                        supported,
+                    )
+                return supported
+        fallback = SUPPORTED_LINEAR_ORDERBOOK_DEPTHS[-1]
+        logger.warning(
+            "Unsupported Bybit linear orderbook depth {} requested; using supported depth {}.",
+            requested,
+            fallback,
+        )
+        return fallback
 
     @property
     def available(self) -> bool:

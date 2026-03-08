@@ -1,6 +1,6 @@
 trading:
   symbols:
-    - BTCUSDT
+    - ETHUSDT
   # Startup validation enforces exactly one symbol in this project.
   max_leverage: 3
   order_type: "market" # legacy fallback; execution_policy.allowed_order_types now controls runtime choice
@@ -125,7 +125,7 @@ private_account_ws:
   execution_cache_size: 200
 
 public_market_ws:
-  orderbook_depth: 10
+  orderbook_depth: 50
   stream_ticker: true
   stream_orderbook: true
   stream_timeframes: []

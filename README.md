@@ -1296,10 +1296,12 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 - `decision_input_hash`
 - `risk_mode`, `risk_profile`
 
-### 주의사항
+### 설정 동기화
 
-현재 [`dashboard/app.py`](/c:/gpt_trader/dashboard/app.py)는 DB 경로를 환경 변수 대신 `data/gpt_trader.db`로 고정해서 읽는다.  
-메인 실행에서 다른 `DB_PATH`를 쓰면 대시보드가 같은 DB를 보지 못할 수 있다.
+- 대시보드는 `.env`를 읽고 `DB_PATH`를 그대로 사용한다.
+- `DB_PATH`를 비우면 기본값 `data/gpt_trader.db`를 사용한다.
+- 상단 모델 라우팅 표시는 `AI_PROVIDER`, `MEMORY_PROVIDER`, `REPLAY_PROVIDER`와 각 모델 env를 반영한다.
+- audit replay 버튼은 `REPLAY_*` 설정을 우선 사용하고, 비어 있으면 `AI_*` 설정으로 fallback 한다.
 
 ## 설치 방법
 
@@ -1414,6 +1416,9 @@ python main.py
 ```powershell
 python dashboard/app.py
 ```
+
+대시보드는 `.env`의 `DB_PATH`를 사용해 같은 SQLite를 읽는다.  
+audit replay를 대시보드에서 실행할 때는 `REPLAY_PROVIDER`, `REPLAY_API_KEY`, `REPLAY_MODEL`을 우선 보고, 비어 있으면 `AI_PROVIDER`, `AI_API_KEY`, `AI_DEFAULT_MODEL` 계열 설정으로 fallback 한다.
 
 접속 주소:
 

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from dashboard import app as dashboard_app
 
@@ -123,7 +124,20 @@ class TestDashboardApp(unittest.TestCase):
         dashboard_app.state_store = self.original_state_store
 
     def test_stats_endpoint_includes_trade_case_retrieval_and_memory_summaries(self):
-        response = self.client.get("/api/stats")
+        with patch.dict(
+            "os.environ",
+            {
+                "AI_PROVIDER": "openai",
+                "AI_DEFAULT_MODEL": "gpt-4.1-mini",
+                "AI_TRIGGER_MODEL": "gpt-4.1",
+                "MEMORY_PROVIDER": "anthropic",
+                "MEMORY_MODEL": "claude-3.7-sonnet",
+                "REPLAY_PROVIDER": "deepseek",
+                "REPLAY_MODEL": "deepseek-chat",
+            },
+            clear=False,
+        ):
+            response = self.client.get("/api/stats")
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
@@ -132,6 +146,13 @@ class TestDashboardApp(unittest.TestCase):
         self.assertIn("memory_summary", payload)
         self.assertIn("recent_trade_cases", payload)
         self.assertIn("recent_retrieval_evaluations", payload)
+        self.assertEqual(payload["models"]["provider"], "openai")
+        self.assertEqual(payload["models"]["default_model"], "gpt-4.1-mini")
+        self.assertEqual(payload["models"]["trigger_model"], "gpt-4.1")
+        self.assertEqual(payload["models"]["memory_provider"], "anthropic")
+        self.assertEqual(payload["models"]["memory_model"], "claude-3.7-sonnet")
+        self.assertEqual(payload["models"]["replay_provider"], "deepseek")
+        self.assertEqual(payload["models"]["replay_model"], "deepseek-chat")
         self.assertEqual(payload["trade_case_summary"]["total_count"], 2)
         self.assertEqual(payload["retrieval_summary"]["settled_count"], 1)
         self.assertEqual(payload["memory_summary"]["active_count"], 1)
@@ -145,6 +166,32 @@ class TestDashboardApp(unittest.TestCase):
         self.assertIn("trade_cases", payload)
         self.assertIn("retrieval_evaluations", payload)
         self.assertEqual(payload["trade_cases"][0]["trade_case_id"], "case-1")
+
+    def test_audit_replay_endpoint_uses_replay_engine_and_payload_options(self):
+        fake_engine = object()
+        with (
+            patch.object(dashboard_app, "build_replay_engine", return_value=fake_engine) as mock_build_engine,
+            patch.object(
+                dashboard_app,
+                "replay_and_optionally_save",
+                return_value={"status": "ok"},
+            ) as mock_replay,
+        ):
+            response = self.client.post(
+                "/api/audits/101/replay",
+                json={"save": False, "include_counterfactual": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok"})
+        mock_build_engine.assert_called_once_with()
+        mock_replay.assert_called_once_with(
+            dashboard_app.state_store,
+            audit_id=101,
+            engine=fake_engine,
+            save=False,
+            include_counterfactual=False,
+        )
 
 
 if __name__ == "__main__":

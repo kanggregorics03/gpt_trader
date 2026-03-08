@@ -1,10 +1,16 @@
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from core.models import AccountState, MarketSnapshot, TradeIntent
+from core.models import (
+    AccountState,
+    MarketSnapshot,
+    RiskStateSnapshot,
+    TradeIntent,
+    coerce_risk_state_snapshot,
+)
 
 class RiskEngine:
     def __init__(self, config_path: str = "policy.yaml"):
@@ -160,13 +166,13 @@ class RiskEngine:
 
     def get_active_risk_mode(
         self,
-        risk_state: Optional[Dict[str, float]] = None,
+        risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
         is_trigger_mode: bool = False,
     ) -> str:
-        risk_state = risk_state or {}
-        if bool(risk_state.get("cooldown_active")):
+        risk_state = coerce_risk_state_snapshot(risk_state)
+        if bool(risk_state.cooldown_active):
             return "cooldown"
-        if bool(risk_state.get("drawdown_active")):
+        if bool(risk_state.drawdown_active):
             return "drawdown"
         if is_trigger_mode:
             return "trigger"
@@ -174,7 +180,7 @@ class RiskEngine:
 
     def get_active_risk_profile(
         self,
-        risk_state: Optional[Dict[str, float]] = None,
+        risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
         is_trigger_mode: bool = False,
     ) -> Dict:
         profiles = self.get_risk_profiles()
@@ -231,11 +237,11 @@ class RiskEngine:
         self,
         intent: TradeIntent,
         active_profile: Optional[Dict] = None,
-        risk_state: Optional[Dict] = None,
+        risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
         market_snapshots: Optional[Dict[str, MarketSnapshot]] = None,
     ) -> Dict[str, object]:
         active_profile = active_profile or {}
-        risk_state = risk_state or {}
+        risk_state = coerce_risk_state_snapshot(risk_state)
         market_snapshots = market_snapshots or {}
         base_cap_pct = float(active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0)
         evidence_quality = self.get_evidence_quality_summary(intent)
@@ -267,7 +273,7 @@ class RiskEngine:
 
         failure_pattern_score = min(
             1.0,
-            max(0.0, float(risk_state.get("failure_pattern_score", 0.0) or 0.0)),
+            max(0.0, float(risk_state.failure_pattern_score or 0.0)),
         )
         failure_pattern_size_multiplier = min(
             1.0,
@@ -317,7 +323,7 @@ class RiskEngine:
         market_snapshot: Optional[MarketSnapshot] = None,
         market_snapshots: Optional[Dict[str, MarketSnapshot]] = None,
         market_prices: Optional[Dict[str, float]] = None,
-        risk_state: Optional[Dict[str, float]] = None,
+        risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
         is_trigger_mode: bool = False,
         unresolved_timeout_count: int = 0,
         active_profile_override: Optional[Dict] = None,
@@ -334,7 +340,7 @@ class RiskEngine:
         trading_policy = self.policy.get("trading", {})
         market_prices = market_prices or {}
         market_snapshots = market_snapshots or {}
-        risk_state = risk_state or {}
+        risk_state = coerce_risk_state_snapshot(risk_state)
         active_mode = self.get_active_risk_mode(risk_state=risk_state, is_trigger_mode=is_trigger_mode)
         active_profile = active_profile_override or self.get_active_risk_profile(
             risk_state=risk_state,
@@ -481,7 +487,7 @@ class RiskEngine:
                     f"Entry blocked: {int(unresolved_timeout_count)} unresolved order lifecycle state(s) remain unknown."
                 )
             daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
-            daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+            daily_pnl_pct = float(risk_state.daily_pnl_pct or 0.0)
             if daily_max_loss_pct > 0 and daily_pnl_pct <= -daily_max_loss_pct:
                 return False, (
                     f"Kill switch active: daily pnl {daily_pnl_pct:.2f}% "
@@ -489,17 +495,17 @@ class RiskEngine:
                 )
 
             max_consecutive_losses = int(risk_limits.get("max_consecutive_losses", 0) or 0)
-            consecutive_losses = int(risk_state.get("consecutive_losses", 0) or 0)
+            consecutive_losses = int(risk_state.consecutive_losses or 0)
             if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
                 return False, (
                     f"Kill switch active: {consecutive_losses} consecutive losses "
                     f"reached policy limit {max_consecutive_losses}."
                 )
 
-            if bool(risk_state.get("cooldown_active")):
-                remaining = int(risk_state.get("cooldown_remaining_minutes", 0) or 0)
-                effective_window = int(risk_state.get("cooldown_minutes_effective", 0) or 0)
-                pattern_reason = str(risk_state.get("dominant_failure_reason") or "").strip()
+            if bool(risk_state.cooldown_active):
+                remaining = int(risk_state.cooldown_remaining_minutes or 0)
+                effective_window = int(risk_state.cooldown_minutes_effective or 0)
+                pattern_reason = str(risk_state.dominant_failure_reason or "").strip()
                 suffix = ""
                 if effective_window > 0:
                     suffix = f" (window {effective_window} minute(s)"

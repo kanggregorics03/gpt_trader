@@ -34,7 +34,7 @@ class TestPublicFeed(unittest.TestCase):
         feed = BybitPublicMarketFeed(
             symbols=["BTCUSDT"],
             timeframes=[],
-            orderbook_depth=10,
+            orderbook_depth=50,
             stream_ticker=True,
             stream_orderbook=True,
             ws_factory=DummyPublicWebSocket,
@@ -47,13 +47,13 @@ class TestPublicFeed(unittest.TestCase):
             [entry[:2] for entry in feed._ws.subscriptions],
             [("ticker", "BTCUSDT"), ("orderbook", "BTCUSDT")],
         )
-        self.assertEqual(feed._ws.subscriptions[1][2], 10)
+        self.assertEqual(feed._ws.subscriptions[1][2], 50)
 
     def test_start_can_disable_orderbook_and_limit_kline_streams(self):
         feed = BybitPublicMarketFeed(
             symbols=["BTCUSDT"],
             timeframes=["5m"],
-            orderbook_depth=10,
+            orderbook_depth=50,
             stream_ticker=True,
             stream_orderbook=False,
             ws_factory=DummyPublicWebSocket,
@@ -66,6 +66,22 @@ class TestPublicFeed(unittest.TestCase):
             [entry[:3] for entry in feed._ws.subscriptions],
             [("ticker", "BTCUSDT", feed._handle_ticker_message), ("kline", "BTCUSDT", "5")],
         )
+
+    def test_invalid_orderbook_depth_is_normalized_to_supported_linear_depth(self):
+        feed = BybitPublicMarketFeed(
+            symbols=["BTCUSDT"],
+            timeframes=[],
+            orderbook_depth=10,
+            stream_ticker=False,
+            stream_orderbook=True,
+            ws_factory=DummyPublicWebSocket,
+        )
+
+        started = feed.start()
+
+        self.assertTrue(started)
+        self.assertEqual(feed.orderbook_depth, 50)
+        self.assertEqual(feed._ws.subscriptions[0][:3], ("orderbook", "BTCUSDT", 50))
 
     def test_diagnostics_track_stream_freshness_counts_and_lag(self):
         feed = ControlledTimePublicFeed(

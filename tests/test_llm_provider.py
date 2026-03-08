@@ -1,12 +1,15 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from ai.llm_provider import (
     AnthropicLLMProvider,
+    GeminiLLMProvider,
     OpenAICompatibleLLMProvider,
     normalize_provider_name,
     resolve_api_key,
 )
+from core.models import TradeIntent
 
 
 class TestLLMProvider(unittest.TestCase):
@@ -140,6 +143,43 @@ class TestLLMProvider(unittest.TestCase):
         self.assertEqual(captured["messages"][0]["role"], "user")
         self.assertEqual(result.text, '{"decision":"HOLD"}')
         self.assertEqual(result.usage_metadata["total_token_count"], 19)
+
+    def test_gemini_provider_uses_json_schema_without_additional_properties(self):
+        captured = {}
+
+        class DummyModels:
+            @staticmethod
+            def generate_content(**kwargs):
+                captured.update(kwargs)
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "text": (
+                            '{"decision":"HOLD","orders":[],"rationale":["wait"],'
+                            '"risk_notes":[],"confidence":0.5}'
+                        ),
+                        "usage_metadata": None,
+                    },
+                )()
+
+        provider = GeminiLLMProvider.__new__(GeminiLLMProvider)
+        provider.client = type("Client", (), {"models": DummyModels()})()
+
+        result = provider.generate_json(
+            prompt="{}",
+            model_name="gemini-2.5-pro",
+            schema=TradeIntent,
+        )
+
+        config = captured["config"]
+        self.assertIsNone(getattr(config, "response_schema", None))
+        self.assertIsNotNone(getattr(config, "response_json_schema", None))
+        self.assertNotIn(
+            "additionalProperties",
+            json.dumps(config.response_json_schema),
+        )
+        self.assertEqual(result.text, '{"decision":"HOLD","orders":[],"rationale":["wait"],"risk_notes":[],"confidence":0.5}')
 
 
 if __name__ == "__main__":

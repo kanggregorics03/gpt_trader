@@ -4,7 +4,18 @@ import time
 import yaml
 from pathlib import Path
 from core.risk_engine import RiskEngine
-from core.models import DerivativesSnapshot, EvidenceItem, MarketSnapshot, OpenOrderState, RationaleItem, TradeIntent, AccountState, PositionState, OrderIntent
+from core.models import (
+    AccountState,
+    DerivativesSnapshot,
+    EvidenceItem,
+    MarketSnapshot,
+    OpenOrderState,
+    OrderIntent,
+    PositionState,
+    RationaleItem,
+    RiskStateSnapshot,
+    TradeIntent,
+)
 
 class TestRiskEngine(unittest.TestCase):
     def setUp(self):
@@ -164,6 +175,24 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("kill switch", reason.lower())
 
+    def test_reject_entry_on_daily_loss_kill_switch_with_risk_state_snapshot_model(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.1)],
+            rationale=["Setup"],
+            risk_notes=[],
+            confidence=0.8
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            risk_state=RiskStateSnapshot(daily_pnl_pct=-4.1),
+        )
+        self.assertFalse(approved)
+        self.assertIn("kill switch", reason.lower())
+
     def test_reject_limit_order_when_policy_requires_market(self):
         intent = TradeIntent(
             decision="BUY",
@@ -225,6 +254,14 @@ class TestRiskEngine(unittest.TestCase):
 
         self.assertEqual(mode, "drawdown")
         self.assertEqual(profile["max_open_positions"], 1)
+
+    def test_active_risk_mode_accepts_risk_state_snapshot_model(self):
+        mode = self.engine.get_active_risk_mode(
+            risk_state=RiskStateSnapshot(cooldown_active=True, cooldown_remaining_minutes=10),
+            is_trigger_mode=False,
+        )
+
+        self.assertEqual(mode, "cooldown")
 
     def test_drawdown_profile_reduces_entry_size_for_confidence_and_failure_pattern(self):
         intent = TradeIntent(

@@ -2,13 +2,29 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request
 
+from ai.llm_provider import (
+    normalize_provider_name,
+    resolve_decision_models,
+    resolve_memory_model_name,
+)
 from db.state_store import StateStore
-from tools.replay_audit import replay_and_optionally_save
+from tools.replay_audit import build_replay_engine, replay_and_optionally_save
+
+load_dotenv()
 
 app = Flask(__name__)
-DB_PATH = str(Path(__file__).resolve().parents[1] / "data" / "gpt_trader.db")
+DEFAULT_DB_PATH = str(Path(__file__).resolve().parents[1] / "data" / "gpt_trader.db")
+
+
+def _resolve_db_path() -> str:
+    configured = os.getenv("DB_PATH", "").strip()
+    return configured or DEFAULT_DB_PATH
+
+
+DB_PATH = _resolve_db_path()
 state_store = StateStore(DB_PATH)
 
 
@@ -104,6 +120,40 @@ def _build_dashboard_snapshot():
     snapshot["retrieval_summary"] = _build_retrieval_summary(retrieval_rows)
     snapshot["memory_summary"] = _build_memory_summary(recent_memory)
     return snapshot
+
+
+def _resolve_replay_model_name(replay_provider: str) -> str:
+    replay_model = (
+        os.getenv("REPLAY_MODEL", "").strip()
+        or os.getenv("MEMORY_MODEL", "").strip()
+        or os.getenv("AI_DEFAULT_MODEL", "").strip()
+        or os.getenv("GEMINI_MEMORY_MODEL", "").strip()
+        or os.getenv("GEMINI_DEFAULT_MODEL", "").strip()
+    )
+    if replay_model:
+        return replay_model
+    return resolve_memory_model_name(replay_provider)
+
+
+def _build_model_routing() -> dict[str, str]:
+    provider = normalize_provider_name(os.getenv("AI_PROVIDER"))
+    default_model, trigger_model = resolve_decision_models(provider)
+    memory_provider = normalize_provider_name(os.getenv("MEMORY_PROVIDER") or provider)
+    memory_model = resolve_memory_model_name(
+        memory_provider,
+        explicit_model=os.getenv("MEMORY_MODEL"),
+    )
+    replay_provider = normalize_provider_name(os.getenv("REPLAY_PROVIDER") or provider)
+    replay_model = _resolve_replay_model_name(replay_provider)
+    return {
+        "provider": provider,
+        "default_model": default_model,
+        "trigger_model": trigger_model,
+        "memory_provider": memory_provider,
+        "memory_model": memory_model,
+        "replay_provider": replay_provider,
+        "replay_model": replay_model,
+    }
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -358,10 +408,14 @@ HTML_TEMPLATE = """
 
         function renderModelRouting(models) {
             const value = models || {};
+            const provider = value.provider || 'unset';
             const defaultModel = value.default_model || 'unset';
             const triggerModel = value.trigger_model || defaultModel;
+            const memoryProvider = value.memory_provider || provider;
             const memoryModel = value.memory_model || triggerModel || defaultModel;
-            return `default ${defaultModel} | trigger ${triggerModel} | memory ${memoryModel}`;
+            const replayProvider = value.replay_provider || provider;
+            const replayModel = value.replay_model || memoryModel;
+            return `decision ${provider}:${defaultModel} | trigger ${triggerModel} | memory ${memoryProvider}:${memoryModel} | replay ${replayProvider}:${replayModel}`;
         }
 
         function parseJson(raw, fallback = {}) {
@@ -1049,20 +1103,10 @@ def index():
 def api_stats():
     try:
         snapshot = _build_dashboard_snapshot()
-        default_model = (os.getenv("GEMINI_DEFAULT_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip())
-        trigger_model = (os.getenv("GEMINI_TRIGGER_MODEL", "").strip() or default_model)
-        memory_model = (
-            os.getenv("GEMINI_MEMORY_MODEL", "").strip()
-            or trigger_model
-            or default_model
-            or "gemini-3.0-pro"
-        )
-        snapshot["models"] = {
-            "default_model": default_model,
-            "trigger_model": trigger_model,
-            "memory_model": memory_model,
-        }
+        snapshot["models"] = _build_model_routing()
         return jsonify(snapshot)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1081,17 +1125,18 @@ def api_audit_detail(audit_id: int):
 @app.route("/api/audits/<int:audit_id>/replay", methods=["POST"])
 def api_audit_replay(audit_id: int):
     try:
-        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not gemini_key:
-            return jsonify({"error": "GEMINI_API_KEY is required"}), 400
         payload = request.get_json(silent=True) or {}
+        engine = build_replay_engine()
         result = replay_and_optionally_save(
             state_store,
             audit_id=audit_id,
-            gemini_key=gemini_key,
+            engine=engine,
             save=bool(payload.get("save", True)),
+            include_counterfactual=bool(payload.get("include_counterfactual", True)),
         )
         return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except SystemExit as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as e:

@@ -87,7 +87,7 @@ class TradingOrchestrator:
         "execution_cache_size": 200,
     }
     DEFAULT_PUBLIC_MARKET_WS = {
-        "orderbook_depth": 10,
+        "orderbook_depth": 50,
         "stream_ticker": True,
         "stream_orderbook": True,
         "stream_timeframes": [],
