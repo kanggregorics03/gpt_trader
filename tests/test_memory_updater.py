@@ -82,6 +82,39 @@ class TestMemoryUpdater(unittest.TestCase):
                 "anthropic-key",
             )
 
+    def test_filter_learning_eligible_journals_excludes_system_error_audits(self):
+        journals = [
+            {
+                "id": 1,
+                "audit_log_id": 101,
+                "decision": "HOLD",
+                "risk_reason": "Approved",
+                "rationale": ["Normal hold."],
+                "execution_summary": {"ai_usage": {"total_token_count": 123}},
+            },
+            {
+                "id": 2,
+                "audit_log_id": 102,
+                "decision": "HOLD",
+                "risk_reason": "Safe action.",
+                "rationale": ["Fallback due to json validation error from AI."],
+                "execution_summary": {"ai_usage": {"validation_error": True}},
+            },
+            {
+                "id": 3,
+                "audit_log_id": 103,
+                "decision": "HOLD",
+                "risk_reason": "Error in Adaptive (1h) cycle: boom",
+                "rationale": ["Loop error during Adaptive (1h)."],
+                "execution_summary": {"error": "boom"},
+            },
+        ]
+
+        eligible, excluded = self.updater._filter_learning_eligible_journals(journals)
+
+        self.assertEqual([row["audit_log_id"] for row in eligible], [101])
+        self.assertEqual([row["audit_log_id"] for row in excluded], [102, 103])
+
     def test_build_stats_package_aggregates_pnl_and_reasons(self):
         class DummyStore:
             def get_position_ledger_stats(self, hours):

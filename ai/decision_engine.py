@@ -306,7 +306,7 @@ policy_summary:
 {request.policy_summary}
 account_state:
 {self._compact_json(self._build_stable_account_payload(request))}
-market_context:
+market_snapshots:
 {self._compact_json(market_payload)}
 risk_state:
 {request.risk_state.model_dump_json()}
@@ -328,7 +328,7 @@ trigger_mode_active:
 {str(request.is_trigger_mode).lower()}
 
 MARKET INTERPRETATION
-0. market_context, recent_journal_context, long_term_memory, and similar_past_cases are compact decision views. They intentionally remove low-value duplication while preserving decision-critical structure, trigger, execution, and outcome information.
+0. market_snapshots, recent_journal_context, long_term_memory, and similar_past_cases are compact decision views. They intentionally remove low-value duplication while preserving decision-critical structure, trigger, execution, and outcome information.
 1. Prefer derived fields such as change, percentile, distance, and trigger-state over raw values when making decisions.
 2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_trigger_active is the stabilized trigger state after hysteresis. Do not treat them as interchangeable.
 3. fast_move_trigger_active, volume_surge_trigger_active, and range_break_trigger_active represent stabilized trigger states and matter more for cadence and follow-through than one-bar noise.
@@ -351,15 +351,17 @@ RULES
 12. Consider idempotency and avoid repeating a failed request from recent_journal_context.
 13. Put identified risks in risk_notes.
 14. All text fields must be English.
-15. market_context represents the single configured trading symbol. Do not invent or reference other symbols.
+15. market_snapshots contains the configured trading symbol set. Do not invent or reference other symbols.
 16. Do not force a trade just because an opportunity trigger exists.
 17. A breakout without volume, open-interest support, or acceptable execution quality is weak.
 18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
 19. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
-20. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
-21. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, or risk_state.cooldown_remaining_minutes.
-22. If operator is not note, threshold is required. If operator is note, threshold must be null.
-23. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+20. Every rationale_item must include at least one evidence row with a valid source path from the DecisionRequest, and each rationale_item should include at least one numeric evidence row whenever possible.
+21. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, risk_state.cooldown_remaining_minutes, or market_snapshots.BTCUSDT.timeframes.1h.trend.
+22. Numeric operators gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte require numeric observed_value and numeric threshold.
+23. If you reference a categorical or boolean field, use operator eq or note only. For eq, observed_value and threshold must match the original categorical/bool value exactly, e.g. "FLAT" or true.
+24. If operator is not note, threshold is required. If operator is note, threshold must be null.
+25. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
 
 OUTPUT EXAMPLE
 {{
@@ -377,7 +379,7 @@ OUTPUT EXAMPLE
         payload = {
             "policy_summary": request.policy_summary,
             "account_state": self._build_stable_account_payload(request),
-            "market_context": self._build_market_payload(request),
+            "market_snapshots": self._build_market_payload(request),
             "risk_state": request.risk_state.model_dump(mode="json"),
             "risk_mode": request.risk_mode,
             "loop_mode": request.loop_mode,
@@ -446,11 +448,24 @@ OUTPUT EXAMPLE
             provider = getattr(self, "llm_provider", None)
             if provider is None:
                 raise RuntimeError("DecisionEngine is missing llm_provider.")
+            logger.info(
+                "Calling {} API with model {} (trigger_mode={}, input_hash={})",
+                getattr(self, "provider_name", "unknown"),
+                model_to_use,
+                bool(request.is_trigger_mode),
+                input_hash,
+            )
             response = provider.generate_json(
                 prompt=prompt,
                 model_name=model_to_use,
                 schema=TradeIntent,
                 temperature=0.2,
+            )
+            logger.info(
+                "{} API response received from model {} (input_hash={})",
+                getattr(self, "provider_name", "unknown"),
+                model_to_use,
+                input_hash,
             )
             raw_text = response.text
             intent = TradeIntent.model_validate_json(raw_text)

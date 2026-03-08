@@ -78,7 +78,7 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertEqual(len(feed._ws.subscriptions), 4)
         self.assertEqual(feed.get_health_status(), "reconnecting")
 
-    def test_feed_recovers_only_after_private_events_reconcile_and_stability_window(self):
+    def test_feed_recovers_after_reconcile_and_stability_window_without_private_events(self):
         feed = ControlledTimeFeed(
             api_key="key",
             api_secret="secret",
@@ -94,6 +94,28 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertEqual(feed.get_health_status(), "reconnecting")
         self.assertIsNone(feed.get_account_state(["BTCUSDT"]))
 
+        feed.advance_ms(12_000)
+        self.assertEqual(feed.get_health_status(), "healthy")
+
+        state = feed.get_account_state(["BTCUSDT"])
+        self.assertIsNotNone(state)
+        self.assertEqual(state.total_balance, 1500.0)
+
+    def test_feed_stays_healthy_when_first_private_event_arrives_after_reconcile_bootstrap(self):
+        feed = ControlledTimeFeed(
+            api_key="key",
+            api_secret="secret",
+            ws_factory=DummyPrivateWebSocket,
+            reconcile_ttl_ms=300_000,
+            ws_stale_after_seconds=25,
+            ws_recover_stability_seconds=12,
+            forced_reconcile_on_recover=True,
+        )
+        feed.start()
+        self._seed_rest_snapshot(feed)
+        feed.advance_ms(12_000)
+        self.assertEqual(feed.get_health_status(), "healthy")
+
         feed._handle_wallet_message(
             {
                 "data": [
@@ -107,23 +129,6 @@ class TestPrivateFeed(unittest.TestCase):
             }
         )
 
-        self.assertEqual(feed.get_health_status(), "degraded")
-        self.assertIsNone(feed.get_account_state(["BTCUSDT"]))
-
-        feed.seed_from_account_state(
-            AccountState(
-                snapshot_timestamp=feed._now_ms(),
-                total_balance=1510.0,
-                available_balance=910.0,
-                margin_ratio=0.11,
-                positions=[],
-                open_orders=[],
-                open_orders_count=0,
-            )
-        )
-
-        self.assertEqual(feed.get_health_status(), "reconnecting")
-        feed.advance_ms(12_000)
         self.assertEqual(feed.get_health_status(), "healthy")
 
         state = feed.get_account_state(["BTCUSDT"])

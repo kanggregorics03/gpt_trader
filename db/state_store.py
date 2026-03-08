@@ -744,6 +744,7 @@ class StateStore:
         case_summary: str = "",
     ):
         try:
+            serialized_rationale_items = self._serialize_json_payload(rationale_items)
             with self.conn:
                 self.conn.execute(
                     """
@@ -765,7 +766,7 @@ class StateStore:
                         audit_log_id,
                         decision,
                         "\\n".join(rationale),
-                        json.dumps(rationale_items) if rationale_items is not None else None,
+                        json.dumps(serialized_rationale_items) if serialized_rationale_items is not None else None,
                         confidence,
                         risk_reason,
                         estimated_pnl_pct,
@@ -777,6 +778,15 @@ class StateStore:
                 )
         except Exception as e:
             logger.error(f"Failed to save journal log: {e}")
+
+    def _serialize_json_payload(self, payload: Any) -> Any:
+        if hasattr(payload, "model_dump"):
+            return payload.model_dump(mode="json")
+        if isinstance(payload, dict):
+            return {str(key): self._serialize_json_payload(value) for key, value in payload.items()}
+        if isinstance(payload, (list, tuple)):
+            return [self._serialize_json_payload(item) for item in payload]
+        return payload
 
     def save_retrieval_evaluations(self, audit_log_id: int, entries: List[Dict[str, Any]]):
         if not audit_log_id or not entries:
@@ -3558,7 +3568,7 @@ class StateStore:
     def get_replay_candidates(self, limit: int = 20) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
             """
-            SELECT id, timestamp, intent, risk_approved, risk_reason, market_vectors
+            SELECT id, timestamp, intent, risk_approved, risk_reason, execution_summary, market_vectors
             FROM audit_logs
             WHERE decision_request IS NOT NULL
             ORDER BY id DESC
@@ -3570,7 +3580,10 @@ class StateStore:
         for row in cursor.fetchall():
             item = dict(row)
             item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+            item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
             item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
+            if not self.is_learning_eligible_audit_record(item):
+                continue
             rows.append(item)
         return rows
 
@@ -3612,6 +3625,8 @@ class StateStore:
             item["intent"] = self._safe_json_loads(item.get("intent"), default={})
             item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
             item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
+            if not self.is_learning_eligible_audit_record(item):
+                continue
             rows.append(item)
 
         def sort_key(item: Dict[str, Any]) -> tuple[int, int, int, int]:
@@ -4575,6 +4590,57 @@ class StateStore:
 
     def _utcnow(self) -> datetime:
         return datetime.now(UTC).replace(tzinfo=None)
+
+    @staticmethod
+    def is_learning_eligible_audit_record(row: Dict[str, Any]) -> bool:
+        record = dict(row or {})
+        risk_reason = str(record.get("risk_reason") or "").strip().lower()
+        if risk_reason.startswith("error in "):
+            return False
+
+        execution_summary = record.get("execution_summary") or {}
+        if hasattr(execution_summary, "model_dump"):
+            execution_summary = execution_summary.model_dump(mode="json")
+        if not isinstance(execution_summary, dict):
+            execution_summary = {}
+        if str(execution_summary.get("error") or "").strip():
+            return False
+
+        ai_usage = execution_summary.get("ai_usage") or {}
+        if hasattr(ai_usage, "model_dump"):
+            ai_usage = ai_usage.model_dump(mode="json")
+        if not isinstance(ai_usage, dict):
+            ai_usage = {}
+        if bool(ai_usage.get("validation_error")) or bool(ai_usage.get("semantic_validation_error")):
+            return False
+
+        intent = record.get("intent") or {}
+        if hasattr(intent, "model_dump"):
+            intent = intent.model_dump(mode="json")
+        if not isinstance(intent, dict):
+            intent = {}
+
+        text_markers = (
+            "system error",
+            "structured rationale validation failed",
+            "fallback due to json validation error from ai",
+            "fallback due to invalid structured rationale from ai",
+            "loop error during",
+        )
+        text_values: List[str] = []
+        for note in intent.get("risk_notes") or []:
+            text_values.append(str(note or "").strip().lower())
+        rationale = intent.get("rationale")
+        if rationale is None:
+            rationale = record.get("rationale")
+        if isinstance(rationale, list):
+            text_values.extend(str(item or "").strip().lower() for item in rationale)
+        elif rationale:
+            text_values.append(str(rationale).strip().lower())
+        for text in text_values:
+            if any(marker in text for marker in text_markers):
+                return False
+        return True
 
     def _decode_audit_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         decoded = dict(row)

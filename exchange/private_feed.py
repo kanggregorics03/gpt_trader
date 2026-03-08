@@ -132,6 +132,8 @@ class BybitPrivateAccountFeed:
                 self._order_key(order): order.model_copy(deep=True)
                 for order in account_state.open_orders
             }
+            if self._started and self._recovery_candidate_since <= 0:
+                self._recovery_candidate_since = now_ms
             reconcile_ok_at = now_ms
             if self._recovery_candidate_since > 0 and reconcile_ok_at <= self._recovery_candidate_since:
                 reconcile_ok_at = self._recovery_candidate_since + 1
@@ -403,7 +405,19 @@ class BybitPrivateAccountFeed:
         if self._last_successful_subscribe_at <= 0:
             return "reconnecting"
         if self._last_ws_message_at <= 0 or self._last_private_event_at <= 0:
-            return "reconnecting"
+            if self._last_reconcile_ok_at <= 0 or not self._wallet_state:
+                return "reconnecting"
+            recovery_since = self._recovery_candidate_since or self._last_successful_subscribe_at or self._last_reconcile_ok_at
+            if (
+                self.forced_reconcile_on_recover
+                and self._last_reconcile_ok_at <= recovery_since
+            ):
+                return "degraded"
+            if (now_ms - recovery_since) < self.ws_recover_stability_ms:
+                return "reconnecting"
+            if (now_ms - self._last_reconcile_ok_at) > self.reconcile_ttl_ms:
+                return "degraded"
+            return "healthy"
         if (now_ms - self._last_ws_message_at) > self.ws_stale_after_ms:
             return "stale"
         if (now_ms - self._last_private_event_at) > self.ws_stale_after_ms:

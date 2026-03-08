@@ -48,6 +48,9 @@ collector
 LLM이 raw 값보다 바로 판단에 쓸 수 있도록 volume ratio, 즉시 volume surge 여부, stabilized trigger state,
 open interest / funding / basis 변화율, spread / depth percentile, breakout / invalidation 거리 같은 상단 요약 필드를 함께 계산
 
+이때 `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`는 in-memory rolling history를 기반으로 계산하므로,
+프로세스 시작 직후나 잦은 재시작 직후에는 `null`일 수 있다.
+
 public WebSocket은 ticker/orderbook 위주로 유지하고, closed-candle 기반 OHLCV는 5분 materialization 시점의 incremental REST fetch를 우선
 
 즉 진행 중인 1h/4h 봉을 계속 스트리밍하기보다, 필요한 시점에만 저빈도로 가져오는 쪽을 기본값으로 둔다
@@ -73,6 +76,9 @@ WS health state는 `healthy / stale / degraded / reconnecting / down`
 `healthy`일 때만 WS를 primary로 사용하고, `stale / degraded / reconnecting / down`에서는 REST fallback
 
 WS 복구는 단순 재연결로 보지 않고, private 이벤트 수신 재개 + REST reconcile 성공 + 안정 구간 통과 후에만 `healthy`
+
+다만 계정이 조용해 private 이벤트가 당장 없더라도, 시작 직후 REST reconcile이 1회 성공하고 안정 구간을 지나면 `healthy`로 승격될 수 있다.
+반대로 stale/down 이후 private 이벤트가 다시 들어온 직후에는 forced reconcile 정책에 따라 한 번 더 `degraded`를 거칠 수 있다.
 
 `AccountReader.get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 볼 수 있다
 
@@ -100,6 +106,9 @@ Gemini / OpenAI(GPT) / DeepSeek / Anthropic(Claude)를 adapter로 선택할 수 
 따라서 `5m`는 프롬프트 레벨에서도 신규 진입 금지, `15m`는 관리 중심, `1h`만 신규 방향성 판단이라는 계약을 공유한다.
 
 JSON mode가 가능한 provider는 native JSON 응답을 우선 사용하고, 그렇지 않은 경우에도 JSON-only 지시와 Pydantic 검증을 함께 사용한다
+
+DeepSeek reasoning 계열은 응답 시간이 수 분까지 길어질 수 있다.
+특히 trigger mode에서 `AI_TRIGGER_MODEL=deepseek-reasoner`를 쓰면 초기 사이클 지연이 커질 수 있다.
 
 risk_engine
 
@@ -281,7 +290,7 @@ policy_summary: 현재 정책 핵심(레버리지/한도/쿨다운 등)
 
 account_state: 계좌 스냅샷 시각, 잔고, 총 미실현손익, 마진비율, 포지션 위험정보, 미체결 주문 상세(사실)
 
-market_snapshot: 15m/1h 캔들(마감된 캔들만), 핵심 지표/레벨 요약
+market_snapshot / market_snapshots: 15m/1h 캔들(마감된 캔들만), 핵심 지표/레벨 요약
 
 현재 프로젝트는 단일 심볼 운영을 전제로 하며, `trading.symbols`에 여러 개가 있더라도 런타임에서는 첫 번째 심볼만 사용한다
 
@@ -293,6 +302,9 @@ market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 
 `spread_vs_1h_avg`, `spread_percentile_1h`, `depth_percentile_1h`,
 `distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`
 같은 파생 요약 필드를 추가해 LLM이 raw 값보다 change / percentile / distance / trigger-state를 우선 해석하게 한다
+
+최근 프롬프트는 입력 섹션 이름을 `market_context`가 아니라 `market_snapshots`로 통일한다.
+구조화 evidence의 `source`는 `market_snapshots.*`, `risk_state.*`, `account_state.*` 같은 실제 `DecisionRequest` 경로를 가리켜야 한다.
 
 risk_state: 일일 손익률, 연속 손실, 최근 손실 강도, 동적 쿨다운 길이, 쿨다운 잔여 시간, 반복 실패 패턴 점수/대표 사유, 드로우다운 상태, 현재 심볼의 recent close/loss 재진입 가드 상태
 
@@ -343,7 +355,9 @@ rationale_items[]: 구조화 근거
 
 각 rationale_item은 summary, why_it_matters, trade_implication, failure_mode, evidence[]를 포함
 
-각 evidence는 signal, timeframe, operator, observed_value, threshold, units, source를 포함
+각 evidence는 signal, timeframe, operator, observed_value, threshold, units, source, confidence_contribution을 포함
+
+`confidence_contribution`은 양수 가점뿐 아니라 음수 감점도 허용한다. 현재 범위는 `-1.0 .. 1.0`이다.
 
 timeframe snapshot에는 previous_values를 둘 수 있고, cross_up/cross_down 검증 시 source별 직전값으로 사용한다
 
@@ -397,6 +411,9 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 
 권장 운영은 `incremental replay -> memory batch` 순서다.
 즉 배치 직전에 최근 24시간 대표 audit를 20~40건 정도 자동 replay한 뒤, 그 결과를 memory/policy 평가에 반영한다.
+단, 자동 replay와 memory batch는 모든 audit를 그대로 학습 입력으로 쓰지 않는다.
+`loop error`, `execution_summary.error`, `ai_usage.validation_error`,
+`ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 감사 로그로는 유지하되 자동 학습 입력에서는 제외한다.
 
 7.2 방식(오염 방지 필수)
 
@@ -570,6 +587,15 @@ with retrieval / without retrieval 중 어느 쪽 decision이 실제 종료 손�
 daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 market regime를 함께 읽어 장기 규칙을 만든다
 
 또한 evidence signal 반복에서 heuristic candidate lesson을 먼저 만들고, LLM은 이를 정제/병합하는 역할로 사용한다
+
+즉 오류 audit는 운영 품질 추적에는 남기되, 시스템 버그성 audit를 trading lesson seed로 직접 승격하지 않는 것이 현재 원칙이다.
+
+구조화 evidence는 현재 `numeric/categorical/boolean` 스키마를 완전히 분리하지 않고 단일 구조를 유지한다.
+대신 operator 규칙으로 타입을 제어한다.
+- `gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte` 는 숫자 evidence 전용
+- `eq/note` 는 숫자/문자열/불리언 evidence 허용
+즉 `rsi_14`, `spread_bps`, `volume_ratio_15m` 같은 값은 숫자 근거로,
+`trend="FLAT"`, `momentum_regime="accelerating_down"`, `cooldown_active=true` 같은 값은 `eq` 또는 `note` 근거로 다룬다.
 
 최근 구조에서는 symbol_journal도 함께 집계해 심볼 단위 evidence signal 반복 패턴을 별도로 반영한다
 

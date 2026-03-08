@@ -134,6 +134,225 @@ class TestStructuredIntentValidator(unittest.TestCase):
         self.assertTrue(any("observed_value_mismatch" in issue for issue in result.issues))
         self.assertTrue(any("source_missing" in issue for issue in result.issues))
 
+    def test_validator_accepts_market_context_source_alias(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[],
+            rationale=["BTC momentum is confirmed on 15m."],
+            rationale_items=[
+                RationaleItem(
+                    summary="BTC RSI is above the continuation threshold.",
+                    why_it_matters="Momentum remains supportive for continuation.",
+                    trade_implication="Long entries are allowed if risk limits pass.",
+                    failure_mode="Momentum rolls over below the threshold.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="rsi_14",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=66.4,
+                            threshold=60.0,
+                            units="index",
+                            source="market_context.BTCUSDT.timeframes.15m.rsi_14",
+                        )
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.6,
+        )
+
+        result = self.validator.validate(self.request, intent)
+
+        self.assertTrue(result.is_valid)
+
+    def test_validator_accepts_boolean_sources_and_trigger_mode_alias(self):
+        request = self.request.model_copy(
+            update={
+                "is_trigger_mode": True,
+                "market_snapshots": {
+                    "BTCUSDT": self.request.market_snapshots["BTCUSDT"].model_copy(
+                        update={
+                            "volume_surge_trigger_active": True,
+                            "fast_move_trigger_active": False,
+                        }
+                    )
+                },
+                "risk_state": self.request.risk_state.model_copy(
+                    update={"cooldown_active": False}
+                ),
+            }
+        )
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[],
+            rationale=["BTC trigger state remains coherent."],
+            rationale_items=[
+                RationaleItem(
+                    summary="Trigger state is active while cooldown remains off.",
+                    why_it_matters="This supports closer monitoring without forcing a trade.",
+                    trade_implication="Allow a small long only if price structure also confirms.",
+                    failure_mode="Disable the setup if trigger participation fades or cooldown activates.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="trigger_mode_active",
+                            symbol="BTCUSDT",
+                            timeframe="risk",
+                            operator="eq",
+                            observed_value=1.0,
+                            threshold=1.0,
+                            units="flag",
+                            source="trigger_mode_active",
+                        ),
+                        EvidenceItem(
+                            signal="volume_surge_trigger_active",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="eq",
+                            observed_value=1.0,
+                            threshold=1.0,
+                            units="flag",
+                            source="market_snapshots.BTCUSDT.volume_surge_trigger_active",
+                        ),
+                        EvidenceItem(
+                            signal="cooldown_active",
+                            timeframe="risk",
+                            operator="eq",
+                            observed_value=0.0,
+                            threshold=0.0,
+                            units="flag",
+                            source="risk_state.cooldown_active",
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.6,
+        )
+
+        result = self.validator.validate(request, intent)
+
+        self.assertTrue(result.is_valid)
+
+    def test_validator_accepts_categorical_eq_evidence(self):
+        request = self.request.model_copy(
+            update={
+                "market_snapshots": {
+                    "BTCUSDT": self.request.market_snapshots["BTCUSDT"].model_copy(
+                        update={
+                            "timeframes": {
+                                "15m": self.request.market_snapshots["BTCUSDT"].timeframes["15m"].model_copy(
+                                    update={"trend": "FLAT"}
+                                ),
+                            },
+                            "regime": self.request.market_snapshots["BTCUSDT"].regime.model_copy(
+                                update={"momentum_regime": "accelerating_down"}
+                            ),
+                        }
+                    )
+                }
+            }
+        )
+        intent = TradeIntent.model_validate(
+            {
+                "decision": "HOLD",
+                "orders": [],
+                "rationale": ["BTC structure is mixed and momentum is softening."],
+                "rationale_items": [
+                    {
+                        "summary": "Higher-timeframe trend is flat while momentum regime is deteriorating.",
+                        "why_it_matters": "Categorical state can explain why a setup is not strong enough to trade.",
+                        "trade_implication": "Prefer HOLD until directional evidence strengthens.",
+                        "failure_mode": "Momentum turns back in favor of continuation.",
+                        "evidence": [
+                            {
+                                "signal": "trend",
+                                "symbol": "BTCUSDT",
+                                "timeframe": "15m",
+                                "operator": "eq",
+                                "observed_value": "FLAT",
+                                "threshold": "FLAT",
+                                "units": "state",
+                                "source": "market_snapshots.BTCUSDT.timeframes.15m.trend",
+                            },
+                            {
+                                "signal": "momentum_regime",
+                                "symbol": "BTCUSDT",
+                                "timeframe": "1h",
+                                "operator": "eq",
+                                "observed_value": "accelerating_down",
+                                "threshold": "accelerating_down",
+                                "units": "state",
+                                "source": "market_snapshots.BTCUSDT.regime.momentum_regime",
+                            },
+                            {
+                                "signal": "rsi_14",
+                                "symbol": "BTCUSDT",
+                                "timeframe": "15m",
+                                "operator": "gte",
+                                "observed_value": 66.4,
+                                "threshold": 60.0,
+                                "units": "index",
+                                "source": "market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                            },
+                        ],
+                    }
+                ],
+                "risk_notes": [],
+                "confidence": 0.4,
+            }
+        )
+
+        result = self.validator.validate(request, intent)
+
+        self.assertTrue(result.is_valid)
+
+    def test_validator_accepts_negative_confidence_contribution(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[],
+            rationale=["BTC setup has one offsetting execution-quality risk."],
+            rationale_items=[
+                RationaleItem(
+                    summary="Momentum is constructive but spread quality slightly offsets conviction.",
+                    why_it_matters="Negative execution evidence should be representable without invalidating the payload.",
+                    trade_implication="Allow a small long only with reduced confidence.",
+                    failure_mode="Execution quality degrades further.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="rsi_14",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=66.4,
+                            threshold=60.0,
+                            units="index",
+                            source="market_snapshots.BTCUSDT.timeframes.15m.rsi_14",
+                            confidence_contribution=0.25,
+                        ),
+                        EvidenceItem(
+                            signal="spread_penalty",
+                            symbol="BTCUSDT",
+                            timeframe="risk",
+                            operator="note",
+                            observed_value=1.0,
+                            threshold=None,
+                            units="flag",
+                            source="market_snapshots.BTCUSDT.recent_volume_surge",
+                            confidence_contribution=-0.15,
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=["Execution quality slightly reduces conviction."],
+            confidence=0.55,
+        )
+
+        result = self.validator.validate(self.request, intent)
+
+        self.assertTrue(result.is_valid)
+
     def test_validator_rejects_failed_operator_condition(self):
         intent = TradeIntent(
             decision="BUY",

@@ -14,6 +14,7 @@ class IntentValidationResult:
 class StructuredIntentValidator:
     _ROOT_PREFIXES = {
         "account_state",
+        "market_context",
         "market_snapshot",
         "market_snapshots",
         "risk_state",
@@ -45,8 +46,9 @@ class StructuredIntentValidator:
                     issues.append(f"{issue_prefix}.source_missing:{evidence.source}")
                     continue
 
-                numeric_evidence_found = True
-                actual_value = float(resolved)
+                if self._is_numeric_or_boolean_scalar(resolved):
+                    numeric_evidence_found = True
+                actual_value = resolved
                 if evidence.operator != "note" and evidence.threshold is None:
                     issues.append(f"{issue_prefix}.threshold_required")
 
@@ -75,8 +77,10 @@ class StructuredIntentValidator:
         payload: Dict[str, Any],
         request: DecisionRequest,
         evidence: EvidenceItem,
-    ) -> Optional[float]:
+    ) -> Optional[float | str | bool]:
         candidate_paths = [evidence.source]
+        candidate_paths.extend(self._market_context_alias_paths(request, evidence))
+        candidate_paths.extend(self._request_alias_paths(evidence))
         if not self._has_root_prefix(evidence.source):
             if evidence.symbol and evidence.symbol in request.market_snapshots:
                 candidate_paths.append(f"market_snapshots.{evidence.symbol}.{evidence.source}")
@@ -87,9 +91,43 @@ class StructuredIntentValidator:
 
         for path in candidate_paths:
             value = self._get_path_value(payload, path)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return float(value)
+            scalar_value = self._coerce_scalar_value(value)
+            if scalar_value is not None:
+                return scalar_value
         return None
+
+    def _request_alias_paths(self, evidence: EvidenceItem) -> List[str]:
+        if str(evidence.source or "") == "trigger_mode_active":
+            return ["is_trigger_mode"]
+        return []
+
+    def _market_context_alias_paths(
+        self,
+        request: DecisionRequest,
+        evidence: EvidenceItem,
+    ) -> List[str]:
+        source = str(evidence.source or "")
+        if not source.startswith("market_context."):
+            return []
+
+        alias_suffix = source[len("market_context.") :]
+        candidate_paths: List[str] = []
+        symbol = str(evidence.symbol or "")
+
+        if alias_suffix:
+            candidate_paths.append(f"market_snapshots.{alias_suffix}")
+            if request.market_snapshot is not None:
+                snapshot_symbol = str(request.market_snapshot.symbol or "")
+                if alias_suffix.startswith(f"{snapshot_symbol}."):
+                    stripped = alias_suffix[len(snapshot_symbol) + 1 :]
+                    if stripped:
+                        candidate_paths.append(f"market_snapshot.{stripped}")
+                else:
+                    candidate_paths.append(f"market_snapshot.{alias_suffix}")
+
+        if symbol and symbol in request.market_snapshots and not alias_suffix.startswith(f"{symbol}."):
+            candidate_paths.append(f"market_snapshots.{symbol}.{alias_suffix}")
+        return candidate_paths
 
     def _has_root_prefix(self, path: str) -> bool:
         head = path.split(".", 1)[0]
@@ -112,39 +150,68 @@ class StructuredIntentValidator:
             return None
         return current
 
-    def _values_match(self, actual_value: float, observed_value: float) -> bool:
-        tolerance = max(0.01, abs(actual_value) * 0.02)
-        return isclose(actual_value, float(observed_value), abs_tol=tolerance, rel_tol=0.02)
+    def _coerce_scalar_value(self, value: Any) -> Optional[float | str | bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+        return None
 
-    def _operator_matches(self, payload: Dict[str, Any], actual_value: float, evidence: EvidenceItem) -> bool:
+    def _is_numeric_scalar(self, value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _is_numeric_or_boolean_scalar(self, value: Any) -> bool:
+        return isinstance(value, bool) or self._is_numeric_scalar(value)
+
+    def _values_match(self, actual_value: float | str | bool, observed_value: float | str | bool) -> bool:
+        if self._is_numeric_scalar(actual_value) and self._is_numeric_scalar(observed_value):
+            actual_float = float(actual_value)
+            observed_float = float(observed_value)
+            tolerance = max(0.01, abs(actual_float) * 0.02)
+            return isclose(actual_float, observed_float, abs_tol=tolerance, rel_tol=0.02)
+        if isinstance(actual_value, bool) or isinstance(observed_value, bool):
+            return bool(actual_value) is bool(observed_value)
+        if actual_value is None or observed_value is None:
+            return actual_value is observed_value
+        return str(actual_value).strip().lower() == str(observed_value).strip().lower()
+
+    def _operator_matches(self, payload: Dict[str, Any], actual_value: float | str | bool, evidence: EvidenceItem) -> bool:
         threshold = evidence.threshold
         operator = evidence.operator
         if operator == "note":
             return True
         if threshold is None:
             return False
-        if operator == "gte":
-            return actual_value >= threshold
-        if operator == "gt":
-            return actual_value > threshold
-        if operator == "lte":
-            return actual_value <= threshold
-        if operator == "lt":
-            return actual_value < threshold
         if operator == "eq":
             return self._values_match(actual_value, threshold)
+        if not self._is_numeric_scalar(actual_value) or not self._is_numeric_scalar(threshold):
+            return False
+        actual_float = float(actual_value)
+        threshold_float = float(threshold)
+        if operator == "gte":
+            return actual_float >= threshold_float
+        if operator == "gt":
+            return actual_float > threshold_float
+        if operator == "lte":
+            return actual_float <= threshold_float
+        if operator == "lt":
+            return actual_float < threshold_float
         if operator == "cross_up":
-            previous_value = self._resolve_previous_value(payload, evidence, actual_value)
+            previous_value = self._resolve_previous_value(payload, evidence, actual_float)
             if previous_value is None:
-                return actual_value > threshold
-            return previous_value <= threshold and actual_value > threshold
+                return actual_float > threshold_float
+            return previous_value <= threshold_float and actual_float > threshold_float
         if operator == "cross_down":
-            previous_value = self._resolve_previous_value(payload, evidence, actual_value)
+            previous_value = self._resolve_previous_value(payload, evidence, actual_float)
             if previous_value is None:
-                return actual_value < threshold
-            return previous_value >= threshold and actual_value < threshold
+                return actual_float < threshold_float
+            return previous_value >= threshold_float and actual_float < threshold_float
         if operator == "delta_abs_gte":
-            return abs(actual_value) >= abs(threshold)
+            return abs(actual_float) >= abs(threshold_float)
         return False
 
     def _resolve_previous_value(

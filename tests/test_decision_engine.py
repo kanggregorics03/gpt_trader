@@ -540,6 +540,8 @@ class TestDecisionEngine(unittest.TestCase):
 
         prompt = engine._create_prompt(request)
 
+        self.assertIn("market_snapshots:", prompt)
+        self.assertNotIn("market_context:", prompt)
         self.assertIn("Prefer derived fields such as change, percentile, distance, and trigger-state", prompt)
         self.assertIn("volume_surge_15m_now is the immediate current-bar condition", prompt)
         self.assertIn('"volume_surge_15m_now":true', prompt)

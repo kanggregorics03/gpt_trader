@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
 
@@ -845,6 +845,18 @@ class TradingOrchestrator:
     def _serialize_risk_state(self, risk_state) -> dict:
         return self._coerce_risk_state(risk_state).model_dump(mode="json")
 
+    def _serialize_json_payload(self, payload):
+        if hasattr(payload, "model_dump"):
+            return payload.model_dump(mode="json")
+        if isinstance(payload, dict):
+            return {
+                str(key): self._serialize_json_payload(value)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, (list, tuple)):
+            return [self._serialize_json_payload(item) for item in payload]
+        return payload
+
     def _primary_symbol(self) -> str:
         configured = [str(symbol).strip().upper() for symbol in (self.symbols or []) if str(symbol).strip()]
         if configured:
@@ -1158,6 +1170,8 @@ class TradingOrchestrator:
         return bool(before_symbols - after_symbols)
 
     def _determine_desired_loop_mode(self, cycle_result: dict) -> str:
+        if bool(cycle_result.get("lock_skipped")):
+            return self.active_loop_mode
         final_account_state = cycle_result.get("final_account_state")
         has_positions = bool(cycle_result.get("has_positions"))
         has_open_orders = bool(cycle_result.get("has_open_orders"))
@@ -3509,13 +3523,14 @@ class TradingOrchestrator:
             return {
                 "loop_type": loop_type,
                 "trigger_active": self.active_loop_mode == "5m",
-                "has_positions": True,
-                "has_open_orders": True,
-                "has_unknown_orders": True,
+                "has_positions": False,
+                "has_open_orders": False,
+                "has_unknown_orders": False,
                 "executed_order_count": 0,
                 "position_closed": False,
                 "final_account_state": None,
                 "locked": True,
+                "lock_skipped": True,
             }
         try:
             if snapshot_bundle is None:
@@ -3785,6 +3800,7 @@ class TradingOrchestrator:
                 risk_state=risk_state,
                 market_snapshots=market_snapshots,
             )
+            risk_payload = self._serialize_risk_state(risk_state)
 
             # 5. Execution
             planned_orders = []
@@ -3811,7 +3827,7 @@ class TradingOrchestrator:
                 "risk_profile": risk_profile,
                 "effective_risk_profile": effective_risk_profile,
                 "cycle_role": effective_risk_profile.get("cycle_role"),
-                "risk_state": risk_state,
+                "risk_state": risk_payload,
                 "decision_input_hash": decision_result.input_hash,
                 "ai_usage": decision_result.usage_metadata or {},
                 "regime_key": regime_key,
@@ -3979,7 +3995,6 @@ class TradingOrchestrator:
                 estimated_pnl_pct = self._estimate_realized_pnl_pct(intent, effective_pre_execution_state)
             loss_signal = estimated_pnl_pct is not None and estimated_pnl_pct < 0
             account_payload = effective_pre_execution_state.model_dump(mode="json")
-            risk_payload = self._serialize_risk_state(risk_state)
             audit_market = {
                 "symbols": list(market_snapshots.keys()),
                 "market_snapshots": {
@@ -3996,7 +4011,7 @@ class TradingOrchestrator:
             audit_id = self.state_store.save_audit(
                 account=account_payload,
                 market=audit_market,
-                intent=intent.model_dump(),
+                intent=intent.model_dump(mode="json"),
                 risk_ok=is_approved,
                 reason=reason,
                 receipts=receipts,
@@ -4004,9 +4019,9 @@ class TradingOrchestrator:
                 decision_input_hash=decision_result.input_hash,
                 risk_mode=risk_mode,
                 risk_profile=risk_profile,
-                decision_request=request.model_dump(),
+                decision_request=request.model_dump(mode="json"),
                 ai_raw_response=decision_result.raw_response,
-                execution_summary=execution_summary,
+                execution_summary=self._serialize_json_payload(execution_summary),
                 market_vectors=self.rag_engine.build_market_vectors(
                     audit_market["market_snapshots"],
                     account_state=account_payload,
@@ -4047,7 +4062,7 @@ class TradingOrchestrator:
                     estimated_pnl_pct=estimated_pnl_pct,
                     ledger_entries=ledger_entries,
                 )
-                observed_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                observed_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
                 symbol_journal_entries = self._annotate_trade_case_entries(
                     audit_log_id=audit_id,
                     symbol_journal_entries=symbol_journal_entries,

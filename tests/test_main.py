@@ -380,6 +380,33 @@ class TestTradingOrchestrator(unittest.TestCase):
             },
         )
 
+    def test_serialize_json_payload_converts_pydantic_models(self):
+        orchestrator = self._make_orchestrator()
+
+        payload = {
+            "risk_state": RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            "post_account_state": AccountState(
+                total_balance=1000.0,
+                available_balance=900.0,
+                positions=[],
+                open_orders=[],
+                open_orders_count=0,
+            ),
+        }
+
+        serialized = orchestrator._serialize_json_payload(payload)
+
+        self.assertIsInstance(serialized["risk_state"], dict)
+        self.assertIsInstance(serialized["post_account_state"], dict)
+        self.assertEqual(serialized["risk_state"]["daily_pnl_pct"], 0.0)
+        self.assertEqual(serialized["post_account_state"]["available_balance"], 900.0)
+
     def test_validate_ai_configuration_uses_gemini_default_and_requires_provider_key(self):
         orchestrator = TradingOrchestrator.__new__(TradingOrchestrator)
         orchestrator.ai_provider = "gemini"
@@ -881,6 +908,21 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(desired_flat_trigger, "1h")
         self.assertEqual(desired_management, "15m")
         self.assertEqual(desired_idle, "1h")
+
+    def test_determine_desired_loop_mode_preserves_current_mode_when_lock_skipped(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.active_loop_mode = "1h"
+
+        desired_mode = orchestrator._determine_desired_loop_mode(
+            {
+                "lock_skipped": True,
+                "has_positions": True,
+                "has_open_orders": True,
+                "has_unknown_orders": True,
+            }
+        )
+
+        self.assertEqual(desired_mode, "1h")
 
     def test_trigger_with_recent_close_but_no_management_target_prefers_15m(self):
         orchestrator = self._make_orchestrator()

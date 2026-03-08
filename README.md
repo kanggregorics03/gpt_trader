@@ -177,7 +177,8 @@ gpt_trader/
   - Bybit private WebSocket으로 `wallet / position / order / execution`을 메모리에 유지하고, REST는 fallback + reconcile 용도로만 사용
   - WS health state는 `healthy / stale / degraded / reconnecting / down`
   - `healthy`일 때만 WS를 primary source로 사용하고, 나머지 상태에서는 REST fallback 사용
-  - WS가 복구되더라도 바로 primary로 복귀하지 않고, private 이벤트 수신 재개 + REST reconcile 1회 성공 + 안정 구간을 통과해야 다시 `healthy`
+  - 시작 직후 계정이 조용해 private 이벤트가 아직 없어도, REST reconcile이 1회 성공하고 안정 구간을 지나면 `healthy`로 승격될 수 있다
+  - 반대로 stale/down 이후 private 이벤트가 다시 들어온 직후에는 forced reconcile 정책에 따라 한 번 더 `degraded`를 거칠 수 있다
   - `get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 확인할 수 있다
 - `MarketCollector`
   - 현재가
@@ -187,6 +188,8 @@ gpt_trader/
   - 히스테리시스가 반영된 fast move / volume surge / range break trigger 상태
   - open interest / funding / basis의 변화율 요약
   - spread와 depth의 최근 1시간 상대 수준(percentile / avg 대비 악화 여부)
+    - 이 percentile 계열은 in-memory rolling history가 쌓여야 계산된다
+    - 프로세스 시작 직후나 잦은 재시작 직후에는 `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`가 `null`일 수 있다
   - breakout 기준선 및 invalidation까지의 거리 요약
   - opportunity trigger 여부와 사유
   - risk trigger 여부와 사유
@@ -373,6 +376,9 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 `distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`처럼
 LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 전달한다.
 
+최근 프롬프트는 입력 섹션 이름을 `market_context`가 아니라 `market_snapshots`로 통일한다.
+구조화 evidence의 `source`도 `market_snapshots.*`, `risk_state.*`, `account_state.*` 같은 실제 `DecisionRequest` 경로를 가리켜야 한다.
+
 `volume_surge_15m_now`와 `volume_surge_trigger_active`는 의도적으로 분리한다.  
 전자는 현재 15분 봉의 즉시 조건이고, 후자는 히스테리시스가 반영된 안정화된 trigger 상태다.
 
@@ -466,7 +472,8 @@ AI 출력은 `TradeIntent`다.
 - `rationale_items`
   - 기계 검증 가능한 구조화 근거
   - 각 항목은 `summary`, `why_it_matters`, `trade_implication`, `failure_mode`, `evidence[]`를 가진다
-  - `evidence[]`는 `signal`, `timeframe`, `operator`, `observed_value`, `threshold`, `units`, `source`, `confidence_contribution`을 포함한다
+- `evidence[]`는 `signal`, `timeframe`, `operator`, `observed_value`, `threshold`, `units`, `source`, `confidence_contribution`을 포함한다
+- `confidence_contribution`은 양수 가점뿐 아니라 음수 감점도 허용한다. 현재 범위는 `-1.0 .. 1.0`이다.
   - timeframe snapshot에는 `previous_values`가 포함될 수 있고, `cross_up/cross_down` 검증 시 source별 직전값으로 사용된다
 - `risk_notes`
   - 감지한 위험 요인
@@ -839,6 +846,13 @@ context_budget:
 
 daily memory batch는 `rationale_json.evidence`의 반복 시그널에서 heuristic `candidate_lessons`를 먼저 만들고, 선택된 LLM provider는 이를 정제하거나 병합하는 역할을 한다.  
 LLM 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
+다만 자동 학습 입력에는 모든 audit를 그대로 쓰지 않는다. `loop error`, `execution_summary.error`,
+`ai_usage.validation_error`, `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 보존하되,
+memory batch와 incremental replay의 자동 학습 후보에서는 제외한다.
+구조화 evidence는 단일 스키마를 유지하되 타입 규칙은 강하게 둔다.
+즉 `gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte` 는 숫자 값만 허용하고,
+`eq/note` 만 숫자/문자열/불리언 evidence를 허용한다.
+예를 들어 `rsi_14`, `spread_bps` 는 숫자 evidence로, `trend="FLAT"`, `momentum_regime="accelerating_down"` 는 `eq` 기반 범주형 evidence로 남긴다.
 
 이 배치는 signal 반복뿐 아니라 `evidence_quality.factor` 버킷과 `entry_size_cap` 조정 패턴도 같이 집계한다.  
 즉 근거 품질이 낮거나 size cap이 줄어든 상황이 실제 손실과 함께 반복되는지도 candidate lesson seed에 반영한다.
@@ -1153,6 +1167,7 @@ memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`,
 
 운영 기본값은 `수동 단건 replay + 일일 incremental replay 자동 배치`다.
 자동 경로는 최근 24시간의 대표 audit를 최대 30건까지 선별해 daily memory batch 직전에 저장한다.
+이 자동 replay 후보는 학습 가능 audit만 대상으로 하고, 시스템 오류 fallback/loop error audit는 자동 경로에서 제외한다.
 
 ### 사용법
 
@@ -1345,19 +1360,30 @@ BYBIT_API_KEY="your_bybit_api_key_here"
 BYBIT_API_SECRET="your_bybit_api_secret_here"
 BYBIT_TRADING_MODE="demo"
 BYBIT_TESTNET="False"
-AI_PROVIDER="gemini"
+AI_PROVIDER="deepseek"
 AI_API_KEY=""
-AI_DEFAULT_MODEL="gemini-2.5-pro"
-AI_TRIGGER_MODEL="gemini-2.5-pro"
-MEMORY_MODEL="gemini-2.5-pro"
-REPLAY_MODEL="gemini-2.5-pro"
-GEMINI_API_KEY="your_gemini_api_key_here" # legacy/provider-specific fallback
+AI_DEFAULT_MODEL="deepseek-reasoner"
+AI_TRIGGER_MODEL="deepseek-reasoner"
+MEMORY_PROVIDER="deepseek"
+MEMORY_MODEL="deepseek-reasoner"
+REPLAY_PROVIDER="deepseek"
+REPLAY_MODEL="deepseek-reasoner"
+GEMINI_API_KEY=""
 OPENAI_API_KEY=""
-DEEPSEEK_API_KEY=""
+DEEPSEEK_API_KEY="your_deepseek_api_key_here"
 ANTHROPIC_API_KEY=""
 DB_PATH="data/gpt_trader.db"
 LOG_LEVEL="INFO"
 LOG_FORMAT="text"
+```
+
+Gemini 예시는 다음처럼 바꾸면 된다.
+
+```env
+AI_PROVIDER="gemini"
+AI_DEFAULT_MODEL="gemini-2.5-pro"
+AI_TRIGGER_MODEL="gemini-2.5-pro"
+GEMINI_API_KEY="your_gemini_api_key_here"
 ```
 
 모델 선택:
@@ -1386,6 +1412,7 @@ LOG_FORMAT="text"
 - Gemini는 native schema JSON 응답을 사용한다.
 - OpenAI와 DeepSeek는 chat completion의 `json_object` 모드를 우선 사용한다.
 - Anthropic은 JSON-only system prompt를 사용하고, 모든 provider는 마지막에 Pydantic 검증으로 `TradeIntent` 스키마를 다시 확인한다.
+- DeepSeek reasoning 계열은 응답 시간이 수 분까지 길어질 수 있다. 특히 `AI_TRIGGER_MODEL=deepseek-reasoner`를 쓰면 첫 trigger cycle이 느릴 수 있다.
 
 ### 3. 정책 확인
 
@@ -1549,6 +1576,8 @@ python -m unittest discover -s tests
   - `derivatives`
   - `previous_values`
 - public/private WebSocket이 끊기면 REST fallback으로 운영은 되지만, 호출 수와 지연이 올라갈 수 있다.
+- private WS health는 시작 직후 잠깐 `reconnecting`일 수 있다.
+- 안정화 시간 이후에도 계속 `health=reconnecting, reconcile_due=False`가 반복되면 health 판정이나 private 이벤트 수신 경로를 점검해야 한다.
 - 로그에서 반복적으로 다음이 보이면 데이터 품질 이슈로 본다:
   - `Failed to fetch market data`
   - `Bulk open-order fetch failed`

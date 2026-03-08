@@ -314,15 +314,20 @@ class EvidenceItem(BaseModel):
     operator: Literal["gte", "lte", "gt", "lt", "eq", "cross_up", "cross_down", "delta_abs_gte", "note"] = Field(
         description="Comparison operator connecting observed_value and threshold"
     )
-    observed_value: float = Field(description="Measured numeric value from the request payload")
-    threshold: Optional[float] = Field(default=None, description="Numeric comparison threshold when applicable")
+    observed_value: float | str | bool = Field(
+        description="Measured scalar value from the request payload. Prefer numeric values, but categorical/bool values are allowed for eq/note evidence."
+    )
+    threshold: Optional[float | str | bool] = Field(
+        default=None,
+        description="Comparison threshold when applicable. Numeric operators require numeric thresholds; eq/note may use categorical or bool thresholds.",
+    )
     units: Optional[str] = Field(default=None, description="Optional units, e.g. pct, bps, usdt")
     source: str = Field(description="Dot path to the source field in DecisionRequest, e.g. market_snapshots.BTCUSDT.timeframes.15m.rsi_14")
     confidence_contribution: Optional[float] = Field(
         default=None,
-        ge=0.0,
+        ge=-1.0,
         le=1.0,
-        description="Optional relative contribution of this evidence to the final confidence",
+        description="Optional signed relative contribution of this evidence to the final confidence",
     )
 
 

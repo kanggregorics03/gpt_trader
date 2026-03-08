@@ -6,6 +6,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from core.models import EvidenceItem, RationaleItem
 from db.state_store import StateStore
 
 
@@ -206,6 +207,40 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["trade_case_ids"], ["BTCUSDT-case-1"])
         self.assertEqual(rows[0]["case_statuses"]["BTCUSDT"], "closed")
         self.assertEqual(rows[0]["case_summary"], "BTCUSDT:closed")
+
+    def test_save_journal_serializes_pydantic_rationale_items(self):
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Wait for confirmation."],
+            confidence=0.4,
+            rationale_items=[
+                RationaleItem(
+                    summary="Spread is acceptable.",
+                    why_it_matters="Execution quality is not blocking.",
+                    trade_implication="Stay flat until directional evidence improves.",
+                    failure_mode="Spread widens materially.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="spread_bps",
+                            symbol="ETHUSDT",
+                            timeframe="risk",
+                            operator="lte",
+                            observed_value=3.2,
+                            threshold=5.0,
+                            units="bps",
+                            source="market_snapshots.ETHUSDT.order_book.spread_bps",
+                        )
+                    ],
+                )
+            ],
+        )
+
+        row = self.store.conn.execute(
+            "SELECT rationale_json FROM journal ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertIn("Spread is acceptable.", row["rationale_json"])
 
     def test_retrieval_evaluations_round_trip(self):
         audit_id = self.store.save_audit(
@@ -509,6 +544,53 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[0]["id"], rejected_entry_id)
         self.assertEqual(rows[1]["id"], approved_trade_id)
         self.assertEqual(rows[2]["id"], hold_id)
+
+    def test_replay_candidates_exclude_system_error_and_validation_fallback_audits(self):
+        eligible_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.3},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "ok", "account_state": {}, "market_snapshot": {}},
+            execution_summary={"ai_usage": {"total_token_count": 120}},
+        )
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={
+                "decision": "HOLD",
+                "orders": [],
+                "confidence": 0.0,
+                "rationale": ["Fallback due to json validation error from AI."],
+                "risk_notes": ["System Error"],
+            },
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "bad-json", "account_state": {}, "market_snapshot": {}},
+            execution_summary={"ai_usage": {"validation_error": True, "model_name": "deepseek-reasoner"}},
+        )
+        self.store.save_audit(
+            account={},
+            market={},
+            intent={"decision": "HOLD", "rationale": ["Loop error during Adaptive (1h)."]},
+            risk_ok=False,
+            reason="Error in Adaptive (1h) cycle: boom",
+            receipts=[],
+            decision_request={"policy_summary": "loop-error", "account_state": {}, "market_snapshot": {}},
+            execution_summary={"loop_type": "Adaptive (1h)", "error": "boom"},
+        )
+
+        candidates = self.store.get_replay_candidates(limit=10)
+        batch_candidates = self.store.get_replay_batch_candidates(
+            since=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
+            limit=10,
+        )
+
+        self.assertEqual([item["id"] for item in candidates], [eligible_id])
+        self.assertEqual([item["id"] for item in batch_candidates], [eligible_id])
 
     def test_position_ledger_and_replay_runs_are_queryable(self):
         audit_id = self.store.save_audit(

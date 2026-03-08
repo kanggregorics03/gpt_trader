@@ -125,6 +125,59 @@ class MemoryUpdater:
             return fetcher(since)
         return []
 
+    def _filter_learning_eligible_journals(
+        self,
+        journals: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        eligible: List[Dict[str, Any]] = []
+        excluded: List[Dict[str, Any]] = []
+        for row in journals:
+            if StateStore.is_learning_eligible_audit_record(row):
+                eligible.append(row)
+            else:
+                excluded.append(row)
+        return eligible, excluded
+
+    def _filter_audit_linked_rows(
+        self,
+        rows: List[Dict[str, Any]] | None,
+        *,
+        audit_ids: set[int],
+        audit_key: str = "audit_log_id",
+    ) -> List[Dict[str, Any]]:
+        if not rows or not audit_ids:
+            return []
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            audit_id = int(row.get(audit_key) or 0)
+            if audit_id and audit_id in audit_ids:
+                filtered.append(row)
+        return filtered
+
+    def _filter_trade_cases_for_learning(
+        self,
+        trade_cases: List[Dict[str, Any]] | None,
+        *,
+        audit_ids: set[int],
+    ) -> List[Dict[str, Any]]:
+        if not trade_cases:
+            return []
+        if not audit_ids:
+            return []
+        filtered: List[Dict[str, Any]] = []
+        for row in trade_cases:
+            entry_audit_id = int(row.get("entry_audit_log_id") or 0)
+            exit_audit_id = int(row.get("exit_audit_log_id") or 0)
+            if entry_audit_id and entry_audit_id in audit_ids:
+                filtered.append(row)
+                continue
+            if exit_audit_id and exit_audit_id in audit_ids:
+                filtered.append(row)
+                continue
+            if not entry_audit_id and not exit_audit_id:
+                filtered.append(row)
+        return filtered
+
     def _build_stats_package(
         self,
         journals: List[Dict[str, Any]],
@@ -3054,6 +3107,20 @@ Computed statistics:
         if not journals:
             logger.info("No journals found in the selected window. Skipping.")
             return
+        journals, excluded_journals = self._filter_learning_eligible_journals(journals)
+        if excluded_journals:
+            logger.info(
+                "Excluding {} system-error journal(s) from memory/replay learning inputs.",
+                len(excluded_journals),
+            )
+        if not journals:
+            logger.info("No learning-eligible journals found in the selected window. Skipping.")
+            return
+        eligible_audit_ids = {
+            int(row.get("audit_log_id") or 0)
+            for row in journals
+            if int(row.get("audit_log_id") or 0) > 0
+        }
 
         symbol_journals = self._fetch_symbol_window_entries(window_hours=window_hours)
         trade_cases = self._fetch_trade_case_window_entries(window_hours=window_hours)
@@ -3061,6 +3128,18 @@ Computed statistics:
         replay_runs = self._fetch_replay_window_entries(window_hours=window_hours)
         execution_policy_evaluations = self._fetch_execution_policy_window_entries(window_hours=window_hours)
         shadow_decisions = self._fetch_shadow_decision_window_entries(window_hours=window_hours)
+        symbol_journals = self._filter_audit_linked_rows(symbol_journals, audit_ids=eligible_audit_ids)
+        trade_cases = self._filter_trade_cases_for_learning(trade_cases, audit_ids=eligible_audit_ids)
+        retrieval_evaluations = self._filter_audit_linked_rows(
+            retrieval_evaluations,
+            audit_ids=eligible_audit_ids,
+        )
+        replay_runs = self._filter_audit_linked_rows(replay_runs, audit_ids=eligible_audit_ids)
+        execution_policy_evaluations = self._filter_audit_linked_rows(
+            execution_policy_evaluations,
+            audit_ids=eligible_audit_ids,
+        )
+        shadow_decisions = self._filter_audit_linked_rows(shadow_decisions, audit_ids=eligible_audit_ids)
         stats_package = self._build_stats_package(
             journals,
             window_hours=window_hours,
@@ -3071,6 +3150,7 @@ Computed statistics:
             execution_policy_evaluations=execution_policy_evaluations,
             shadow_decisions=shadow_decisions,
         )
+        stats_package["excluded_system_error_journal_count"] = len(excluded_journals)
         logger.info(
             "Prepared stats for memory update: journals={}, symbol_rows={}, trade_cases={}, evaluated={}, win_rate={:.2f}%",
             stats_package["journal_count"],
