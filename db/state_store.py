@@ -245,14 +245,164 @@ class StateStore:
                     decision_changed BOOLEAN DEFAULT 0,
                     order_count_changed BOOLEAN DEFAULT 0,
                     side_changed BOOLEAN DEFAULT 0,
+                    order_type_changed BOOLEAN DEFAULT 0,
+                    execution_profile_changed BOOLEAN DEFAULT 0,
                     size_delta REAL DEFAULT 0,
                     confidence_delta REAL DEFAULT 0,
+                    simulated_fill_ratio REAL,
+                    simulated_slippage_bps REAL,
+                    simulated_latency_seconds REAL,
                     rationale_keywords_added JSON,
                     rationale_keywords_removed JSON,
                     evidence_signals_added JSON,
                     evidence_signals_removed JSON,
                     evidence_signal_count_delta INTEGER DEFAULT 0,
                     payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS execution_policy_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_log_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL,
+                    loop_mode TEXT,
+                    risk_mode TEXT,
+                    action_type TEXT,
+                    urgency_bucket TEXT,
+                    liquidity_bucket TEXT,
+                    decision TEXT,
+                    order_action TEXT,
+                    order_type TEXT,
+                    execution_profile TEXT,
+                    reduce_only BOOLEAN DEFAULT 0,
+                    trigger_mode BOOLEAN DEFAULT 0,
+                    spread_bps REAL,
+                    spread_percentile_1h REAL,
+                    depth_percentile_1h REAL,
+                    reference_price REAL,
+                    order_price REAL,
+                    average_fill_price REAL,
+                    requested_quantity REAL,
+                    filled_quantity REAL,
+                    fill_ratio REAL,
+                    slippage_bps REAL,
+                    latency_seconds REAL,
+                    status TEXT,
+                    outcome_trade_case_id TEXT,
+                    outcome_estimated_pnl_pct REAL,
+                    outcome_realized_pnl REAL,
+                    payload JSON
+                );
+
+                CREATE TABLE IF NOT EXISTS execution_policy_profiles (
+                    context_key TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    loop_mode TEXT,
+                    risk_mode TEXT,
+                    action_type TEXT,
+                    urgency_bucket TEXT,
+                    liquidity_bucket TEXT,
+                    recommended_order_type TEXT,
+                    recommended_execution_profile TEXT,
+                    metrics JSON,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_registry (
+                    policy_key TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    policy_type TEXT NOT NULL,
+                    regime_key TEXT,
+                    active_candidate_policy_id INTEGER,
+                    version INTEGER DEFAULT 1,
+                    config JSON,
+                    metrics JSON,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_policy_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL,
+                    policy_type TEXT NOT NULL,
+                    regime_key TEXT,
+                    policy_name TEXT,
+                    source TEXT,
+                    status TEXT DEFAULT 'candidate',
+                    rule_text TEXT,
+                    config JSON,
+                    metrics JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    evaluated_at DATETIME,
+                    promoted_at DATETIME,
+                    retired_at DATETIME
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candidate_policy_id INTEGER NOT NULL,
+                    evaluation_scope TEXT NOT NULL,
+                    sample_count INTEGER DEFAULT 0,
+                    score REAL DEFAULT 0,
+                    metrics JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_promotions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL,
+                    regime_key TEXT,
+                    previous_candidate_policy_id INTEGER,
+                    new_candidate_policy_id INTEGER NOT NULL,
+                    reason TEXT,
+                    metrics JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_bundles (
+                    bundle_key TEXT PRIMARY KEY,
+                    regime_key TEXT,
+                    status TEXT DEFAULT 'candidate',
+                    alpha_policy_key TEXT,
+                    position_policy_key TEXT,
+                    safety_policy_key TEXT,
+                    execution_policy_key TEXT,
+                    metrics JSON,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS bundle_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bundle_key TEXT NOT NULL,
+                    evaluation_scope TEXT NOT NULL,
+                    sample_count INTEGER DEFAULT 0,
+                    score REAL DEFAULT 0,
+                    metrics JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS bundle_promotions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    regime_key TEXT,
+                    previous_bundle_key TEXT,
+                    new_bundle_key TEXT NOT NULL,
+                    reason TEXT,
+                    metrics JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS shadow_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_log_id INTEGER NOT NULL,
+                    candidate_policy_id INTEGER NOT NULL,
+                    domain TEXT NOT NULL,
+                    symbol TEXT,
+                    loop_mode TEXT,
+                    trade_case_id TEXT,
+                    divergence_type TEXT,
+                    outcome_status TEXT,
+                    outcome_estimated_pnl_pct REAL,
+                    payload JSON,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS order_state_transitions (
@@ -262,6 +412,10 @@ class StateStore:
                     symbol TEXT,
                     client_order_id TEXT,
                     exchange_order_id TEXT,
+                    replace_group_id TEXT,
+                    lineage_role TEXT,
+                    lineage_parent_order_id TEXT,
+                    lineage_parent_client_order_id TEXT,
                     from_state TEXT,
                     to_state TEXT,
                     event_type TEXT,
@@ -326,6 +480,10 @@ class StateStore:
                     client_order_id TEXT,
                     exchange_order_id TEXT,
                     symbol TEXT,
+                    replace_group_id TEXT,
+                    lineage_role TEXT,
+                    lineage_parent_order_id TEXT,
+                    lineage_parent_client_order_id TEXT,
                     state TEXT NOT NULL,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     last_audit_log_id INTEGER,
@@ -374,6 +532,33 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_retrieval_evaluations_trade_case
                 ON retrieval_evaluations(trade_case_id, created_at, id);
 
+                CREATE INDEX IF NOT EXISTS idx_execution_policy_eval_context
+                ON execution_policy_evaluations(symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, id);
+
+                CREATE INDEX IF NOT EXISTS idx_execution_policy_profiles_lookup
+                ON execution_policy_profiles(symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_policy_domain_status
+                ON candidate_policy_versions(domain, status, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_policy_registry_domain_regime
+                ON policy_registry(domain, regime_key, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_policy_domain_regime_status
+                ON candidate_policy_versions(domain, regime_key, status, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_policy_evaluations_candidate
+                ON policy_evaluations(candidate_policy_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_shadow_decisions_candidate
+                ON shadow_decisions(candidate_policy_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_policy_bundles_regime_status
+                ON policy_bundles(regime_key, status, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_bundle_evaluations_bundle
+                ON bundle_evaluations(bundle_key, created_at);
+
                 CREATE INDEX IF NOT EXISTS idx_decision_fingerprint_lookup
                 ON decision_fingerprints(symbol, action, size_band, id);
 
@@ -388,6 +573,7 @@ class StateStore:
         self._ensure_column("audit_logs", "ai_raw_response", "TEXT")
         self._ensure_column("audit_logs", "execution_summary", "JSON")
         self._ensure_column("audit_logs", "market_vectors", "JSON")
+        self._ensure_column("policy_bundles", "safety_policy_key", "TEXT")
         self._ensure_column("journal", "audit_log_id", "INTEGER")
         self._ensure_column("journal", "rationale_json", "JSON")
         self._ensure_column("journal", "risk_reason", "TEXT")
@@ -420,11 +606,16 @@ class StateStore:
         self._ensure_column("trade_cases", "slippage_cost", "REAL")
         self._ensure_column("trade_cases", "slippage_bps", "REAL")
         self._ensure_column("trade_cases", "thesis_failure_reason", "TEXT")
+        self._ensure_column("trade_cases", "thesis_id", "TEXT")
+        self._ensure_column("trade_cases", "management_template_id", "TEXT")
+        self._ensure_column("trade_cases", "exit_reason", "TEXT")
         self._ensure_column("trade_cases", "evidence_signals", "JSON")
         self._ensure_column("trade_cases", "trigger_reasons", "JSON")
         self._ensure_column("trade_cases", "risk_trigger_reasons", "JSON")
         self._ensure_column("trade_cases", "feature_vector", "JSON")
         self._ensure_column("trade_cases", "payload", "JSON")
+        self._ensure_column("active_trade_cases", "thesis_id", "TEXT")
+        self._ensure_column("active_trade_cases", "management_template_id", "TEXT")
         self._ensure_column("trade_case_vector_index", "status", "TEXT")
         self._ensure_column("trade_case_vector_index", "risk_mode", "TEXT")
         self._ensure_column("trade_case_vector_index", "opened_at", "DATETIME")
@@ -446,12 +637,28 @@ class StateStore:
         self._ensure_column("retrieval_evaluations", "outcome_slippage_bps", "REAL")
         self._ensure_column("retrieval_evaluations", "outcome_updated_at", "DATETIME")
         self._ensure_column("replay_runs", "side_changed", "BOOLEAN DEFAULT 0")
+        self._ensure_column("replay_runs", "order_type_changed", "BOOLEAN DEFAULT 0")
+        self._ensure_column("replay_runs", "execution_profile_changed", "BOOLEAN DEFAULT 0")
         self._ensure_column("replay_runs", "size_delta", "REAL DEFAULT 0")
+        self._ensure_column("replay_runs", "simulated_fill_ratio", "REAL")
+        self._ensure_column("replay_runs", "simulated_slippage_bps", "REAL")
+        self._ensure_column("replay_runs", "simulated_latency_seconds", "REAL")
         self._ensure_column("replay_runs", "rationale_keywords_added", "JSON")
         self._ensure_column("replay_runs", "rationale_keywords_removed", "JSON")
         self._ensure_column("replay_runs", "evidence_signals_added", "JSON")
         self._ensure_column("replay_runs", "evidence_signals_removed", "JSON")
         self._ensure_column("replay_runs", "evidence_signal_count_delta", "INTEGER DEFAULT 0")
+        self._ensure_column("policy_registry", "regime_key", "TEXT")
+        self._ensure_column("candidate_policy_versions", "regime_key", "TEXT")
+        self._ensure_column("policy_promotions", "regime_key", "TEXT")
+        self._ensure_column("order_state_transitions", "replace_group_id", "TEXT")
+        self._ensure_column("order_state_transitions", "lineage_role", "TEXT")
+        self._ensure_column("order_state_transitions", "lineage_parent_order_id", "TEXT")
+        self._ensure_column("order_state_transitions", "lineage_parent_client_order_id", "TEXT")
+        self._ensure_column("order_runtime_state", "replace_group_id", "TEXT")
+        self._ensure_column("order_runtime_state", "lineage_role", "TEXT")
+        self._ensure_column("order_runtime_state", "lineage_parent_order_id", "TEXT")
+        self._ensure_column("order_runtime_state", "lineage_parent_client_order_id", "TEXT")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str):
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
@@ -905,8 +1112,13 @@ class StateStore:
                 decision_changed,
                 order_count_changed,
                 side_changed,
+                order_type_changed,
+                execution_profile_changed,
                 size_delta,
                 confidence_delta,
+                simulated_fill_ratio,
+                simulated_slippage_bps,
+                simulated_latency_seconds,
                 rationale_keywords_added,
                 rationale_keywords_removed,
                 evidence_signals_added,
@@ -1209,6 +1421,8 @@ class StateStore:
                 trade_case_id,
                 opened_at,
                 entry_decision,
+                thesis_id,
+                management_template_id,
                 last_decision,
                 last_audit_log_id,
                 payload
@@ -1232,6 +1446,8 @@ class StateStore:
                 trade_case_id,
                 opened_at,
                 entry_decision,
+                thesis_id,
+                management_template_id,
                 last_decision,
                 last_audit_log_id,
                 payload
@@ -1252,6 +1468,8 @@ class StateStore:
         trade_case_id: str,
         opened_at: Optional[str],
         entry_decision: Optional[str] = None,
+        thesis_id: Optional[str] = None,
+        management_template_id: Optional[str] = None,
         last_decision: Optional[str] = None,
         last_audit_log_id: Optional[int] = None,
         payload: Optional[Dict[str, Any]] = None,
@@ -1267,14 +1485,18 @@ class StateStore:
                         trade_case_id,
                         opened_at,
                         entry_decision,
+                        thesis_id,
+                        management_template_id,
                         last_decision,
                         last_audit_log_id,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol) DO UPDATE SET
                         trade_case_id = excluded.trade_case_id,
                         opened_at = excluded.opened_at,
                         entry_decision = excluded.entry_decision,
+                        thesis_id = excluded.thesis_id,
+                        management_template_id = excluded.management_template_id,
                         last_decision = excluded.last_decision,
                         last_audit_log_id = excluded.last_audit_log_id,
                         payload = excluded.payload
@@ -1284,6 +1506,8 @@ class StateStore:
                         trade_case_id,
                         opened_at,
                         entry_decision,
+                        thesis_id,
+                        management_template_id,
                         last_decision,
                         last_audit_log_id,
                         json.dumps(payload or {}),
@@ -1353,12 +1577,15 @@ class StateStore:
                         slippage_cost,
                         slippage_bps,
                         thesis_failure_reason,
+                        thesis_id,
+                        management_template_id,
+                        exit_reason,
                         evidence_signals,
                         trigger_reasons,
                         risk_trigger_reasons,
                         feature_vector,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(trade_case_id) DO UPDATE SET
                         symbol = excluded.symbol,
                         status = excluded.status,
@@ -1381,6 +1608,9 @@ class StateStore:
                         slippage_cost = excluded.slippage_cost,
                         slippage_bps = excluded.slippage_bps,
                         thesis_failure_reason = excluded.thesis_failure_reason,
+                        thesis_id = excluded.thesis_id,
+                        management_template_id = excluded.management_template_id,
+                        exit_reason = excluded.exit_reason,
                         evidence_signals = excluded.evidence_signals,
                         trigger_reasons = excluded.trigger_reasons,
                         risk_trigger_reasons = excluded.risk_trigger_reasons,
@@ -1410,6 +1640,9 @@ class StateStore:
                         record.get("slippage_cost"),
                         record.get("slippage_bps"),
                         record.get("thesis_failure_reason"),
+                        record.get("thesis_id"),
+                        record.get("management_template_id"),
+                        record.get("exit_reason"),
                         json.dumps(record.get("evidence_signals") or []),
                         json.dumps(record.get("trigger_reasons") or []),
                         json.dumps(record.get("risk_trigger_reasons") or []),
@@ -1557,6 +1790,80 @@ class StateStore:
             params.append(limit)
         cursor = self.conn.execute(query, params)
         return [self._decode_trade_case_row(dict(row)) for row in cursor.fetchall()]
+
+    def get_recent_closed_trade_case_for_symbol(
+        self,
+        symbol: str,
+        close_cooldown_minutes: int = 0,
+        loss_cooldown_minutes: int = 0,
+        loss_threshold_pct: float = 0.0,
+        require_no_active_case: bool = False,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return {}
+        if require_no_active_case and self.get_active_trade_case(symbol):
+            return {}
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM trade_cases
+            WHERE symbol = ?
+              AND status = 'closed'
+              AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC, trade_case_id DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return {}
+        item = self._decode_trade_case_row(dict(row))
+        closed_at_text = str(item.get("closed_at") or "").strip()
+        if not closed_at_text:
+            return {}
+        try:
+            closed_at = datetime.strptime(closed_at_text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return {}
+        now = now or self._utcnow()
+        elapsed_minutes = max(0.0, (now - closed_at).total_seconds() / 60.0)
+        estimated_pnl_pct = item.get("estimated_pnl_pct")
+        try:
+            estimated_pnl_pct = float(estimated_pnl_pct) if estimated_pnl_pct is not None else None
+        except (TypeError, ValueError):
+            estimated_pnl_pct = None
+
+        active = False
+        reason = ""
+        remaining_minutes = 0
+        if (
+            loss_cooldown_minutes > 0
+            and estimated_pnl_pct is not None
+            and estimated_pnl_pct <= float(loss_threshold_pct)
+            and elapsed_minutes < float(loss_cooldown_minutes)
+        ):
+            active = True
+            reason = "recent_symbol_loss_guard"
+            remaining_minutes = max(0, int(round(float(loss_cooldown_minutes) - elapsed_minutes)))
+        elif close_cooldown_minutes > 0 and elapsed_minutes < float(close_cooldown_minutes):
+            active = True
+            reason = "recent_symbol_close_guard"
+            remaining_minutes = max(0, int(round(float(close_cooldown_minutes) - elapsed_minutes)))
+
+        return {
+            "active": active,
+            "reason": reason,
+            "remaining_minutes": remaining_minutes,
+            "trade_case_id": item.get("trade_case_id"),
+            "symbol": symbol,
+            "closed_at": closed_at_text,
+            "estimated_pnl_pct": estimated_pnl_pct,
+            "exit_reason": item.get("exit_reason"),
+            "elapsed_minutes": round(elapsed_minutes, 2),
+        }
 
     def get_trade_case_vector_candidates(
         self,
@@ -1770,15 +2077,20 @@ class StateStore:
                         decision_changed,
                         order_count_changed,
                         side_changed,
+                        order_type_changed,
+                        execution_profile_changed,
                         size_delta,
                         confidence_delta,
+                        simulated_fill_ratio,
+                        simulated_slippage_bps,
+                        simulated_latency_seconds,
                         rationale_keywords_added,
                         rationale_keywords_removed,
                         evidence_signals_added,
                         evidence_signals_removed,
                         evidence_signal_count_delta,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         audit_log_id,
@@ -1787,8 +2099,13 @@ class StateStore:
                         int(bool(comparison.get("decision_changed"))),
                         int(bool(comparison.get("order_count_changed"))),
                         int(bool(comparison.get("side_changed"))),
+                        int(bool(comparison.get("order_type_changed"))),
+                        int(bool(comparison.get("execution_profile_changed"))),
                         float(comparison.get("size_delta") or 0.0),
                         float(comparison.get("confidence_delta") or 0.0),
+                        payload.get("simulated_fill_ratio"),
+                        payload.get("simulated_slippage_bps"),
+                        payload.get("simulated_latency_seconds"),
                         json.dumps(comparison.get("rationale_keywords_added") or []),
                         json.dumps(comparison.get("rationale_keywords_removed") or []),
                         json.dumps(comparison.get("evidence_signals_added") or []),
@@ -1799,6 +2116,806 @@ class StateStore:
                 )
         except Exception as e:
             logger.error(f"Failed to save replay run: {e}")
+
+    def _build_execution_policy_context_key(
+        self,
+        symbol: str,
+        loop_mode: str,
+        action_type: str,
+        urgency_bucket: str,
+        liquidity_bucket: str,
+        risk_mode: str,
+    ) -> str:
+        return "|".join(
+            [
+                str(symbol or "*").strip() or "*",
+                str(loop_mode or "").strip() or "unknown",
+                str(action_type or "").strip() or "unknown",
+                str(urgency_bucket or "").strip() or "unknown",
+                str(liquidity_bucket or "").strip() or "unknown",
+                str(risk_mode or "").strip() or "unknown",
+            ]
+        )
+
+    def save_execution_policy_evaluations(self, audit_log_id: int, entries: List[Dict[str, Any]]):
+        if not audit_log_id or not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO execution_policy_evaluations (
+                        audit_log_id,
+                        symbol,
+                        loop_mode,
+                        risk_mode,
+                        action_type,
+                        urgency_bucket,
+                        liquidity_bucket,
+                        decision,
+                        order_action,
+                        order_type,
+                        execution_profile,
+                        reduce_only,
+                        trigger_mode,
+                        spread_bps,
+                        spread_percentile_1h,
+                        depth_percentile_1h,
+                        reference_price,
+                        order_price,
+                        average_fill_price,
+                        requested_quantity,
+                        filled_quantity,
+                        fill_ratio,
+                        slippage_bps,
+                        latency_seconds,
+                        status,
+                        outcome_trade_case_id,
+                        outcome_estimated_pnl_pct,
+                        outcome_realized_pnl,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            audit_log_id,
+                            entry.get("symbol"),
+                            entry.get("loop_mode"),
+                            entry.get("risk_mode"),
+                            entry.get("action_type"),
+                            entry.get("urgency_bucket"),
+                            entry.get("liquidity_bucket"),
+                            entry.get("decision"),
+                            entry.get("order_action"),
+                            entry.get("order_type"),
+                            entry.get("execution_profile"),
+                            int(bool(entry.get("reduce_only"))),
+                            int(bool(entry.get("trigger_mode"))),
+                            entry.get("spread_bps"),
+                            entry.get("spread_percentile_1h"),
+                            entry.get("depth_percentile_1h"),
+                            entry.get("reference_price"),
+                            entry.get("order_price"),
+                            entry.get("average_fill_price"),
+                            entry.get("requested_quantity"),
+                            entry.get("filled_quantity"),
+                            entry.get("fill_ratio"),
+                            entry.get("slippage_bps"),
+                            entry.get("latency_seconds"),
+                            entry.get("status"),
+                            entry.get("outcome_trade_case_id"),
+                            entry.get("outcome_estimated_pnl_pct"),
+                            entry.get("outcome_realized_pnl"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                        if entry.get("symbol")
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save execution policy evaluations: {e}")
+
+    def get_execution_policy_evaluations_since(self, since: datetime) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM execution_policy_evaluations
+            WHERE created_at >= ?
+            ORDER BY id ASC
+            """,
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def upsert_execution_policy_profile(self, record: Dict[str, Any]):
+        symbol = str(record.get("symbol") or "*").strip() or "*"
+        loop_mode = str(record.get("loop_mode") or "unknown").strip() or "unknown"
+        action_type = str(record.get("action_type") or "unknown").strip() or "unknown"
+        urgency_bucket = str(record.get("urgency_bucket") or "unknown").strip() or "unknown"
+        liquidity_bucket = str(record.get("liquidity_bucket") or "unknown").strip() or "unknown"
+        risk_mode = str(record.get("risk_mode") or "unknown").strip() or "unknown"
+        context_key = self._build_execution_policy_context_key(
+            symbol=symbol,
+            loop_mode=loop_mode,
+            action_type=action_type,
+            urgency_bucket=urgency_bucket,
+            liquidity_bucket=liquidity_bucket,
+            risk_mode=risk_mode,
+        )
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO execution_policy_profiles (
+                        context_key,
+                        symbol,
+                        loop_mode,
+                        risk_mode,
+                        action_type,
+                        urgency_bucket,
+                        liquidity_bucket,
+                        recommended_order_type,
+                        recommended_execution_profile,
+                        metrics,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(context_key) DO UPDATE SET
+                        symbol = excluded.symbol,
+                        loop_mode = excluded.loop_mode,
+                        risk_mode = excluded.risk_mode,
+                        action_type = excluded.action_type,
+                        urgency_bucket = excluded.urgency_bucket,
+                        liquidity_bucket = excluded.liquidity_bucket,
+                        recommended_order_type = excluded.recommended_order_type,
+                        recommended_execution_profile = excluded.recommended_execution_profile,
+                        metrics = excluded.metrics,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        context_key,
+                        symbol,
+                        loop_mode,
+                        risk_mode,
+                        action_type,
+                        urgency_bucket,
+                        liquidity_bucket,
+                        record.get("recommended_order_type"),
+                        record.get("recommended_execution_profile"),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to upsert execution policy profile: {e}")
+
+    def save_execution_policy_profiles(self, entries: List[Dict[str, Any]]):
+        for entry in entries or []:
+            self.upsert_execution_policy_profile(entry)
+
+    def get_execution_policy_profile(
+        self,
+        symbol: str,
+        loop_mode: str,
+        action_type: str,
+        urgency_bucket: str,
+        liquidity_bucket: str,
+        risk_mode: str,
+    ) -> Dict[str, Any]:
+        context_key = self._build_execution_policy_context_key(
+            symbol=symbol,
+            loop_mode=loop_mode,
+            action_type=action_type,
+            urgency_bucket=urgency_bucket,
+            liquidity_bucket=liquidity_bucket,
+            risk_mode=risk_mode,
+        )
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM execution_policy_profiles
+            WHERE context_key = ?
+            LIMIT 1
+            """,
+            (context_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+        return item
+
+    def get_recent_execution_policy_profiles(self, limit: int = 50) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM execution_policy_profiles
+            ORDER BY updated_at DESC, context_key DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def save_candidate_policy_version(self, record: Dict[str, Any]) -> Optional[int]:
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO candidate_policy_versions (
+                        domain,
+                        policy_type,
+                        regime_key,
+                        policy_name,
+                        source,
+                        status,
+                        rule_text,
+                        config,
+                        metrics,
+                        evaluated_at,
+                        promoted_at,
+                        retired_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.get("domain"),
+                        record.get("policy_type"),
+                        record.get("regime_key"),
+                        record.get("policy_name"),
+                        record.get("source"),
+                        record.get("status") or "candidate",
+                        record.get("rule_text"),
+                        json.dumps(record.get("config") or {}),
+                        json.dumps(record.get("metrics") or {}),
+                        record.get("evaluated_at"),
+                        record.get("promoted_at"),
+                        record.get("retired_at"),
+                    ),
+                )
+                return int(cursor.lastrowid)
+        except Exception as e:
+            logger.error(f"Failed to save candidate policy version: {e}")
+            return None
+
+    def get_candidate_policy_versions(
+        self,
+        domain: Optional[str] = None,
+        regime_key: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM candidate_policy_versions"
+        clauses = []
+        params: List[Any] = []
+        if domain:
+            clauses.append("domain = ?")
+            params.append(domain)
+        if regime_key is not None:
+            if str(regime_key).strip():
+                clauses.append("COALESCE(regime_key, '') = ?")
+                params.append(str(regime_key).strip())
+            else:
+                clauses.append("(regime_key IS NULL OR regime_key = '')")
+        clean_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if clean_statuses:
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["config"] = self._safe_json_loads(item.get("config"), default={})
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def save_policy_evaluation(self, record: Dict[str, Any]) -> Optional[int]:
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO policy_evaluations (
+                        candidate_policy_id,
+                        evaluation_scope,
+                        sample_count,
+                        score,
+                        metrics
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.get("candidate_policy_id"),
+                        record.get("evaluation_scope"),
+                        record.get("sample_count", 0),
+                        record.get("score", 0.0),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        UPDATE candidate_policy_versions
+                        SET evaluated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (record.get("candidate_policy_id"),),
+                    )
+                return int(cursor.lastrowid)
+        except Exception as e:
+            logger.error(f"Failed to save policy evaluation: {e}")
+            return None
+
+    def get_policy_evaluations(self, candidate_policy_id: int) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM policy_evaluations
+            WHERE candidate_policy_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (candidate_policy_id,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def upsert_policy_registry(self, record: Dict[str, Any]):
+        policy_key = str(record.get("policy_key") or "").strip()
+        if not policy_key:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO policy_registry (
+                        policy_key,
+                        domain,
+                        policy_type,
+                        regime_key,
+                        active_candidate_policy_id,
+                        version,
+                        config,
+                        metrics,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(policy_key) DO UPDATE SET
+                        domain = excluded.domain,
+                        policy_type = excluded.policy_type,
+                        regime_key = excluded.regime_key,
+                        active_candidate_policy_id = excluded.active_candidate_policy_id,
+                        version = excluded.version,
+                        config = excluded.config,
+                        metrics = excluded.metrics,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        policy_key,
+                        record.get("domain"),
+                        record.get("policy_type"),
+                        record.get("regime_key"),
+                        record.get("active_candidate_policy_id"),
+                        record.get("version", 1),
+                        json.dumps(record.get("config") or {}),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to upsert policy registry: {e}")
+
+    def get_policy_registry_entry(self, policy_key: str) -> Dict[str, Any]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM policy_registry
+            WHERE policy_key = ?
+            LIMIT 1
+            """,
+            (policy_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["config"] = self._safe_json_loads(item.get("config"), default={})
+        item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+        return item
+
+    def build_policy_key(self, domain: str, regime_key: Optional[str] = None) -> str:
+        domain_text = str(domain or "").strip()
+        regime_text = str(regime_key or "").strip()
+        if regime_text:
+            return f"champion:{domain_text}:{regime_text}"
+        return f"champion:{domain_text}"
+
+    def get_policy_registry_entry_for_regime(self, domain: str, regime_key: Optional[str] = None) -> Dict[str, Any]:
+        regime_text = str(regime_key or "").strip()
+        if regime_text:
+            scoped = self.get_policy_registry_entry(self.build_policy_key(domain, regime_text))
+            if scoped:
+                return scoped
+        return self.get_policy_registry_entry(self.build_policy_key(domain))
+
+    def list_policy_registry(self, domain: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM policy_registry"
+        params: List[Any] = []
+        if domain:
+            query += " WHERE domain = ?"
+            params.append(domain)
+        query += " ORDER BY updated_at DESC, policy_key DESC"
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["config"] = self._safe_json_loads(item.get("config"), default={})
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def save_policy_promotion(self, record: Dict[str, Any]):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO policy_promotions (
+                        domain,
+                        regime_key,
+                        previous_candidate_policy_id,
+                        new_candidate_policy_id,
+                        reason,
+                        metrics
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.get("domain"),
+                        record.get("regime_key"),
+                        record.get("previous_candidate_policy_id"),
+                        record.get("new_candidate_policy_id"),
+                        record.get("reason"),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE candidate_policy_versions
+                    SET status = 'promoted', promoted_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (record.get("new_candidate_policy_id"),),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save policy promotion: {e}")
+
+    def save_shadow_decisions(self, entries: List[Dict[str, Any]]):
+        if not entries:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO shadow_decisions (
+                        audit_log_id,
+                        candidate_policy_id,
+                        domain,
+                        symbol,
+                        loop_mode,
+                        trade_case_id,
+                        divergence_type,
+                        outcome_status,
+                        outcome_estimated_pnl_pct,
+                        payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            entry.get("audit_log_id"),
+                            entry.get("candidate_policy_id"),
+                            entry.get("domain"),
+                            entry.get("symbol"),
+                            entry.get("loop_mode"),
+                            entry.get("trade_case_id"),
+                            entry.get("divergence_type"),
+                            entry.get("outcome_status"),
+                            entry.get("outcome_estimated_pnl_pct"),
+                            json.dumps(entry.get("payload") or {}),
+                        )
+                        for entry in entries
+                        if entry.get("audit_log_id") and entry.get("candidate_policy_id")
+                    ],
+                )
+        except Exception as e:
+            logger.error(f"Failed to save shadow decisions: {e}")
+
+    def upsert_policy_bundle(self, record: Dict[str, Any]):
+        bundle_key = str(record.get("bundle_key") or "").strip()
+        if not bundle_key:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO policy_bundles (
+                        bundle_key,
+                        regime_key,
+                        status,
+                        alpha_policy_key,
+                        position_policy_key,
+                        safety_policy_key,
+                        execution_policy_key,
+                        metrics,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(bundle_key) DO UPDATE SET
+                        regime_key = excluded.regime_key,
+                        status = excluded.status,
+                        alpha_policy_key = excluded.alpha_policy_key,
+                        position_policy_key = excluded.position_policy_key,
+                        safety_policy_key = excluded.safety_policy_key,
+                        execution_policy_key = excluded.execution_policy_key,
+                        metrics = excluded.metrics,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        bundle_key,
+                        record.get("regime_key"),
+                        record.get("status") or "candidate",
+                        record.get("alpha_policy_key"),
+                        record.get("position_policy_key"),
+                        record.get("safety_policy_key"),
+                        record.get("execution_policy_key"),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to upsert policy bundle: {e}")
+
+    def get_policy_bundle(self, bundle_key: str) -> Dict[str, Any]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM policy_bundles
+            WHERE bundle_key = ?
+            LIMIT 1
+            """,
+            (bundle_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+        return item
+
+    def get_active_policy_bundle(self, regime_key: Optional[str] = None) -> Dict[str, Any]:
+        regime_text = str(regime_key or "").strip()
+        if regime_text:
+            cursor = self.conn.execute(
+                """
+                SELECT *
+                FROM policy_bundles
+                WHERE regime_key = ? AND status = 'active'
+                ORDER BY updated_at DESC, bundle_key DESC
+                LIMIT 1
+                """,
+                (regime_text,),
+            )
+            row = cursor.fetchone()
+            if row:
+                item = dict(row)
+                item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+                return item
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM policy_bundles
+            WHERE (regime_key IS NULL OR regime_key = '') AND status = 'active'
+            ORDER BY updated_at DESC, bundle_key DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        item = dict(row)
+        item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+        return item
+
+    def get_policy_bundles(
+        self,
+        regime_key: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM policy_bundles"
+        clauses = []
+        params: List[Any] = []
+        regime_text = str(regime_key or "").strip()
+        if regime_key is not None:
+            if regime_text:
+                clauses.append("COALESCE(regime_key, '') = ?")
+                params.append(regime_text)
+            else:
+                clauses.append("(regime_key IS NULL OR regime_key = '')")
+        clean_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if clean_statuses:
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC, bundle_key DESC LIMIT ?"
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def save_bundle_evaluation(self, record: Dict[str, Any]) -> Optional[int]:
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO bundle_evaluations (
+                        bundle_key,
+                        evaluation_scope,
+                        sample_count,
+                        score,
+                        metrics
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.get("bundle_key"),
+                        record.get("evaluation_scope"),
+                        record.get("sample_count", 0),
+                        record.get("score", 0.0),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+                return int(cursor.lastrowid)
+        except Exception as e:
+            logger.error(f"Failed to save bundle evaluation: {e}")
+            return None
+
+    def get_bundle_evaluations(self, bundle_key: str) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM bundle_evaluations
+            WHERE bundle_key = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (bundle_key,),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def save_bundle_promotion(self, record: Dict[str, Any]):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO bundle_promotions (
+                        regime_key,
+                        previous_bundle_key,
+                        new_bundle_key,
+                        reason,
+                        metrics
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.get("regime_key"),
+                        record.get("previous_bundle_key"),
+                        record.get("new_bundle_key"),
+                        record.get("reason"),
+                        json.dumps(record.get("metrics") or {}),
+                    ),
+                )
+                previous_bundle_key = str(record.get("previous_bundle_key") or "").strip()
+                if previous_bundle_key:
+                    self.conn.execute(
+                        """
+                        UPDATE policy_bundles
+                        SET status = 'shadow', updated_at = CURRENT_TIMESTAMP
+                        WHERE bundle_key = ?
+                        """,
+                        (previous_bundle_key,),
+                    )
+                self.conn.execute(
+                    """
+                    UPDATE policy_bundles
+                    SET status = 'active', updated_at = CURRENT_TIMESTAMP
+                    WHERE bundle_key = ?
+                    """,
+                    (record.get("new_bundle_key"),),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save bundle promotion: {e}")
+
+    def get_recent_bundle_promotions(self, regime_key: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM bundle_promotions"
+        params: List[Any] = []
+        regime_text = str(regime_key or "").strip()
+        if regime_key is not None:
+            if regime_text:
+                query += " WHERE COALESCE(regime_key, '') = ?"
+                params.append(regime_text)
+            else:
+                query += " WHERE (regime_key IS NULL OR regime_key = '')"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        cursor = self.conn.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["metrics"] = self._safe_json_loads(item.get("metrics"), default={})
+            rows.append(item)
+        return rows
+
+    def get_shadow_decisions_since(self, since: datetime) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT *
+            FROM shadow_decisions
+            WHERE created_at >= ?
+            ORDER BY id ASC
+            """,
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["payload"] = self._safe_json_loads(item.get("payload"), default={})
+            rows.append(item)
+        return rows
+
+    def update_shadow_decisions_for_trade_case(
+        self,
+        trade_case_id: str,
+        outcome_status: Optional[str] = None,
+        outcome_estimated_pnl_pct: Optional[float] = None,
+    ):
+        if not trade_case_id:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    UPDATE shadow_decisions
+                    SET
+                        outcome_status = COALESCE(?, outcome_status),
+                        outcome_estimated_pnl_pct = COALESCE(?, outcome_estimated_pnl_pct)
+                    WHERE trade_case_id = ?
+                    """,
+                    (
+                        outcome_status,
+                        outcome_estimated_pnl_pct,
+                        trade_case_id,
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Failed to update shadow decision outcomes: {e}")
 
     def save_order_state_transitions(self, audit_log_id: int, entries: List[Dict[str, Any]]):
         if not entries:
@@ -1840,17 +2957,25 @@ class StateStore:
                             symbol,
                             client_order_id,
                             exchange_order_id,
+                            replace_group_id,
+                            lineage_role,
+                            lineage_parent_order_id,
+                            lineage_parent_client_order_id,
                             from_state,
                             to_state,
                             event_type,
                             payload
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             audit_log_id,
                             entry.get("symbol"),
                             client_order_id,
                             exchange_order_id,
+                            entry.get("replace_group_id") or payload.get("replace_group_id"),
+                            entry.get("lineage_role") or payload.get("lineage_role"),
+                            entry.get("lineage_parent_order_id") or payload.get("lineage_parent_order_id"),
+                            entry.get("lineage_parent_client_order_id") or payload.get("lineage_parent_client_order_id"),
                             from_state,
                             to_state,
                             entry.get("event_type"),
@@ -1862,6 +2987,10 @@ class StateStore:
                         client_order_id=client_order_id,
                         exchange_order_id=exchange_order_id,
                         symbol=entry.get("symbol"),
+                        replace_group_id=entry.get("replace_group_id") or payload.get("replace_group_id"),
+                        lineage_role=entry.get("lineage_role") or payload.get("lineage_role"),
+                        lineage_parent_order_id=entry.get("lineage_parent_order_id") or payload.get("lineage_parent_order_id"),
+                        lineage_parent_client_order_id=entry.get("lineage_parent_client_order_id") or payload.get("lineage_parent_client_order_id"),
                         state=to_state,
                         audit_log_id=audit_log_id,
                         payload=payload,
@@ -2445,6 +3574,64 @@ class StateStore:
             rows.append(item)
         return rows
 
+    def get_replay_batch_candidates(
+        self,
+        *,
+        since: datetime,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            WITH latest_replay AS (
+                SELECT audit_log_id, MAX(created_at) AS latest_created_at
+                FROM replay_runs
+                GROUP BY audit_log_id
+            )
+            SELECT
+                audit.id,
+                audit.timestamp,
+                audit.intent,
+                audit.risk_approved,
+                audit.risk_reason,
+                audit.risk_mode,
+                audit.execution_summary,
+                audit.market_vectors,
+                replay.latest_created_at
+            FROM audit_logs AS audit
+            LEFT JOIN latest_replay AS replay
+                ON replay.audit_log_id = audit.id
+            WHERE audit.decision_request IS NOT NULL
+              AND audit.timestamp >= ?
+            ORDER BY audit.id DESC
+            """,
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+            item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+            item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
+            rows.append(item)
+
+        def sort_key(item: Dict[str, Any]) -> tuple[int, int, int, int]:
+            intent = item.get("intent") or {}
+            decision = str(intent.get("decision") or "HOLD").upper()
+            risk_ok = bool(item.get("risk_approved"))
+            has_replay = bool(item.get("latest_created_at"))
+            is_trade = int(decision in ("BUY", "SELL", "REDUCE", "EXIT"))
+            is_rejected_entry = int(not risk_ok and decision in ("BUY", "SELL"))
+            is_non_hold = int(decision != "HOLD")
+            return (
+                is_trade * 5 + is_rejected_entry * 4 + is_non_hold * 2 - int(has_replay) * 3,
+                int(item.get("id") or 0),
+                int(risk_ok),
+                0,
+            )
+
+        rows.sort(key=sort_key, reverse=True)
+        return rows[: max(1, int(limit or 40))]
+
     def get_recent_rag_candidates(self, limit: int = 500) -> List[Dict[str, Any]]:
         cursor = self.conn.execute(
             """
@@ -2695,8 +3882,13 @@ class StateStore:
                 decision_changed,
                 order_count_changed,
                 side_changed,
+                order_type_changed,
+                execution_profile_changed,
                 size_delta,
                 confidence_delta,
+                simulated_fill_ratio,
+                simulated_slippage_bps,
+                simulated_latency_seconds,
                 rationale_keywords_added,
                 rationale_keywords_removed,
                 evidence_signals_added,
@@ -2744,8 +3936,13 @@ class StateStore:
                 decision_changed,
                 order_count_changed,
                 side_changed,
+                order_type_changed,
+                execution_profile_changed,
                 size_delta,
                 confidence_delta,
+                simulated_fill_ratio,
+                simulated_slippage_bps,
+                simulated_latency_seconds,
                 rationale_keywords_added,
                 rationale_keywords_removed,
                 evidence_signals_added,
@@ -3282,7 +4479,9 @@ class StateStore:
         state = str(value or "unknown").strip().lower()
         aliases = {
             "none": "none",
+            "deferred": "deferred",
             "submitted": "submitted",
+            "cancel_requested": "cancel_requested",
             "partial": "partial_filled",
             "partial_filled": "partial_filled",
             "partially_filled": "partial_filled",
@@ -3302,10 +4501,12 @@ class StateStore:
         normalized_from = self._normalize_order_state(from_state)
         normalized_to = self._normalize_order_state(to_state)
         allowed = {
-            "none": {"submitted", "unknown"},
-            "submitted": {"submitted", "partial_filled", "completed", "cancelled", "failed", "unknown"},
-            "partial_filled": {"partial_filled", "completed", "cancelled", "failed", "unknown"},
-            "unknown": {"unknown", "submitted", "partial_filled", "completed", "cancelled", "failed"},
+            "none": {"deferred", "submitted", "unknown"},
+            "deferred": {"deferred", "submitted", "failed", "unknown"},
+            "cancel_requested": {"cancel_requested", "cancelled", "failed", "unknown"},
+            "submitted": {"submitted", "cancel_requested", "partial_filled", "completed", "cancelled", "failed", "unknown"},
+            "partial_filled": {"partial_filled", "cancel_requested", "completed", "cancelled", "failed", "unknown"},
+            "unknown": {"unknown", "submitted", "cancel_requested", "partial_filled", "completed", "cancelled", "failed"},
             "cancelled": {"cancelled"},
             "failed": {"failed"},
             "completed": {"completed"},
@@ -3318,6 +4519,10 @@ class StateStore:
         client_order_id: Optional[str],
         exchange_order_id: Optional[str],
         symbol: Optional[str],
+        replace_group_id: Optional[str],
+        lineage_role: Optional[str],
+        lineage_parent_order_id: Optional[str],
+        lineage_parent_client_order_id: Optional[str],
         state: str,
         audit_log_id: int,
         payload: Dict[str, Any],
@@ -3331,15 +4536,23 @@ class StateStore:
                 client_order_id,
                 exchange_order_id,
                 symbol,
+                replace_group_id,
+                lineage_role,
+                lineage_parent_order_id,
+                lineage_parent_client_order_id,
                 state,
                 updated_at,
                 last_audit_log_id,
                 payload
-            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
             ON CONFLICT(order_key) DO UPDATE SET
                 client_order_id = excluded.client_order_id,
                 exchange_order_id = excluded.exchange_order_id,
                 symbol = excluded.symbol,
+                replace_group_id = excluded.replace_group_id,
+                lineage_role = excluded.lineage_role,
+                lineage_parent_order_id = excluded.lineage_parent_order_id,
+                lineage_parent_client_order_id = excluded.lineage_parent_client_order_id,
                 state = excluded.state,
                 updated_at = CURRENT_TIMESTAMP,
                 last_audit_log_id = excluded.last_audit_log_id,
@@ -3350,6 +4563,10 @@ class StateStore:
                 client_order_id,
                 exchange_order_id,
                 symbol,
+                replace_group_id,
+                lineage_role,
+                lineage_parent_order_id,
+                lineage_parent_client_order_id,
                 self._normalize_order_state(state),
                 audit_log_id,
                 json.dumps(payload or {}),

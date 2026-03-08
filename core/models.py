@@ -132,6 +132,7 @@ class PositionState(BaseModel):
 
 class OpenOrderState(BaseModel):
     symbol: str
+    order_id: Optional[str] = None
     side: str = "UNKNOWN"
     order_type: str = "UNKNOWN"
     quantity: float = 0.0
@@ -150,8 +151,31 @@ class RiskStateSnapshot(BaseModel):
     drawdown_active: bool = False
     drawdown_activate_pct: Optional[float] = None
     consecutive_losses: int = 0
+    last_loss_estimated_pnl_pct: Optional[float] = None
+    cooldown_minutes_effective: int = 0
+    cooldown_components: List[str] = Field(default_factory=list)
     cooldown_active: bool = False
     cooldown_remaining_minutes: int = 0
+    failure_pattern_score: float = 0.0
+    dominant_failure_reason: Optional[str] = None
+    dominant_failure_count: int = 0
+    reentry_guard_active: bool = False
+    reentry_guard_symbol: Optional[str] = None
+    reentry_guard_reason: Optional[str] = None
+    reentry_guard_remaining_minutes: int = 0
+    reentry_guard_last_closed_at: Optional[str] = None
+    reentry_guard_last_estimated_pnl_pct: Optional[float] = None
+    reentry_guard_last_exit_reason: Optional[str] = None
+
+
+def coerce_risk_state_snapshot(risk_state: Any) -> RiskStateSnapshot:
+    if isinstance(risk_state, RiskStateSnapshot):
+        return risk_state
+    if hasattr(risk_state, "model_dump"):
+        return RiskStateSnapshot.model_validate(risk_state.model_dump(mode="json"))
+    if isinstance(risk_state, dict):
+        return RiskStateSnapshot.model_validate(risk_state)
+    return RiskStateSnapshot()
 
 class AccountState(BaseModel):
     snapshot_timestamp: Optional[int] = None
@@ -216,16 +240,71 @@ class DecisionRequest(BaseModel):
     is_trigger_mode: bool = False
     risk_mode: Literal["normal", "trigger", "cooldown", "drawdown"] = "normal"
     risk_profile: Dict[str, Any] = Field(default_factory=dict)
+    loop_mode: Literal["1h", "15m", "5m"] = "1h"
+    cycle_role: Optional[str] = None
 
 class OrderIntent(BaseModel):
     symbol: str = Field(description="Trading pair symbol (e.g., BTCUSDT)")
-    action: Literal["BUY", "SELL"] = Field(description="Order action")
+    action: Literal["BUY", "SELL", "CANCEL"] = Field(description="Order action")
     order_type: Literal["MARKET", "LIMIT"] = Field(description="Type of order")
-    quantity: float = Field(description="Order quantity")
+    quantity: float = Field(default=0.0, description="Order quantity")
     price: Optional[float] = Field(None, description="Limit price if LIMIT order, null for MARKET")
     reduce_only: bool = Field(False, description="Whether this order is only to reduce position")
     take_profit: Optional[float] = Field(None, description="Take profit price")
     stop_loss: Optional[float] = Field(None, description="Stop loss price")
+    target_order_id: Optional[str] = Field(
+        None,
+        description="Exchange order identifier to cancel when action is CANCEL.",
+    )
+    target_client_order_id: Optional[str] = Field(
+        None,
+        description="Client order identifier to cancel when action is CANCEL.",
+    )
+    replace_group_id: Optional[str] = Field(
+        None,
+        description="Stable lineage group id tying a cancel request to its replacement order.",
+    )
+    lineage_role: Optional[Literal["cancel", "replacement"]] = Field(
+        None,
+        description="Whether this order is the cancel leg or replacement leg of a replace-entry flow.",
+    )
+    lineage_parent_order_id: Optional[str] = Field(
+        None,
+        description="Original exchange order id this order is linked to for replacement lineage.",
+    )
+    lineage_parent_client_order_id: Optional[str] = Field(
+        None,
+        description="Original client order id this order is linked to for replacement lineage.",
+    )
+    wait_for_cancel_confirmation: bool = Field(
+        False,
+        description="Whether this order must not be submitted until its linked cancel request is confirmed.",
+    )
+    execution_profile: Optional[str] = Field(
+        None,
+        description="Execution profile chosen by the execution policy layer, e.g. market_urgent or limit_passive.",
+    )
+    urgency_score: Optional[float] = Field(
+        None,
+        description="Normalized urgency score from 0.0 to 1.0 used for execution policy selection.",
+    )
+    max_slippage_bps: Optional[float] = Field(
+        None,
+        description="Maximum adverse slippage budget in basis points for the execution policy.",
+    )
+    time_in_force: Optional[str] = Field(
+        None,
+        description="Exchange time-in-force hint for limit orders.",
+    )
+    post_only: bool = Field(False, description="Whether a limit order should avoid taking liquidity.")
+    limit_offset_bps: Optional[float] = Field(
+        None,
+        description="Offset in basis points from reference price used to construct a limit order.",
+    )
+    execution_context: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Compact execution-policy context persisted for later evaluation.",
+    )
 
 
 class EvidenceItem(BaseModel):
@@ -262,7 +341,7 @@ class RationaleItem(BaseModel):
 
 
 class TradeIntent(BaseModel):
-    decision: Literal["HOLD", "BUY", "SELL", "REDUCE", "EXIT"] = Field(description="Overall strategy decision")
+    decision: Literal["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"] = Field(description="Overall strategy decision")
     orders: List[OrderIntent] = Field(default_factory=list, description="List of proposed orders")
     rationale: List[str] = Field(description="Brief reasoning for the decision")
     rationale_items: List[RationaleItem] = Field(
@@ -271,3 +350,23 @@ class TradeIntent(BaseModel):
     )
     risk_notes: List[str] = Field(description="Any identified market or strategy risks")
     confidence: float = Field(description="AI confidence score 0.0 to 1.0", ge=0.0, le=1.0)
+    thesis_id: Optional[str] = Field(
+        None,
+        description="Stable identifier for the thesis that opened or managed the position.",
+    )
+    thesis_summary: Optional[str] = Field(
+        None,
+        description="Compact summary of the thesis behind the current trade lifecycle.",
+    )
+    invalidation_reason: Optional[str] = Field(
+        None,
+        description="Primary condition that invalidates the current thesis.",
+    )
+    management_template_id: Optional[str] = Field(
+        None,
+        description="Identifier for the management template assigned to this trade lifecycle.",
+    )
+    exit_reason: Optional[str] = Field(
+        None,
+        description="Structured exit reason when the intent is risk reducing or closing.",
+    )

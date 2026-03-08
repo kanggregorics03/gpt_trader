@@ -464,6 +464,7 @@ class BybitPrivateAccountFeed:
     def _normalize_order(self, item: Dict[str, Any]) -> OpenOrderState:
         return OpenOrderState(
             symbol=str(item.get("symbol") or "UNKNOWN"),
+            order_id=str(item.get("orderId") or "") or None,
             side=str(item.get("side") or "UNKNOWN").upper(),
             order_type=str(item.get("orderType") or item.get("type") or "UNKNOWN").upper(),
             quantity=self._safe_float(item.get("qty"), item.get("cumExecQty"), 0.0) or 0.0,

@@ -216,6 +216,7 @@ class AccountReader:
         info = order.get("info") or {}
         return OpenOrderState(
             symbol=order.get("symbol") or info.get("symbol") or "UNKNOWN",
+            order_id=order.get("id") or info.get("orderId"),
             side=str(order.get("side") or info.get("side") or "UNKNOWN").upper(),
             order_type=str(order.get("type") or info.get("orderType") or "UNKNOWN").upper(),
             quantity=float(order.get("amount") or info.get("qty") or 0.0),

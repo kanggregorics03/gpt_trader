@@ -9,7 +9,7 @@ from core.models import AccountState, MarketSnapshot, TradeIntent
 class RiskEngine:
     def __init__(self, config_path: str = "policy.yaml"):
         self.config_path = Path(config_path)
-        self.policy = self._load_policy()
+        self.policy = self._validate_policy(self._normalize_single_symbol_policy(self._load_policy()))
 
     def _load_policy(self) -> dict:
         try:
@@ -19,9 +19,101 @@ class RiskEngine:
             logger.error(f"Failed to load policy.yaml: {e}")
             raise
 
+    def _normalize_single_symbol_policy(self, raw_policy: Optional[dict]) -> dict:
+        policy = dict(raw_policy or {})
+        trading_policy = dict(policy.get("trading") or {})
+        configured_symbols = [
+            str(symbol).strip().upper()
+            for symbol in (trading_policy.get("symbols") or [])
+            if str(symbol).strip()
+        ]
+        if not configured_symbols:
+            configured_symbols = ["BTCUSDT"]
+        primary_symbol = configured_symbols[0]
+        if len(configured_symbols) > 1:
+            logger.warning(
+                "Single-symbol mode is active. Using {} and ignoring {} additional configured symbol(s).",
+                primary_symbol,
+                len(configured_symbols) - 1,
+            )
+        trading_policy["symbols"] = [primary_symbol]
+        policy["trading"] = trading_policy
+
+        risk_limits = dict(policy.get("risk_limits") or {})
+        risk_limits["max_open_positions"] = 1
+        mode_profiles = dict(risk_limits.get("mode_profiles") or {})
+        for mode_name, configured_profile in list(mode_profiles.items()):
+            profile = dict(configured_profile or {})
+            profile["max_open_positions"] = 1
+            mode_profiles[mode_name] = profile
+        risk_limits["mode_profiles"] = mode_profiles
+        policy["risk_limits"] = risk_limits
+        return policy
+
+    def _validate_policy(self, policy: dict) -> dict:
+        trading_policy = dict(policy.get("trading") or {})
+        configured_symbols = [str(symbol).strip().upper() for symbol in (trading_policy.get("symbols") or []) if str(symbol).strip()]
+        if len(configured_symbols) != 1:
+            raise ValueError("Single-symbol mode requires exactly one trading symbol in policy.yaml.")
+
+        risk_limits = dict(policy.get("risk_limits") or {})
+        if int(risk_limits.get("max_open_positions", 1) or 1) != 1:
+            raise ValueError("Single-symbol mode requires risk_limits.max_open_positions = 1.")
+        for mode_name, profile in ((risk_limits.get("mode_profiles") or {}) or {}).items():
+            if int((profile or {}).get("max_open_positions", 1) or 1) != 1:
+                raise ValueError(f"Single-symbol mode requires mode_profiles.{mode_name}.max_open_positions = 1.")
+
+        for section_name in ("position_policy", "safety_policy"):
+            section = dict(policy.get(section_name) or {})
+            if not section:
+                continue
+            spread_limit = section.get("stale_order_reprice_spread_percentile_max")
+            depth_floor = section.get("stale_order_reprice_depth_percentile_min")
+            limit_offset = section.get("stale_order_reprice_limit_offset_bps")
+            stale_minutes = section.get("stale_order_minutes")
+            if spread_limit is not None and not (0 <= float(spread_limit) <= 100):
+                raise ValueError(f"{section_name}.stale_order_reprice_spread_percentile_max must be between 0 and 100.")
+            if depth_floor is not None and not (0 <= float(depth_floor) <= 100):
+                raise ValueError(f"{section_name}.stale_order_reprice_depth_percentile_min must be between 0 and 100.")
+            if limit_offset is not None and float(limit_offset) < 0:
+                raise ValueError(f"{section_name}.stale_order_reprice_limit_offset_bps must be >= 0.")
+            if stale_minutes is not None and float(stale_minutes) <= 0:
+                raise ValueError(f"{section_name}.stale_order_minutes must be > 0.")
+
+        execution_guards = dict(policy.get("execution_guards") or {})
+        close_minutes = int(execution_guards.get("symbol_reentry_close_cooldown_minutes", 0) or 0)
+        loss_minutes = int(execution_guards.get("symbol_reentry_loss_cooldown_minutes", 0) or 0)
+        loss_threshold_pct = float(execution_guards.get("symbol_reentry_loss_threshold_pct", 0.0) or 0.0)
+        if close_minutes < 0 or loss_minutes < 0:
+            raise ValueError("symbol re-entry cooldown minutes must be >= 0.")
+        if loss_minutes and close_minutes and loss_minutes < close_minutes:
+            raise ValueError("symbol_reentry_loss_cooldown_minutes must be >= symbol_reentry_close_cooldown_minutes.")
+        if loss_threshold_pct > 0:
+            raise ValueError("symbol_reentry_loss_threshold_pct must be <= 0.0.")
+        return policy
+
     def get_summary(self) -> str:
         """Returns a string representation of the policy for Gemini context"""
         return yaml.dump(self.policy)
+
+    def get_trading_symbol(self) -> str:
+        trading_policy = self.policy.get("trading", {}) or {}
+        configured = trading_policy.get("symbols") or ["BTCUSDT"]
+        return str(configured[0]).strip().upper()
+
+    def get_trading_symbols(self) -> List[str]:
+        return [self.get_trading_symbol()]
+
+    def get_allowed_order_types(self) -> List[str]:
+        trading_policy = self.policy.get("trading", {}) or {}
+        execution_policy = self.policy.get("execution_policy", {}) or {}
+        configured = execution_policy.get("allowed_order_types")
+        if configured:
+            return [str(item).upper() for item in configured if str(item).strip()]
+        legacy = str(trading_policy.get("order_type") or "").strip().upper()
+        if legacy:
+            return [legacy]
+        return ["MARKET", "LIMIT"]
 
     def get_risk_profiles(self) -> Dict[str, Dict]:
         risk_limits = self.policy.get("risk_limits", {})
@@ -31,18 +123,18 @@ class RiskEngine:
             "normal": {
                 "max_open_positions": base_max_positions,
                 "max_order_notional_pct_balance": 100.0,
-                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
             },
             "trigger": {
                 "max_open_positions": max(1, min(base_max_positions, 1)),
                 "max_order_notional_pct_balance": 35.0,
-                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
                 "block_additional_entries_when_position_exists": True,
             },
             "cooldown": {
                 "max_open_positions": base_max_positions,
                 "max_order_notional_pct_balance": 0.0,
-                "allowed_actions": ["HOLD", "REDUCE", "EXIT"],
+                "allowed_actions": ["HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
             },
             "drawdown": {
                 "max_open_positions": max(1, min(base_max_positions, 1)),
@@ -51,14 +143,18 @@ class RiskEngine:
                 "confidence_cap": 0.55,
                 "failure_pattern_size_multiplier": 0.75,
                 "risk_trigger_size_multiplier": 0.85,
-                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
             },
         }
         profiles = {}
         for mode, default_profile in defaults.items():
             profile = dict(default_profile)
             profile.update(configured_profiles.get(mode, {}) or {})
-            profile["allowed_actions"] = [str(action).upper() for action in profile.get("allowed_actions", [])]
+            allowed_actions = [str(action).upper() for action in profile.get("allowed_actions", [])]
+            for management_action in ("CANCEL", "REPLACE_ENTRY"):
+                if management_action not in allowed_actions:
+                    allowed_actions.append(management_action)
+            profile["allowed_actions"] = allowed_actions
             profiles[mode] = profile
         return profiles
 
@@ -244,8 +340,12 @@ class RiskEngine:
             risk_state=risk_state,
             is_trigger_mode=is_trigger_mode,
         )
+        allowed_symbols = trading_policy.get('symbols', [])
+        is_cancel_decision = intent.decision == "CANCEL"
+        is_replace_entry_decision = intent.decision == "REPLACE_ENTRY"
         is_entry_decision = intent.decision in ("BUY", "SELL")
-        is_risk_reducing = intent.decision in ("REDUCE", "EXIT")
+        uses_entry_exposure = is_entry_decision or is_replace_entry_decision
+        is_risk_reducing = intent.decision in ("REDUCE", "EXIT", "CANCEL")
 
         def get_snapshot_for_symbol(symbol: str) -> Optional[MarketSnapshot]:
             if symbol in market_snapshots:
@@ -262,9 +362,106 @@ class RiskEngine:
                 return False
             return str(getattr(order, "side", "")).upper() in ("BUY", "SELL")
 
+        def is_cancelled_by_intent(open_order) -> bool:
+            symbol = str(getattr(open_order, "symbol", "") or "")
+            order_id = getattr(open_order, "order_id", None)
+            client_order_id = getattr(open_order, "client_order_id", None)
+            for cancel_order in cancel_orders:
+                if cancel_order.symbol != symbol:
+                    continue
+                if order_id and cancel_order.target_order_id and order_id == cancel_order.target_order_id:
+                    return True
+                if client_order_id and cancel_order.target_client_order_id and client_order_id == cancel_order.target_client_order_id:
+                    return True
+            return False
+
         allowed_actions = set(active_profile.get("allowed_actions", []))
         if allowed_actions and intent.decision not in allowed_actions:
             return False, f"Risk profile {active_mode} blocks action {intent.decision}."
+
+        cancel_orders = [order for order in intent.orders if order.action == "CANCEL"]
+        non_cancel_orders = [order for order in intent.orders if order.action != "CANCEL"]
+
+        if cancel_orders:
+            open_orders_by_symbol = {}
+            for open_order in account_state.open_orders:
+                open_orders_by_symbol.setdefault(str(getattr(open_order, "symbol", "") or ""), []).append(open_order)
+            for order in cancel_orders:
+                if order.symbol not in allowed_symbols:
+                    return False, f"Symbol {order.symbol} is not in approved policy list."
+                candidates = open_orders_by_symbol.get(order.symbol, [])
+                if not candidates:
+                    return False, f"No live open orders found for {order.symbol}."
+                matches_target = any(
+                    (
+                        getattr(candidate, "order_id", None)
+                        and getattr(candidate, "order_id", None) == order.target_order_id
+                    )
+                    or (
+                        getattr(candidate, "client_order_id", None)
+                        and getattr(candidate, "client_order_id", None) == order.target_client_order_id
+                    )
+                    for candidate in candidates
+                )
+                if not matches_target:
+                    return False, (
+                        f"Cancel target for {order.symbol} is not present in the live open-order set."
+                    )
+        if is_cancel_decision:
+            if not intent.orders:
+                return False, "Cancel action requires at least one target order."
+            if non_cancel_orders:
+                return False, "Cancel decision may only contain CANCEL orders."
+            return True, "Approved"
+
+        if is_replace_entry_decision:
+            if not cancel_orders or not non_cancel_orders:
+                return False, "REPLACE_ENTRY requires both a cancel leg and a replacement entry leg."
+            if len(cancel_orders) != len(non_cancel_orders):
+                return False, "REPLACE_ENTRY requires one replacement order per cancel leg."
+            open_orders_by_key = {}
+            for open_order in account_state.open_orders:
+                symbol = str(getattr(open_order, "symbol", "") or "")
+                order_id = getattr(open_order, "order_id", None)
+                client_order_id = getattr(open_order, "client_order_id", None)
+                if order_id:
+                    open_orders_by_key[("order_id", symbol, order_id)] = open_order
+                if client_order_id:
+                    open_orders_by_key[("client_order_id", symbol, client_order_id)] = open_order
+            for replacement_order in non_cancel_orders:
+                if replacement_order.reduce_only:
+                    return False, "REPLACE_ENTRY replacement orders must not be reduce_only."
+                if replacement_order.action not in ("BUY", "SELL"):
+                    return False, "REPLACE_ENTRY replacement orders must be BUY or SELL."
+                if replacement_order.symbol not in allowed_symbols:
+                    return False, f"Symbol {replacement_order.symbol} is not in approved policy list."
+                if replacement_order.wait_for_cancel_confirmation is not True:
+                    return False, "REPLACE_ENTRY replacement orders must wait for cancel confirmation."
+                matched_cancel = next(
+                    (
+                        order for order in cancel_orders
+                        if order.replace_group_id
+                        and order.replace_group_id == replacement_order.replace_group_id
+                    ),
+                    None,
+                )
+                if matched_cancel is None:
+                    return False, "REPLACE_ENTRY replacement order is missing its linked cancel leg."
+                target_open_order = None
+                if matched_cancel.target_order_id:
+                    target_open_order = open_orders_by_key.get(("order_id", matched_cancel.symbol, matched_cancel.target_order_id))
+                if target_open_order is None and matched_cancel.target_client_order_id:
+                    target_open_order = open_orders_by_key.get(("client_order_id", matched_cancel.symbol, matched_cancel.target_client_order_id))
+                if target_open_order is None:
+                    return False, "REPLACE_ENTRY target order is not present in the live open-order set."
+                target_side = str(getattr(target_open_order, "side", "") or "").upper()
+                target_quantity = abs(float(getattr(target_open_order, "quantity", 0.0) or 0.0))
+                if replacement_order.symbol != matched_cancel.symbol:
+                    return False, "REPLACE_ENTRY cancel and replacement legs must target the same symbol."
+                if replacement_order.action != target_side:
+                    return False, "REPLACE_ENTRY replacement side must match the cancelled entry order side."
+                if abs(float(replacement_order.quantity or 0.0)) > target_quantity + 1e-9:
+                    return False, "REPLACE_ENTRY replacement size must not exceed the cancelled order quantity."
 
         if is_entry_decision:
             block_additional_entries = bool(
@@ -316,16 +513,16 @@ class RiskEngine:
             int(self.policy.get('risk_limits', {}).get('max_open_positions', 2) or 2),
             int(active_profile.get("max_open_positions", self.policy.get('risk_limits', {}).get('max_open_positions', 2)) or 0),
         )
-        if is_entry_decision:
+        if uses_entry_exposure:
             new_symbols = {
                 order.symbol
-                for order in intent.orders
+                for order in non_cancel_orders
                 if not order.reduce_only
             }
             pending_symbols = {
                 order.symbol
                 for order in account_state.open_orders
-                if is_pending_entry_order(order)
+                if is_pending_entry_order(order) and not is_cancelled_by_intent(order)
             }
             existing_symbols = {
                 position.symbol
@@ -337,12 +534,13 @@ class RiskEngine:
                 return False, f"Risk limit exceeded: Cannot open more than {max_positions} positions."
 
         # 3. Leverage / Order Type verification
-        allowed_symbols = trading_policy.get('symbols', [])
-        policy_order_type = str(trading_policy.get("order_type", "market")).upper()
+        allowed_order_types = set(self.get_allowed_order_types())
         max_leverage = float(trading_policy.get("max_leverage", 0) or 0)
         risk_advisories: List[str] = []
 
         for order in intent.orders:
+            if order.action == "CANCEL":
+                continue
             symbol_market_snapshot = get_snapshot_for_symbol(order.symbol)
             risk_trigger_reasons = set(
                 symbol_market_snapshot.risk_trigger_reasons if symbol_market_snapshot else []
@@ -351,16 +549,16 @@ class RiskEngine:
             if order.symbol not in allowed_symbols:
                 return False, f"Symbol {order.symbol} is not in approved policy list."
 
-            if policy_order_type and order.order_type != policy_order_type:
+            if allowed_order_types and order.order_type not in allowed_order_types:
                 return False, (
                     f"Order type {order.order_type} is not allowed. "
-                    f"Policy requires {policy_order_type}."
+                    f"Policy allows {', '.join(sorted(allowed_order_types))}."
                 )
 
-            if is_risk_reducing and not order.reduce_only:
+            if is_risk_reducing and not is_entry_decision and not order.reduce_only:
                 return False, f"{intent.decision} orders must be marked reduce_only."
 
-            if is_entry_decision and "wide_spread" in risk_trigger_reasons:
+            if uses_entry_exposure and "wide_spread" in risk_trigger_reasons:
                 spread_bps = (
                     symbol_market_snapshot.order_book.spread_bps
                     if symbol_market_snapshot is not None
@@ -371,7 +569,7 @@ class RiskEngine:
                 else:
                     risk_advisories.append(f"{order.symbol}: wide_spread")
 
-            if is_entry_decision and symbol_market_snapshot is not None:
+            if uses_entry_exposure and symbol_market_snapshot is not None:
                 funding_rate = symbol_market_snapshot.derivatives.funding_rate
                 if "elevated_funding" in risk_trigger_reasons and funding_rate is not None:
                     unfavorable_long = funding_rate > 0 and order.action == "BUY"
@@ -381,18 +579,18 @@ class RiskEngine:
                             f"{order.symbol}: elevated_funding_unfavorable={float(funding_rate):.6f}"
                         )
 
-        if is_entry_decision and max_leverage > 0:
+        if uses_entry_exposure and max_leverage > 0:
             current_exposure = sum(abs(pos.size) * pos.entry_price for pos in account_state.positions)
             pending_exposure = 0.0
             for pending_order in account_state.open_orders:
-                if not is_pending_entry_order(pending_order):
+                if not is_pending_entry_order(pending_order) or is_cancelled_by_intent(pending_order):
                     continue
                 pending_price = pending_order.price or market_prices.get(pending_order.symbol)
                 if pending_price is None:
                     pending_price = 0.0
                 pending_exposure += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
             incremental_exposure = 0.0
-            for order in intent.orders:
+            for order in non_cancel_orders:
                 if order.reduce_only:
                     continue
                 reference_price = order.price or market_prices.get(order.symbol)
@@ -415,7 +613,7 @@ class RiskEngine:
         max_order_notional_pct_balance = float(
             active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0
         )
-        if is_entry_decision and max_order_notional_pct_balance >= 0:
+        if uses_entry_exposure and max_order_notional_pct_balance >= 0:
             cap_summary = self.get_effective_max_order_notional_pct_balance(
                 intent=intent,
                 active_profile=active_profile,
@@ -427,13 +625,13 @@ class RiskEngine:
             candidate_notional = 0.0
             pending_notional = 0.0
             for pending_order in account_state.open_orders:
-                if not is_pending_entry_order(pending_order):
+                if not is_pending_entry_order(pending_order) or is_cancelled_by_intent(pending_order):
                     continue
                 pending_price = pending_order.price or market_prices.get(pending_order.symbol)
                 if pending_price is None:
                     pending_price = 0.0
                 pending_notional += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
-            for order in intent.orders:
+            for order in non_cancel_orders:
                 if order.reduce_only:
                     continue
                 reference_price = order.price or market_prices.get(order.symbol)

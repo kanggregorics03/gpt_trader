@@ -312,6 +312,10 @@ risk_state:
 {request.risk_state.model_dump_json()}
 risk_mode:
 {request.risk_mode}
+loop_mode:
+{request.loop_mode}
+cycle_role:
+{request.cycle_role or ""}
 risk_profile:
 {self._compact_json(request.risk_profile)}
 recent_journal_context:
@@ -334,24 +338,28 @@ MARKET INTERPRETATION
 
 RULES
 1. Analyze structure, participation, trigger context, execution quality, and recent performance.
-2. Decide one of HOLD, BUY, SELL, REDUCE, EXIT at the portfolio level.
+2. Decide one of HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY at the portfolio level.
 3. If entering or reducing, populate orders and include take_profit / stop_loss when appropriate.
 4. Distinguish opportunity triggers vs risk triggers. Opportunity triggers mean closer monitoring; risk triggers mean more conservative execution.
 5. Review existing open orders and avoid duplicate or conflicting orders for the same symbol.
 6. If liquidation risk, cooldown pressure, drawdown pressure, wide spread, weak depth, or unfavorable funding is elevated, prefer REDUCE or EXIT over new exposure.
-7. In trigger mode, prioritize risk reduction. Avoid new positions unless uniquely supported by long_term_memory.
-8. Consider idempotency and avoid repeating a failed request from recent_journal_context.
-9. Put identified risks in risk_notes.
-10. All text fields must be English.
-11. When market_context contains multiple symbols, compare them and only place orders on the strongest justified symbols.
-12. Do not force a trade just because an opportunity trigger exists.
-13. A breakout without volume, open-interest support, or acceptable execution quality is weak.
-14. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
-15. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
-16. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
-17. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, or risk_state.cooldown_remaining_minutes.
-18. If operator is not note, threshold is required. If operator is note, threshold must be null.
-19. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+7. If loop_mode is 5m or cycle_role is execution_safety, do not open new positions. Only HOLD, REDUCE, EXIT, CANCEL, or REPLACE_ENTRY are valid.
+8. If loop_mode is 15m or cycle_role is position_management, avoid opening new positions and focus on managing live exposure and working orders for the configured symbol.
+9. Use REPLACE_ENTRY only for working-order management. It must include a CANCEL leg for the existing entry order and a replacement BUY/SELL limit leg for the same symbol.
+10. Only the 1h strategy loop should initiate fresh directional exposure unless the risk_profile explicitly blocks entries.
+11. In trigger mode, prioritize risk reduction and execution quality over new exposure.
+12. Consider idempotency and avoid repeating a failed request from recent_journal_context.
+13. Put identified risks in risk_notes.
+14. All text fields must be English.
+15. market_context represents the single configured trading symbol. Do not invent or reference other symbols.
+16. Do not force a trade just because an opportunity trigger exists.
+17. A breakout without volume, open-interest support, or acceptable execution quality is weak.
+18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
+19. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
+20. Every rationale_item must include at least one evidence row with a numeric observed_value and a valid source path from the DecisionRequest.
+21. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, or risk_state.cooldown_remaining_minutes.
+22. If operator is not note, threshold is required. If operator is note, threshold must be null.
+23. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
 
 OUTPUT EXAMPLE
 {{
@@ -372,6 +380,8 @@ OUTPUT EXAMPLE
             "market_context": self._build_market_payload(request),
             "risk_state": request.risk_state.model_dump(mode="json"),
             "risk_mode": request.risk_mode,
+            "loop_mode": request.loop_mode,
+            "cycle_role": request.cycle_role,
             "risk_profile": request.risk_profile,
             "recent_journal_context": self._build_recent_journal_context_payload(request),
             "long_term_memory": self._build_long_term_memory_payload(request),

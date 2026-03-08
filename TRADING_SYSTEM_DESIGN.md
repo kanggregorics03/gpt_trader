@@ -11,6 +11,9 @@ LLM provider는 시장/계좌 상태를 바탕으로 “주문 후보(JSON)”�
 
 매매일지(원본+요약)와 장기 요약(LongTermMemory)을 유지해 맥락/통찰을 축적한다.
 
+현재 구현은 여기서 더 나아가 `메모리 -> 정책 후보 -> shadow/replay 평가 -> 자동 승격`을 수행한다.
+즉 시스템 목표는 단순한 AI 자동매매가 아니라, 제약된 정책 공간 안에서 스스로 진화하는 트레이딩 운영체제다.
+
 2) 설계 원칙
 
 LLM은 전략가, 시스템은 경찰
@@ -93,6 +96,9 @@ decision_engine (provider adapter)
 
 Gemini / OpenAI(GPT) / DeepSeek / Anthropic(Claude)를 adapter로 선택할 수 있다
 
+프롬프트는 `loop_mode`와 `cycle_role`을 함께 받아 루프별 제약을 직접 반영한다.
+따라서 `5m`는 프롬프트 레벨에서도 신규 진입 금지, `15m`는 관리 중심, `1h`만 신규 방향성 판단이라는 계약을 공유한다.
+
 JSON mode가 가능한 provider는 native JSON 응답을 우선 사용하고, 그렇지 않은 경우에도 JSON-only 지시와 Pydantic 검증을 함께 사용한다
 
 risk_engine
@@ -101,6 +107,8 @@ risk_engine
 
 최근 구현에서는 쿨다운도 고정 30분이 아니라 손실 강도, 연속 손실, 반복된 `thesis_failure_reason`을 같이 봐서 동적으로 늘어난다.
 또 `drawdown`은 BUY/SELL을 완전히 막지 않되 `confidence_cap`, `entry_size_multiplier`, `failure_pattern_score`로 추가 감쇠한다.
+또 현재 구현에서는 `normal` 모드에서만 레짐별 `exposure_budget` champion을 읽어 `max_order_notional_pct_balance`와 `entry_size_multiplier`를 override할 수 있다. `trigger` 모드는 기본 risk profile을 그대로 사용한다.
+반면 `max_leverage`, `drawdown_activate_pct`, `daily_max_loss_pct`는 자동 진화 대상이 아닌 하드 가드레일로 유지한다.
 
 execution_engine
 
@@ -113,6 +121,15 @@ journal & audit logger
 long_term_memory_updater (Batch)
 
 하루 1회(권장) 장기 요약 업데이트(교훈/안티패턴/국면 맵)
+
+동시에 아래 정책 계층도 관리
+
+- `alpha_1h` 진입 필터 후보 생성/평가/승격
+- `position_15m` FSM 관리 정책 후보 생성/평가/승격
+- `safety_5m` execution safety FSM 후보 생성/평가/승격
+- `execution_5m` market/limit 및 execution profile 추천/승격
+- `exposure_budget` 레짐별 최대 참여율/entry multiplier 추천/승격
+- 레짐별 `policy_bundle` 생성/평가/승격/rollback
 
 monitoring & alert
 
@@ -137,6 +154,12 @@ monitoring & alert
 
 역할: 전략 판단과 신규 진입 방향성 결정
 
+추가 원칙:
+
+- `AlphaPolicyEngine`이 먼저 레짐별 champion 진입 필터를 적용
+- 통과한 심볼만 AI가 최종 방향성 판단
+- 후보 알파 정책은 live entry 기준 `entry_block` shadow decision을 남긴다
+
 15분 cadence
 
 포지션 보유 중
@@ -149,15 +172,33 @@ monitoring & alert
 
 역할: 포지션 관리, 주문 정리, 감축/청산 중심
 
+추가 원칙:
+
+- 기본 경로는 AI가 아니라 `PositionPolicyEngine` FSM
+- 상태 예시: `healthy`, `stalled`, `weakened`, `de-risk`, `exit`
+- shadow 후보 FSM과 live decision의 차이를 저장해 승격 평가에 사용
+
 5분 cadence
 
-opportunity_trigger 활성화
+opportunity_trigger 활성화 + active management 대상 존재
 
-역할: trigger 대응과 빠른 재판단
+active management 대상:
 
-기본 정책에서는 포지션이 없을 때만 첫 trigger entry를 허용하고, 기존 포지션이 있으면 추가 진입 대신 HOLD/REDUCE/EXIT 위주로 동작
+- 포지션 보유 중
+- 미체결 주문 존재
+- unknown order 상태 존재
+- 최근 진입 직후
+- 최근 청산 직후
 
-즉, trigger가 뜨면 무엇이 돌고 있든 5분 cadence가 선점하고, trigger가 사라지면 포지션/주문 상태에 따라 15분 또는 1시간으로 강등된다.
+역할: execution safety, trigger deterioration 대응, emergency de-risking
+
+기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이다.
+5분 루프는 신규 진입을 만들지 않고 HOLD/REDUCE/EXIT/CANCEL만 다룬다.
+
+즉, strong trigger가 떠도 flat 상태에서 관리 대상이 없으면 5분 cadence가 바로 선점하지 않는다. 5분은 trigger와 관리 필요가 동시에 있을 때만 승격되고, trigger가 사라지면 포지션/주문 상태에 따라 15분 또는 1시간으로 강등된다.
+
+5분 루프는 방향 예측보다 실행/안전 계층에 가깝다.
+`SafetyPolicyEngine`이 먼저 HOLD/REDUCE/EXIT/CANCEL을 결정하고, 실제 주문이 생기면 `ExecutionPolicyEngine`이 market/limit, urgency, execution profile을 결정한다.
 
 4.1.1 스냅샷 materialization
 
@@ -203,11 +244,13 @@ WS recovery
 
 `1h or 15m -> 5m`
 
-같은 심볼에서 strong opportunity trigger(`volume_surge_15m` 또는 `range_break_1h`)를 포함한 opportunity reason이 2개 이상일 때만 승격
+같은 심볼에서 strong opportunity trigger(`volume_surge_15m` 또는 `range_break_1h`)를 포함한 opportunity reason이 2개 이상이고, 동시에 포지션 / 미체결 주문 / unknown order 같은 active management 대상이 있을 때만 승격
 
 `5m -> 15m`
 
 trigger 해제 + clear streak 충족 + 포지션/주문/복구 대상 존재
+
+단, 포지션 / 미체결 주문 / unknown order가 모두 사라진 flat 상태면 clear streak 없이 즉시 15분으로 강등
 
 `5m -> 1h`
 
@@ -215,7 +258,9 @@ trigger 해제 + clear streak 충족 + 포지션/주문/복구 대상 없음
 
 `15m -> 1h`
 
-flat 상태가 최소 유지 시간 이후 여러 사이클 연속 확인될 때만 강등
+recent execution / recent close TTL이 남아 있으면 유지
+
+TTL까지 끝난 완전 flat 상태에서는 즉시 1시간으로 복귀
 
 이 히스테리시스는 cadence가 경계값 근처에서 `5m <-> 15m <-> 1h`로 흔들리는 현상을 줄이기 위한 것이다.
 
@@ -238,7 +283,7 @@ account_state: 계좌 스냅샷 시각, 잔고, 총 미실현손익, 마진비�
 
 market_snapshot: 15m/1h 캔들(마감된 캔들만), 핵심 지표/레벨 요약
 
-멀티 심볼 운영에서는 market_snapshots로 여러 심볼 스냅샷을 한 번에 전달해 포트폴리오 단일 판단을 생성
+현재 프로젝트는 단일 심볼 운영을 전제로 하며, `trading.symbols`에 여러 개가 있더라도 런타임에서는 첫 번째 심볼만 사용한다
 
 market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 분리해 포함
 
@@ -249,7 +294,7 @@ market_snapshot 안에는 opportunity_trigger_reasons / risk_trigger_reasons를 
 `distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`
 같은 파생 요약 필드를 추가해 LLM이 raw 값보다 change / percentile / distance / trigger-state를 우선 해석하게 한다
 
-risk_state: 일일 손익률, 연속 손실, 쿨다운, 드로우다운 상태
+risk_state: 일일 손익률, 연속 손실, 최근 손실 강도, 동적 쿨다운 길이, 쿨다운 잔여 시간, 반복 실패 패턴 점수/대표 사유, 드로우다운 상태, 현재 심볼의 recent close/loss 재진입 가드 상태
 
 recent_journal_context: 같은 최근 일지 정보를 구조화 객체로 전달
 
@@ -282,9 +327,15 @@ RAG vector는 시장 13차원만 쓰지 않고, 리스크/계좌/포지션 컨�
 
 5.2 LLM 출력(TradeIntent.json)
 
-decision: HOLD/BUY/SELL/REDUCE/EXIT
+decision: HOLD/BUY/SELL/REDUCE/EXIT/CANCEL/REPLACE_ENTRY
 
 orders[]: 주문 후보(가격/수량/TP/SL/reduce_only 포함)
+
+`CANCEL` action은 `target_order_id` 또는 `target_client_order_id`를 함께 담아 stale working order를 정리한다.
+
+`REPLACE_ENTRY`는 stale entry working order를 재배치하는 관리 액션이다.
+내부적으로는 `CANCEL + BUY/SELL LIMIT` leg를 담지만, replacement leg는 cancel confirmation 이후에만 제출된다.
+각 leg는 `replace_group_id`와 lineage parent 정보를 함께 가져 원래 주문 -> cancel -> replacement 흐름을 영속적으로 추적한다.
 
 rationale[]: 근거(짧게)
 
@@ -312,6 +363,11 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 
 중요: 시스템은 “주문 실행 권한”을 Gemini에 주지 않는다. JSON은 추천일 뿐.
 
+최근 구현에서는 orders[]에 `execution_profile`, `urgency_score`, `time_in_force`, `post_only` 같은 실행 메타데이터도 포함될 수 있다.
+
+또 주문 타입은 더 이상 전역 market/limit 고정이 아니다.
+`ExecutionPolicyEngine`이 loop role, action type, spread/depth, urgency를 보고 실행 프로필을 선택한다.
+
 6) 맥락(기억) 설계: 단기/중기/장기 3층
 6.1 단기(Recent)
 
@@ -333,11 +389,14 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 
 레짐 불확실하면 “불확실 모드”로 리스크 축소
 
-7) 장기 요약 자동화(배치) 명세
+7) 장기 요약 및 정책 진화 배치 명세
 7.1 주기
 
 매일 1회(권장): 예) KST 04:00
 (주 1회도 가능하지만 통찰 업데이트가 느림)
+
+권장 운영은 `incremental replay -> memory batch` 순서다.
+즉 배치 직전에 최근 24시간 대표 audit를 20~40건 정도 자동 replay한 뒤, 그 결과를 memory/policy 평가에 반영한다.
 
 7.2 방식(오염 방지 필수)
 
@@ -349,6 +408,15 @@ LLM provider는 통계 해석과 교훈 구조화만 수행
 
 각 교훈은 반드시 근거(트레이드 ID/기간/표본수)를 가진다.
 
+추가로 배치는 아래 진화 파이프라인을 수행한다.
+
+1. trade case와 symbol journal에서 candidate lesson과 feature gap을 추출
+2. 이를 `candidate_policy_versions`로 저장
+3. `shadow_decisions`와 `replay_runs`로 후보 정책을 평가
+4. 레짐별 `policy_registry` champion을 승격
+5. `alpha + position + safety + execution` champion 조합을 `policy_bundle`로 묶어 다시 평가/승격
+6. 최근 shadow 성과가 크게 악화되면 이전 bundle로 rollback
+
 8) 리스크 관리(필수 안전장치)
 8.1 회로차단기(Kill switch)
 
@@ -357,6 +425,15 @@ LLM provider는 통계 해석과 교훈 구조화만 수행
 연속 손실 Y회면 신규 진입 금지 + 쿨다운
 
 슬리피지/거절률/오류율 임계치 초과 시 정지
+
+자동 진화가 허용되지 않는 핵심 가드레일은 다음과 같다.
+
+- `max_leverage`
+- `drawdown_activate_pct`
+- `daily_max_loss_pct`
+- `cooldown` 상한
+
+즉 시스템은 실효 노출과 실행 정책은 바꾸되, 생존 한도는 스스로 올리지 않는다.
 
 8.2 멱등성(Idempotency)
 
@@ -497,6 +574,30 @@ daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 
 최근 구조에서는 symbol_journal도 함께 집계해 심볼 단위 evidence signal 반복 패턴을 별도로 반영한다
 
 symbol 기반 candidate lesson의 evidence_journal_ids는 audit_log_id가 아니라 symbol_journal.id를 근거로 기록한다
+
+정책 진화 관점에서 추가된 영속 계층:
+
+- `execution_policy_evaluations`
+  - 일반 진입/청산뿐 아니라 `CANCEL`, `REPLACE_ENTRY` 성공률, timeout, stale order reprice 문맥도 함께 저장
+- `execution_policy_profiles`
+- `candidate_policy_versions`
+- `policy_registry`
+- `policy_evaluations`
+- `policy_promotions`
+- `shadow_decisions`
+- `policy_bundles`
+- `bundle_evaluations`
+- `bundle_promotions`
+
+이 계층은 각각 다음 용도로 쓰인다.
+
+- execution/alpha/position/exposure 후보 저장
+- 후보 정책의 shadow/replay 성과 저장
+- 레짐별 champion 정책 관리
+- 레짐별 champion 조합(bundle) 관리
+
+최근 replay는 단순 decision diff가 아니라 `simulated_fill_ratio`, `simulated_slippage_bps`,
+`simulated_latency_seconds` 같은 execution-aware metric도 함께 남긴다.
 
 symbol_journal 조회 효율을 위해 symbol+id, timestamp+id, audit_log_id 인덱스를 유지한다
 
@@ -744,7 +845,7 @@ journal의 반복 손실 signal과 evidence quality 패턴을 확인한다
 15) 단계별 로드맵
 Phase 1: MVP(안전한 자동매매 최소셋)
 
-BTCUSDT/ETHUSDT 1~2개 심볼
+BTCUSDT 단일 심볼
 
 adaptive cadence(기본 1시간, 관리 시 15분, trigger 시 5분)
 
@@ -780,7 +881,7 @@ Phase 4: 운영 최적화
 
 16) MVP 권장 초기 기본값
 
-심볼: BTCUSDT, ETHUSDT
+심볼: BTCUSDT
 
 최대 레버리지: 2~3x
 

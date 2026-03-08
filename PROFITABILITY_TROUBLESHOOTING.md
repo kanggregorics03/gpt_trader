@@ -52,9 +52,14 @@
 즉시 해볼 것:
 
 1. `max_order_notional_pct_balance`를 낮춘다.
-2. trigger mode 신규 진입을 잠시 축소한다.
+2. `1h alpha` 신규 진입 기준과 `5m safety` 민감도를 더 보수적으로 둔다.
 3. 심볼 수를 줄인다.
 4. 문제 구간의 실거래를 멈추고 demo 또는 축소 size로 재관찰한다.
+5. `policy_bundle`이 최근 승격 직후인지 확인한다.
+6. `regime_drift`가 감지된 상태에서 현재 champion이 계속 유지되고 있지 않은지 본다.
+7. `execution_policy_evaluations`, `shadow_decisions`, `bundle_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
+8. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
+9. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
 
 ## 4. 원인별 해석 가이드
 
@@ -113,6 +118,8 @@
 - `position_ledger.fee_cost`
 - `trade_cases.slippage_bps`
 - `trade_cases.slippage_cost`
+- `execution_policy_evaluations`
+- `replay_runs.simulated_slippage_bps`
 - `market_snapshot.order_book.spread_bps`
 - `spread_percentile_1h`
 - `depth_percentile_1h`
@@ -127,7 +134,7 @@
 1. spread/depth filter를 강화한다.
 2. size를 줄인다.
 3. fast move 직후 추격 진입을 줄인다.
-4. trigger loop의 신규 진입 조건을 더 보수적으로 만든다.
+4. `safety_5m`와 `execution_5m`의 spread/depth 민감도를 더 보수적으로 만든다.
 5. limit entry가 가능한 정책인지 별도로 검토한다.
 
 실험 아이디어:
@@ -158,6 +165,8 @@
 - `drawdown_active`
 - `daily_pnl_pct`
 - 모드별 평균 진입 size
+- `policy_registry`의 `exposure_budget` champion
+- `entry_size_cap.effective_cap_pct`
 
 어떻게 해석할 것인가:
 
@@ -171,6 +180,8 @@
 3. `confidence_cap`을 더 보수적으로 둔다.
 4. 연속 손실 시 `Cooldown Extended`가 더 빨리 켜지게 만든다.
 5. trigger mode와 normal mode의 size 차이를 더 벌린다.
+
+현재 구조에서는 고정값을 바로 손대기 전에, 해당 레짐의 `exposure_budget` champion이 과도하게 공격적으로 승격된 것은 아닌지도 함께 본다.
 
 실험 아이디어:
 
@@ -278,6 +289,9 @@
 - `retrieval_evaluations`
 - `long_term_memory`
 - `candidate_lessons`
+- `policy_evaluations`
+- `bundle_evaluations`
+- `bundle_promotions`
 - 최근 `24h / 7d / latest 50` semantic fallback
 - in-sample vs recent out-of-sample 비교
 
@@ -286,6 +300,7 @@
 - 이 경우 "모델이 좋아졌다"는 착시가 많다.
 - 반드시 최근 구간, 비용 반영 결과, 실전 체결 결과를 분리해서 본다.
 - memory rule은 설명력이 아니라 반복성과 holdout 적합성이 중요하다.
+- champion score만 높고 bundle score가 약하면 개별 정책은 좋아 보여도 조합이 나쁜 경우다.
 
 바로 해볼 것:
 
@@ -578,7 +593,7 @@
 - 총 거래 수 변화
 - 반복 손실 fingerprint 재진입 감소율
 - drawdown 구간 신규 진입 감소율
-- trigger mode 신규 진입 비중 변화
+- `1h alpha` 신규 진입 비중 변화
 
 좋은 신호:
 

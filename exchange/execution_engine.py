@@ -31,64 +31,23 @@ class ExecutionEngine:
         """
         receipts = []
         orders_to_execute = self.resolve_orders(intent, account_state)
+        cancel_status_by_group: Dict[str, str] = {}
         for order in orders_to_execute:
-            # 1. Idempotency Key
-            client_order_id = f"gpt_{uuid.uuid4().hex[:12]}"
-            
-            # 2. Map actions to ccxt format
-            side = 'buy' if order.action == 'BUY' else 'sell'
-            order_type = 'market' if order.order_type == 'MARKET' else 'limit'
-            
-            params = {
-                'clientOrderId': client_order_id,
-                'reduceOnly': order.reduce_only
-            }
-            
-            # Add take profit and stop loss if specified (Bybit specific logic)
-            if order.take_profit:
-                params['takeProfit'] = str(order.take_profit)
-            if order.stop_loss:
-                params['stopLoss'] = str(order.stop_loss)
-
-            logger.info(f"Executing {side} {order.quantity} {order.symbol} ({order_type}). orderId: {client_order_id}")
-            
-            try:
-                # 3. Create Order
-                receipt = self.exchange.create_order(
-                    symbol=order.symbol,
-                    type=order_type,
-                    side=side,
-                    amount=order.quantity,
-                    price=order.price,
-                    params=params
-                )
-                normalized = self.normalize_receipt(receipt, fallback_client_order_id=client_order_id)
-                receipts.append(normalized)
-                # Brief sleep to avoid rate limits if multiple orders
-                time.sleep(0.5)
-                
-            except ccxt.RequestTimeout:
-                logger.error(f"Timeout executing {client_order_id}. IMPORTANT: We must NOT blindly retry without checking!")
-                recovered_order = self._recover_timed_out_order(order.symbol, client_order_id)
-                receipts.append({
-                    "symbol": order.symbol,
-                    "clientOrderId": client_order_id,
-                    "status": "recovered" if recovered_order else "timeout_unresolved",
-                    "recovered_order": recovered_order,
-                })
-            except Exception as e:
-                logger.error(f"Failed executing order {order}: {e}")
-                receipts.append({
-                    "symbol": order.symbol,
-                    "clientOrderId": client_order_id,
-                    "status": "failed",
-                    "side": side,
-                    "type": order_type,
-                    "amount": order.quantity,
-                    "price": order.price,
-                    "reduceOnly": order.reduce_only,
-                    "error": str(e),
-                })
+            if order.lineage_role == "replacement" and order.wait_for_cancel_confirmation:
+                group_id = str(order.replace_group_id or "").strip()
+                group_status = cancel_status_by_group.get(group_id, "")
+                if not self._is_cancel_confirmed_status(group_status):
+                    receipts.append(
+                        self._build_deferred_replace_receipt(
+                            order,
+                            reason=f"waiting_for_cancel_confirmation:{group_status or 'missing_cancel_receipt'}",
+                        )
+                    )
+                    continue
+            receipt = self._execute_single_order(order)
+            receipts.append(receipt)
+            if order.action == "CANCEL" and order.replace_group_id:
+                cancel_status_by_group[str(order.replace_group_id)] = str(receipt.get("status") or "").lower()
 
         return receipts
 
@@ -104,31 +63,49 @@ class ExecutionEngine:
             matched_fills = self._get_fills_for_receipt(order, receipt, fills)
             client_order_id = receipt.get("clientOrderId")
             exchange_order_id = receipt.get("id")
+            from_state = "submitted" if order.action == "CANCEL" else "none"
+            submitted_state = "cancel_requested" if order.action == "CANCEL" else "submitted"
+            event_type = "intent_cancel" if order.action == "CANCEL" else "intent_submitted"
             transitions.append(
                 {
                     "symbol": order.symbol,
                     "client_order_id": client_order_id,
                     "exchange_order_id": exchange_order_id,
-                    "from_state": "none",
-                    "to_state": "submitted",
-                    "event_type": "intent_submitted",
-                    "payload": {
-                        "action": order.action,
-                        "order_type": order.order_type,
-                        "quantity": order.quantity,
-                        "price": order.price,
-                        "reduce_only": order.reduce_only,
-                    },
-                }
-            )
+                    "from_state": from_state,
+                    "to_state": submitted_state,
+                    "event_type": event_type,
+                        "payload": {
+                            "action": order.action,
+                            "order_type": order.order_type,
+                            "quantity": order.quantity,
+                            "price": order.price,
+                            "reduce_only": order.reduce_only,
+                            "execution_profile": order.execution_profile,
+                            "time_in_force": order.time_in_force,
+                            "post_only": bool(order.post_only),
+                            "target_order_id": order.target_order_id,
+                            "target_client_order_id": order.target_client_order_id,
+                            "replace_group_id": order.replace_group_id,
+                            "lineage_role": order.lineage_role,
+                            "lineage_parent_order_id": order.lineage_parent_order_id,
+                            "lineage_parent_client_order_id": order.lineage_parent_client_order_id,
+                            "wait_for_cancel_confirmation": bool(order.wait_for_cancel_confirmation),
+                        },
+                    }
+                )
+            if str(receipt.get("status") or "").lower() == "deferred_waiting_cancel":
+                transitions[-1]["to_state"] = "deferred"
+                transitions[-1]["event_type"] = "replace_deferred"
+                transitions[-1]["payload"]["deferred_reason"] = receipt.get("error")
+                continue
             final_state = self._derive_order_state(order, receipt, matched_fills)
-            if final_state != "submitted":
+            if final_state != submitted_state:
                 transitions.append(
                     {
                         "symbol": order.symbol,
                         "client_order_id": client_order_id,
                         "exchange_order_id": exchange_order_id,
-                        "from_state": "submitted",
+                        "from_state": submitted_state,
                         "to_state": final_state,
                         "event_type": "exchange_update",
                         "payload": {
@@ -139,6 +116,10 @@ class ExecutionEngine:
                             ),
                             "fill_count": len(matched_fills),
                             "receipt": receipt,
+                            "replace_group_id": order.replace_group_id,
+                            "lineage_role": order.lineage_role,
+                            "lineage_parent_order_id": order.lineage_parent_order_id,
+                            "lineage_parent_client_order_id": order.lineage_parent_client_order_id,
                         },
                     }
                 )
@@ -152,7 +133,7 @@ class ExecutionEngine:
         planned_orders: List[OrderIntent],
         receipts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        if intent.decision == "HOLD":
+        if intent.decision in ("HOLD", "CANCEL", "REPLACE_ENTRY"):
             return []
 
         pre_positions = {position.symbol: position for position in account_state.positions}
@@ -254,7 +235,9 @@ class ExecutionEngine:
                 summary["recovered_orders"] += 1
             elif status == "timeout_unresolved":
                 summary["unresolved_timeouts"] += 1
-            elif status in ("canceled", "rejected", "failed"):
+            elif status == "deferred_waiting_cancel":
+                continue
+            elif status in ("rejected", "failed"):
                 summary["failed_orders"] += 1
 
         summary["symbols"] = sorted(symbols)
@@ -296,6 +279,8 @@ class ExecutionEngine:
         intent: TradeIntent,
         account_state: Optional[AccountState],
     ) -> List[OrderIntent]:
+        if intent.decision == "CANCEL":
+            return intent.orders
         if intent.decision != "EXIT" or intent.orders:
             return intent.orders
 
@@ -333,6 +318,154 @@ class ExecutionEngine:
                 if self._matches_client_order_id(order, client_order_id):
                     return order
         return None
+
+    def _is_cancel_confirmed_status(self, status: str) -> bool:
+        return str(status or "").lower() in ("canceled", "cancelled", "closed", "filled")
+
+    def _build_deferred_replace_receipt(self, order: OrderIntent, reason: str) -> Dict[str, Any]:
+        return {
+            "symbol": order.symbol,
+            "clientOrderId": None,
+            "id": None,
+            "status": "deferred_waiting_cancel",
+            "action": order.action,
+            "type": order.order_type,
+            "amount": order.quantity,
+            "price": order.price,
+            "reduceOnly": order.reduce_only,
+            "timeInForce": order.time_in_force,
+            "postOnly": bool(order.post_only),
+            "executionProfile": order.execution_profile,
+            "replaceGroupId": order.replace_group_id,
+            "lineageRole": order.lineage_role,
+            "lineageParentOrderId": order.lineage_parent_order_id,
+            "lineageParentClientOrderId": order.lineage_parent_client_order_id,
+            "error": reason,
+        }
+
+    def _execute_single_order(self, order: OrderIntent) -> Dict[str, Any]:
+        if order.action == "CANCEL":
+            cancel_target_id = order.target_order_id or order.target_client_order_id
+            params = {}
+            if order.target_client_order_id:
+                params["orderLinkId"] = str(order.target_client_order_id)
+                params["clientOrderId"] = str(order.target_client_order_id)
+            logger.info(
+                f"Cancelling order for {order.symbol}. target={cancel_target_id or 'unknown'}"
+            )
+            try:
+                receipt = self.exchange.cancel_order(
+                    cancel_target_id,
+                    order.symbol,
+                    params=params,
+                )
+                normalized = self.normalize_receipt(
+                    receipt,
+                    fallback_client_order_id=order.target_client_order_id,
+                )
+                if not normalized.get("status"):
+                    normalized["status"] = "canceled"
+                return self._enrich_receipt_with_lineage(normalized, order)
+            except ccxt.RequestTimeout:
+                logger.error(
+                    f"Timeout cancelling {order.symbol} target={cancel_target_id or 'unknown'}."
+                )
+                return self._enrich_receipt_with_lineage(
+                    {
+                        "symbol": order.symbol,
+                        "clientOrderId": order.target_client_order_id,
+                        "id": order.target_order_id,
+                        "status": "timeout_unresolved",
+                        "action": "CANCEL",
+                        "error": "cancel_timeout",
+                    },
+                    order,
+                )
+            except Exception as e:
+                logger.error(f"Failed cancelling order {order}: {e}")
+                return self._enrich_receipt_with_lineage(
+                    {
+                        "symbol": order.symbol,
+                        "clientOrderId": order.target_client_order_id,
+                        "id": order.target_order_id,
+                        "status": "failed",
+                        "action": "CANCEL",
+                        "error": str(e),
+                    },
+                    order,
+                )
+
+        client_order_id = f"gpt_{uuid.uuid4().hex[:12]}"
+        side = 'buy' if order.action == 'BUY' else 'sell'
+        order_type = 'market' if order.order_type == 'MARKET' else 'limit'
+
+        params = {
+            'clientOrderId': client_order_id,
+            'reduceOnly': order.reduce_only
+        }
+        if order.time_in_force:
+            params['timeInForce'] = str(order.time_in_force)
+        if bool(order.post_only):
+            params['postOnly'] = True
+        if order.execution_profile:
+            params['executionProfile'] = str(order.execution_profile)
+        if order.take_profit:
+            params['takeProfit'] = str(order.take_profit)
+        if order.stop_loss:
+            params['stopLoss'] = str(order.stop_loss)
+
+        logger.info(f"Executing {side} {order.quantity} {order.symbol} ({order_type}). orderId: {client_order_id}")
+        try:
+            receipt = self.exchange.create_order(
+                symbol=order.symbol,
+                type=order_type,
+                side=side,
+                amount=order.quantity,
+                price=order.price,
+                params=params
+            )
+            normalized = self.normalize_receipt(receipt, fallback_client_order_id=client_order_id)
+            time.sleep(0.5)
+            return self._enrich_receipt_with_lineage(normalized, order)
+        except ccxt.RequestTimeout:
+            logger.error(f"Timeout executing {client_order_id}. IMPORTANT: We must NOT blindly retry without checking!")
+            recovered_order = self._recover_timed_out_order(order.symbol, client_order_id)
+            return self._enrich_receipt_with_lineage(
+                {
+                    "symbol": order.symbol,
+                    "clientOrderId": client_order_id,
+                    "status": "recovered" if recovered_order else "timeout_unresolved",
+                    "recovered_order": recovered_order,
+                },
+                order,
+            )
+        except Exception as e:
+            logger.error(f"Failed executing order {order}: {e}")
+            return self._enrich_receipt_with_lineage(
+                {
+                    "symbol": order.symbol,
+                    "clientOrderId": client_order_id,
+                    "status": "failed",
+                    "side": side,
+                    "type": order_type,
+                    "amount": order.quantity,
+                    "price": order.price,
+                    "reduceOnly": order.reduce_only,
+                    "timeInForce": order.time_in_force,
+                    "postOnly": bool(order.post_only),
+                    "executionProfile": order.execution_profile,
+                    "error": str(e),
+                },
+                order,
+            )
+
+    def _enrich_receipt_with_lineage(self, receipt: Dict[str, Any], order: OrderIntent) -> Dict[str, Any]:
+        enriched = dict(receipt or {})
+        enriched["replaceGroupId"] = order.replace_group_id
+        enriched["lineageRole"] = order.lineage_role
+        enriched["lineageParentOrderId"] = order.lineage_parent_order_id
+        enriched["lineageParentClientOrderId"] = order.lineage_parent_client_order_id
+        return enriched
 
     def _fetch_open_orders(self, symbol: str) -> List[Dict]:
         return self.exchange.fetch_open_orders(symbol)
@@ -377,6 +510,16 @@ class ExecutionEngine:
                 receipt.get("reduceOnly")
                 or info.get("reduceOnly")
                 or (receipt.get("params") or {}).get("reduceOnly", False)
+            ),
+            "timeInForce": receipt.get("timeInForce") or info.get("timeInForce"),
+            "postOnly": bool(
+                receipt.get("postOnly")
+                or info.get("postOnly")
+                or (receipt.get("params") or {}).get("postOnly", False)
+            ),
+            "executionProfile": (
+                (receipt.get("params") or {}).get("executionProfile")
+                or info.get("executionProfile")
             ),
             "fee_cost": fee.get("cost", 0.0) if isinstance(fee, dict) else 0.0,
             "fee_currency": fee.get("currency") if isinstance(fee, dict) else None,
@@ -453,6 +596,16 @@ class ExecutionEngine:
         if filled_quantity <= 0:
             filled_quantity = float(receipt.get("filled") or 0.0)
 
+        if order.action == "CANCEL":
+            if status in ("timeout_unresolved", "unknown"):
+                return "unknown"
+            if status in ("failed", "rejected"):
+                return "failed"
+            if status in ("canceled", "cancelled", "closed", "filled"):
+                return "cancelled"
+            return "cancel_requested"
+        if status == "deferred_waiting_cancel":
+            return "deferred"
         if status in ("timeout_unresolved", "unknown"):
             return "unknown"
         if status in ("failed", "rejected"):

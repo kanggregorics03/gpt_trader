@@ -12,7 +12,7 @@ class TestRiskEngine(unittest.TestCase):
         self.dummy_policy_path = Path("test_policy.yaml")
         policy_data = {
             "trading": {
-                "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                "symbols": ["BTCUSDT"],
                 "max_leverage": 3,
                 "order_type": "market"
             },
@@ -51,6 +51,14 @@ class TestRiskEngine(unittest.TestCase):
             yaml.dump(policy_data, f)
             
         self.engine = RiskEngine(config_path="test_policy.yaml")
+
+    def test_policy_normalizes_to_single_symbol_project(self):
+        self.assertEqual(self.engine.get_trading_symbols(), ["BTCUSDT"])
+        self.assertEqual(self.engine.policy["risk_limits"]["max_open_positions"], 1)
+        self.assertEqual(
+            self.engine.policy["risk_limits"]["mode_profiles"]["normal"]["max_open_positions"],
+            1,
+        )
 
     def tearDown(self):
         self.engine = None
@@ -280,6 +288,129 @@ class TestRiskEngine(unittest.TestCase):
             risk_state={"daily_pnl_pct": -5.0, "cooldown_active": True, "consecutive_losses": 4},
         )
         self.assertTrue(approved)
+
+    def test_cancel_is_allowed_for_live_open_orders_during_cooldown(self):
+        intent = TradeIntent(
+            decision="CANCEL",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="CANCEL",
+                    order_type="MARKET",
+                    quantity=0.0,
+                    target_order_id="order-1",
+                    target_client_order_id="client-1",
+                )
+            ],
+            rationale=["Cancel stale entry"],
+            risk_notes=[],
+            confidence=0.8,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=1000,
+            positions=[],
+            open_orders=[
+                OpenOrderState(
+                    symbol="BTCUSDT",
+                    order_id="order-1",
+                    client_order_id="client-1",
+                    side="BUY",
+                    order_type="LIMIT",
+                    quantity=0.1,
+                )
+            ],
+            open_orders_count=1,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            risk_state={"cooldown_active": True, "cooldown_remaining_minutes": 10},
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(reason, "Approved")
+
+    def test_mixed_cancel_and_reprice_entry_is_approved(self):
+        self.engine.policy["execution_policy"] = {"allowed_order_types": ["market", "limit"]}
+        intent = TradeIntent(
+            decision="REPLACE_ENTRY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="CANCEL",
+                    order_type="MARKET",
+                    quantity=0.0,
+                    target_order_id="order-1",
+                    target_client_order_id="client-1",
+                    replace_group_id="replace-1",
+                    lineage_role="cancel",
+                ),
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    quantity=0.01,
+                    price=30000.0,
+                    replace_group_id="replace-1",
+                    lineage_role="replacement",
+                    lineage_parent_order_id="order-1",
+                    lineage_parent_client_order_id="client-1",
+                    wait_for_cancel_confirmation=True,
+                ),
+            ],
+            rationale=["Reprice stale entry"],
+            risk_notes=[],
+            confidence=0.8,
+        )
+        acc_state = AccountState(
+            total_balance=1000,
+            available_balance=1000,
+            positions=[],
+            open_orders=[
+                OpenOrderState(
+                    symbol="BTCUSDT",
+                    order_id="order-1",
+                    client_order_id="client-1",
+                    side="BUY",
+                    order_type="LIMIT",
+                    quantity=0.01,
+                    price=30100.0,
+                )
+            ],
+            open_orders_count=1,
+        )
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+            risk_state={},
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(reason, "Approved")
+
+    def test_policy_validation_rejects_inverted_reentry_cooldowns(self):
+        invalid_policy_path = Path("test_invalid_policy.yaml")
+        policy_data = {
+            "trading": {"symbols": ["BTCUSDT"]},
+            "risk_limits": {"max_open_positions": 1, "mode_profiles": {"normal": {"max_open_positions": 1}}},
+            "execution_guards": {
+                "symbol_reentry_close_cooldown_minutes": 20,
+                "symbol_reentry_loss_cooldown_minutes": 10,
+                "symbol_reentry_loss_threshold_pct": 0.0,
+            },
+        }
+        with open(invalid_policy_path, "w") as f:
+            yaml.dump(policy_data, f)
+
+        try:
+            with self.assertRaises(ValueError):
+                RiskEngine(config_path=str(invalid_policy_path))
+        finally:
+            invalid_policy_path.unlink(missing_ok=True)
 
     def test_wide_spread_is_passed_as_advisory_not_hard_block(self):
         intent = TradeIntent(

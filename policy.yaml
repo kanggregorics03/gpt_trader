@@ -1,9 +1,9 @@
 trading:
   symbols:
     - BTCUSDT
-    - ETHUSDT
+  # Startup validation enforces exactly one symbol in this project.
   max_leverage: 3
-  order_type: "market" # market or limit (MVP primarily uses market for simplicity, or limit with aggressive pricing)
+  order_type: "market" # legacy fallback; execution_policy.allowed_order_types now controls runtime choice
   
 risk_limits:
   daily_max_loss_pct: 3.0    # Stop trading if daily loss exceeds 3% of account balance
@@ -25,10 +25,10 @@ risk_limits:
     repeated_failure_min_count: 2
     repeated_failure_add_minutes: 15
     max_minutes: 90
-  max_open_positions: 2      # Maximum number of concurrent positions
+  max_open_positions: 1      # Single-symbol project: only one concurrent position is allowed
   mode_profiles:
     normal:
-      max_open_positions: 2
+      max_open_positions: 1
       max_order_notional_pct_balance: 100
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
     trigger:
@@ -37,7 +37,7 @@ risk_limits:
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
       block_additional_entries_when_position_exists: true
     cooldown:
-      max_open_positions: 2
+      max_open_positions: 1
       max_order_notional_pct_balance: 0
       allowed_actions: [HOLD, REDUCE, EXIT]
     drawdown:
@@ -62,6 +62,60 @@ adaptive_loop:
   recent_execution_window_minutes: 20
   recent_close_window_minutes: 20
   poll_seconds: 1
+
+replay_batch:
+  enabled: true
+  window_hours: 24
+  limit: 30
+  save: true
+
+execution_policy:
+  allowed_order_types: [market, limit]
+  default_entry_order_type: limit
+  default_reduce_order_type: market
+  default_exit_order_type: market
+  prefer_market_when_trigger_mode: true
+  prefer_market_spread_percentile_lte: 35
+  prefer_limit_spread_percentile_gte: 80
+  prefer_limit_depth_percentile_lte: 20
+  aggressive_limit_offset_bps: 3
+  passive_limit_offset_bps: 8
+  market_max_slippage_bps: 18
+  limit_max_slippage_bps: 10
+  profile_min_support: 4
+
+position_policy:
+  losing_exit_pct: -1.25
+  stalled_minutes: 45
+  stalled_max_pnl_pct: 0.2
+  weakened_minutes: 30
+  weakened_reduce_pct: 0.5
+  profit_reduce_trigger_pct: 1.25
+  profit_reduce_fraction: 0.25
+  risk_trigger_exit_count: 2
+  microstructure_exit_spread_percentile: 90
+  microstructure_exit_depth_percentile: 12
+  stale_order_minutes: 30
+  stale_order_reprice_enabled: true
+  stale_order_reprice_spread_percentile_max: 75
+  stale_order_reprice_depth_percentile_min: 25
+  stale_order_reprice_limit_offset_bps: 4
+
+safety_policy:
+  loss_exit_pct: -0.9
+  risk_trigger_exit_count: 1
+  microstructure_exit_spread_percentile: 85
+  microstructure_exit_depth_percentile: 15
+  profit_protect_trigger_pct: 1.0
+  profit_protect_reduce_fraction: 0.35
+  stale_order_minutes: 12
+  stale_order_risk_trigger_count: 1
+  stale_order_reprice_enabled: true
+  stale_order_reprice_spread_percentile_max: 70
+  stale_order_reprice_depth_percentile_min: 30
+  stale_order_reprice_limit_offset_bps: 3
+
+alpha_policy: {}
 
 private_account_ws:
   reconcile_ttl_ms: 600000
@@ -89,6 +143,9 @@ execution_guards:
   entry_mutex_ttl_seconds: 180      # Per-symbol entry mutex TTL while entry execution is in-flight.
   unknown_order_block_minutes: 30   # Block new entries when unresolved unknown order states exist.
   recovery_sweep_minutes: 5         # Sweep interval to recover unknown/timeout order runtime states.
+  symbol_reentry_close_cooldown_minutes: 10  # Pause same-symbol re-entry after a fully flat close.
+  symbol_reentry_loss_cooldown_minutes: 30   # Must be >= close cooldown; extends pause after a losing fully flat close.
+  symbol_reentry_loss_threshold_pct: 0.0     # Any negative closed-case pnl activates the longer loss cooldown.
 
 context_budget:
   journal_fetch_limit: 24

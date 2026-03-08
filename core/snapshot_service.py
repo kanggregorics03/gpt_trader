@@ -2,13 +2,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
-from core.models import AccountState, MarketSnapshot
+from core.models import AccountState, MarketSnapshot, RiskStateSnapshot, coerce_risk_state_snapshot
 
 
 @dataclass
 class SnapshotBundle:
     account_state: AccountState
-    risk_state: Dict[str, Any]
+    risk_state: RiskStateSnapshot
     policy_summary: str
     market_snapshots: Dict[str, MarketSnapshot]
     market_prices: Dict[str, float]
@@ -38,7 +38,16 @@ class SnapshotService:
         self.account_reader = account_reader
         self.market_collector = market_collector
         self.risk_engine = risk_engine
-        self.symbols = list(symbols or [])
+        configured_symbols = [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
+        primary_symbol = None
+        if hasattr(risk_engine, "get_trading_symbol"):
+            primary_symbol = str(risk_engine.get_trading_symbol() or "").strip().upper()
+        if primary_symbol:
+            self.symbols = [primary_symbol]
+        elif configured_symbols:
+            self.symbols = [configured_symbols[0]]
+        else:
+            self.symbols = ["BTCUSDT"]
         self.materialization_minutes = max(1, int(materialization_minutes or 5))
         self._market_snapshot_cache: Dict[str, MarketSnapshot] = {}
         self._last_timeframe_buckets: Dict[str, int] = {}
@@ -67,7 +76,7 @@ class SnapshotService:
                 refresh[timeframe] = self.DEFAULT_TIMEFRAME_LIMITS[timeframe]
         return refresh
 
-    def _build_risk_state(self, account_state: AccountState) -> Dict[str, Any]:
+    def _build_risk_state(self, account_state: AccountState) -> RiskStateSnapshot:
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         cooldown_minutes = risk_limits.get("cooldown_minutes", 0)
         cooldown_config = risk_limits.get("dynamic_cooldown", {})
@@ -75,11 +84,13 @@ class SnapshotService:
         if drawdown_activate_pct is None:
             daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
             drawdown_activate_pct = round(daily_max_loss_pct * 0.5, 4) if daily_max_loss_pct > 0 else None
-        return self.state_store.get_risk_state(
-            current_balance=account_state.total_balance,
-            cooldown_minutes=cooldown_minutes,
-            cooldown_config=cooldown_config,
-            drawdown_activate_pct=drawdown_activate_pct,
+        return coerce_risk_state_snapshot(
+            self.state_store.get_risk_state(
+                current_balance=account_state.total_balance,
+                cooldown_minutes=cooldown_minutes,
+                cooldown_config=cooldown_config,
+                drawdown_activate_pct=drawdown_activate_pct,
+            )
         )
 
     def _should_enable_trigger_mode(self, market_snapshots: Dict[str, MarketSnapshot]) -> bool:

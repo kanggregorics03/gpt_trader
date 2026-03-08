@@ -463,6 +463,53 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(fill_stats["fee_cost"], 2.3)
         self.assertEqual(fill_stats["realized_pnl"], 1.7)
 
+    def test_replay_batch_candidates_prioritize_unreplayed_trade_audits(self):
+        approved_trade_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.7},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshot": {}},
+        )
+        rejected_entry_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.4},
+            risk_ok=False,
+            reason="Blocked",
+            receipts=[],
+            decision_request={"policy_summary": "y", "account_state": {}, "market_snapshot": {}},
+        )
+        hold_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.2},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "z", "account_state": {}, "market_snapshot": {}},
+        )
+        self.store.save_replay_run(
+            hold_id,
+            {
+                "comparison": {"original_decision": "HOLD", "replayed_decision": "HOLD"},
+                "simulated_fill_ratio": 0.0,
+                "simulated_slippage_bps": 0.0,
+                "simulated_latency_seconds": 0.0,
+            },
+        )
+
+        rows = self.store.get_replay_batch_candidates(
+            since=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
+            limit=3,
+        )
+
+        self.assertEqual(rows[0]["id"], rejected_entry_id)
+        self.assertEqual(rows[1]["id"], approved_trade_id)
+        self.assertEqual(rows[2]["id"], hold_id)
+
     def test_position_ledger_and_replay_runs_are_queryable(self):
         audit_id = self.store.save_audit(
             account={"total_balance": 1000},
@@ -926,6 +973,8 @@ class TestStateStore(unittest.TestCase):
             trade_case_id="BTCUSDT-case-4",
             opened_at="2026-03-07 13:00:00",
             entry_decision="BUY",
+            thesis_id="thesis-1",
+            management_template_id="position_manage_adaptive",
             last_decision="BUY",
             last_audit_log_id=10,
             payload={"opened_via": "intent_buy"},
@@ -942,10 +991,91 @@ class TestStateStore(unittest.TestCase):
 
         self.assertEqual(active["trade_case_id"], "BTCUSDT-case-4")
         self.assertEqual(active["entry_decision"], "BUY")
+        self.assertEqual(active["thesis_id"], "thesis-1")
+        self.assertEqual(active["management_template_id"], "position_manage_adaptive")
         self.assertEqual(active["payload"]["opened_via"], "intent_buy")
         self.assertEqual(closed["trade_case_id"], "BTCUSDT-case-4")
         self.assertEqual(closed["opened_at"], "2026-03-07 13:00:00")
         self.assertEqual(missing, {})
+
+    def test_candidate_policy_and_registry_round_trip(self):
+        candidate_id = self.store.save_candidate_policy_version(
+            {
+                "domain": "position_15m",
+                "policy_type": "management_fsm",
+                "regime_key": "aligned_up|high",
+                "policy_name": "reduce_stalled",
+                "source": "test",
+                "status": "candidate",
+                "rule_text": "Reduce when stalled.",
+                "config": {"stalled_minutes": 45},
+                "metrics": {"support_count": 4},
+            }
+        )
+        self.assertIsNotNone(candidate_id)
+        self.store.save_policy_evaluation(
+            {
+                "candidate_policy_id": candidate_id,
+                "evaluation_scope": "shadow",
+                "sample_count": 5,
+                "score": 0.8,
+                "metrics": {"avg_pnl": 0.8},
+            }
+        )
+        self.store.upsert_policy_registry(
+            {
+                "policy_key": "champion:position_15m:aligned_up|high",
+                "domain": "position_15m",
+                "policy_type": "management_fsm",
+                "regime_key": "aligned_up|high",
+                "active_candidate_policy_id": candidate_id,
+                "version": 1,
+                "config": {"stalled_minutes": 45},
+                "metrics": {"score": 0.8},
+            }
+        )
+        registry = self.store.get_policy_registry_entry("champion:position_15m:aligned_up|high")
+        candidates = self.store.get_candidate_policy_versions(
+            domain="position_15m",
+            regime_key="aligned_up|high",
+            statuses=["candidate"],
+            limit=5,
+        )
+        evaluations = self.store.get_policy_evaluations(candidate_id)
+        self.assertEqual(registry["active_candidate_policy_id"], candidate_id)
+        self.assertEqual(registry["regime_key"], "aligned_up|high")
+        self.assertEqual(registry["config"]["stalled_minutes"], 45)
+        self.assertEqual(candidates[0]["rule_text"], "Reduce when stalled.")
+        self.assertEqual(evaluations[0]["sample_count"], 5)
+
+    def test_policy_bundle_round_trip(self):
+        self.store.upsert_policy_bundle(
+            {
+                "bundle_key": "bundle:aligned_up|high",
+                "regime_key": "aligned_up|high",
+                "status": "active",
+                "alpha_policy_key": "champion:alpha_1h:aligned_up|high",
+                "position_policy_key": "champion:position_15m:aligned_up|high",
+                "safety_policy_key": "champion:safety_5m:aligned_up|high",
+                "execution_policy_key": "champion:execution_5m:aligned_up|high",
+                "metrics": {"score": 0.9},
+            }
+        )
+        bundle = self.store.get_active_policy_bundle(regime_key="aligned_up|high")
+        self.store.save_bundle_evaluation(
+            {
+                "bundle_key": "bundle:aligned_up|high",
+                "evaluation_scope": "bundle_batch",
+                "sample_count": 3,
+                "score": 0.9,
+                "metrics": {"component_scores": {"alpha_1h": 0.8}},
+            }
+        )
+        evaluations = self.store.get_bundle_evaluations("bundle:aligned_up|high")
+        self.assertEqual(bundle["bundle_key"], "bundle:aligned_up|high")
+        self.assertEqual(bundle["safety_policy_key"], "champion:safety_5m:aligned_up|high")
+        self.assertEqual(bundle["metrics"]["score"], 0.9)
+        self.assertEqual(evaluations[0]["sample_count"], 3)
 
     def test_trade_case_round_trip_and_query(self):
         self.store.upsert_trade_case(
@@ -1035,6 +1165,99 @@ class TestStateStore(unittest.TestCase):
         self.assertIn("idx_symbol_journal_symbol_id", index_names)
         self.assertIn("idx_symbol_journal_timestamp_id", index_names)
         self.assertIn("idx_symbol_journal_audit_log_id", index_names)
+
+    def test_recent_closed_trade_case_for_symbol_exposes_reentry_guard(self):
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-guard",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "opened_at": "2026-03-08 09:00:00",
+                "closed_at": "2026-03-08 09:50:00",
+                "estimated_pnl_pct": -0.7,
+                "exit_reason": "thesis_break",
+            }
+        )
+
+        guard = self.store.get_recent_closed_trade_case_for_symbol(
+            symbol="BTCUSDT",
+            close_cooldown_minutes=10,
+            loss_cooldown_minutes=30,
+            loss_threshold_pct=0.0,
+            now=datetime(2026, 3, 8, 10, 0, 0),
+        )
+
+        self.assertTrue(guard["active"])
+        self.assertEqual(guard["reason"], "recent_symbol_loss_guard")
+        self.assertEqual(guard["remaining_minutes"], 20)
+        self.assertEqual(guard["exit_reason"], "thesis_break")
+
+    def test_recent_closed_trade_case_for_symbol_can_require_no_active_case(self):
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-case-guard",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "opened_at": "2026-03-08 09:00:00",
+                "closed_at": "2026-03-08 09:50:00",
+                "estimated_pnl_pct": -0.7,
+                "exit_reason": "thesis_break",
+            }
+        )
+        self.store.upsert_active_trade_case(
+            symbol="BTCUSDT",
+            trade_case_id="BTCUSDT-case-live",
+            opened_at="2026-03-08 09:55:00",
+            payload={},
+        )
+
+        guard = self.store.get_recent_closed_trade_case_for_symbol(
+            symbol="BTCUSDT",
+            close_cooldown_minutes=10,
+            loss_cooldown_minutes=30,
+            loss_threshold_pct=0.0,
+            require_no_active_case=True,
+            now=datetime(2026, 3, 8, 10, 0, 0),
+        )
+
+        self.assertEqual(guard, {})
+
+    def test_order_state_transitions_persist_replace_lineage_fields(self):
+        self.store.save_order_state_transitions(
+            audit_log_id=1,
+            entries=[
+                {
+                    "symbol": "BTCUSDT",
+                    "client_order_id": "cid-replace",
+                    "exchange_order_id": "oid-replace",
+                    "from_state": "none",
+                    "to_state": "deferred",
+                    "event_type": "replace_deferred",
+                    "payload": {
+                        "replace_group_id": "replace-1",
+                        "lineage_role": "replacement",
+                        "lineage_parent_order_id": "oid-parent",
+                        "lineage_parent_client_order_id": "cid-parent",
+                    },
+                }
+            ],
+        )
+
+        row = self.store.conn.execute(
+            """
+            SELECT state, replace_group_id, lineage_role, lineage_parent_order_id, lineage_parent_client_order_id
+            FROM order_runtime_state
+            WHERE client_order_id = ?
+            """,
+            ("cid-replace",),
+        ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["state"], "deferred")
+        self.assertEqual(row["replace_group_id"], "replace-1")
+        self.assertEqual(row["lineage_role"], "replacement")
+        self.assertEqual(row["lineage_parent_order_id"], "oid-parent")
+        self.assertEqual(row["lineage_parent_client_order_id"], "cid-parent")
 
     def test_runtime_lock_blocks_other_owner_until_release(self):
         acquired_a = self.store.try_acquire_runtime_lock("loop_lock", owner="worker-a", ttl_seconds=60)

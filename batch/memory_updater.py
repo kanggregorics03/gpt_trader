@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Literal
 
@@ -110,6 +111,20 @@ class MemoryUpdater:
             return fetcher(since)
         return []
 
+    def _fetch_execution_policy_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
+        since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
+        fetcher = getattr(self.state_store, "get_execution_policy_evaluations_since", None)
+        if callable(fetcher):
+            return fetcher(since)
+        return []
+
+    def _fetch_shadow_decision_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
+        since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
+        fetcher = getattr(self.state_store, "get_shadow_decisions_since", None)
+        if callable(fetcher):
+            return fetcher(since)
+        return []
+
     def _build_stats_package(
         self,
         journals: List[Dict[str, Any]],
@@ -118,11 +133,15 @@ class MemoryUpdater:
         trade_cases: List[Dict[str, Any]] | None = None,
         retrieval_evaluations: List[Dict[str, Any]] | None = None,
         replay_runs: List[Dict[str, Any]] | None = None,
+        execution_policy_evaluations: List[Dict[str, Any]] | None = None,
+        shadow_decisions: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         symbol_journals = symbol_journals or []
         trade_cases = trade_cases or []
         retrieval_evaluations = retrieval_evaluations or []
         replay_runs = replay_runs or []
+        execution_policy_evaluations = execution_policy_evaluations or []
+        shadow_decisions = shadow_decisions or []
         ledger_stats = self.state_store.get_position_ledger_stats(hours=window_hours)
         symbol_report = self.state_store.get_symbol_performance_report(hours=window_hours)
         daily_report = self.state_store.get_daily_ledger_report(days=max(1, round(window_hours / 24)))
@@ -179,6 +198,11 @@ class MemoryUpdater:
             replay_runs=replay_runs,
             retrieval_evaluations=retrieval_evaluations,
         )
+        execution_policy_summary = self._build_execution_policy_summary(execution_policy_evaluations)
+        execution_policy_recommendations = self._build_execution_policy_recommendations(
+            execution_policy_evaluations
+        )
+        shadow_policy_summary = self._build_shadow_policy_summary(shadow_decisions)
         trade_case_candidate_lessons = self._build_trade_case_candidate_lessons(trade_case_patterns)
         trade_case_cluster_candidate_lessons = self._build_trade_case_cluster_candidate_lessons(trade_case_clusters)
         merged_candidate_lessons = self._merge_candidate_lesson_dicts(
@@ -192,6 +216,14 @@ class MemoryUpdater:
             trade_case_candidate_lessons,
             trade_case_cluster_candidate_lessons,
         )
+        candidate_policies = self._build_candidate_policies(
+            stats_package_seed={
+                "candidate_lessons": merged_candidate_lessons,
+                "trade_case_patterns": trade_case_patterns,
+            },
+            trade_cases=trade_cases,
+            execution_policy_recommendations=execution_policy_recommendations,
+        )
 
         return {
             "window_hours": window_hours,
@@ -200,6 +232,8 @@ class MemoryUpdater:
             "trade_case_count": len(trade_cases),
             "retrieval_evaluation_count": len(retrieval_evaluations),
             "replay_run_count": len(replay_runs),
+            "execution_policy_evaluation_count": len(execution_policy_evaluations),
+            "shadow_decision_count": len(shadow_decisions),
             "closed_trade_case_count": len([case for case in trade_cases if str(case.get("status") or "") == "closed"]),
             "evaluated_trade_count": len(pnl_rows),
             "win_count": len(wins),
@@ -222,6 +256,10 @@ class MemoryUpdater:
             "trade_case_cluster_evaluation": trade_case_cluster_evaluation,
             "retrieval_evaluation_summary": retrieval_evaluation_summary,
             "retrieval_counterfactual_summary": retrieval_counterfactual_summary,
+            "execution_policy_summary": execution_policy_summary,
+            "execution_policy_recommendations": execution_policy_recommendations,
+            "shadow_policy_summary": shadow_policy_summary,
+            "candidate_policies": candidate_policies,
             "candidate_lessons": merged_candidate_lessons,
             "top_losses": [
                 {
@@ -1094,6 +1132,612 @@ class MemoryUpdater:
             round(utility_delta_sum / outcome_linked_count, 6) if outcome_linked_count else 0.0
         )
         return enriched
+
+    def _build_execution_policy_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not rows:
+            return {
+                "profile_counts": {},
+                "order_type_counts": {},
+                "avg_slippage_bps": 0.0,
+                "avg_fill_ratio": 0.0,
+                "sample_count": 0,
+                "cancel_count": 0,
+                "cancel_success_rate": 0.0,
+                "cancel_timeout_rate": 0.0,
+            }
+
+        profile_counts: Dict[str, int] = {}
+        order_type_counts: Dict[str, int] = {}
+        slippage_total = 0.0
+        fill_ratio_total = 0.0
+        slippage_count = 0
+        fill_ratio_count = 0
+        cancel_count = 0
+        cancel_success_count = 0
+        cancel_timeout_count = 0
+        for row in rows:
+            profile = str(row.get("execution_profile") or "unknown")
+            order_type = str(row.get("order_type") or "unknown")
+            profile_counts[profile] = profile_counts.get(profile, 0) + 1
+            order_type_counts[order_type] = order_type_counts.get(order_type, 0) + 1
+            if str(row.get("action_type") or "").strip().lower() == "cancel":
+                cancel_count += 1
+                status = str(row.get("status") or "").lower()
+                if status in ("canceled", "cancelled", "closed"):
+                    cancel_success_count += 1
+                if status in ("timeout_unresolved", "failed", "rejected"):
+                    cancel_timeout_count += 1
+                continue
+            slippage_bps = self._coerce_float(row.get("slippage_bps"))
+            if slippage_bps is not None:
+                slippage_total += slippage_bps
+                slippage_count += 1
+            fill_ratio = self._coerce_float(row.get("fill_ratio"))
+            if fill_ratio is not None:
+                fill_ratio_total += fill_ratio
+                fill_ratio_count += 1
+        return {
+            "profile_counts": profile_counts,
+            "order_type_counts": order_type_counts,
+            "avg_slippage_bps": round(slippage_total / max(1, slippage_count), 4),
+            "avg_fill_ratio": round(fill_ratio_total / max(1, fill_ratio_count), 4),
+            "sample_count": len(rows),
+            "cancel_count": cancel_count,
+            "cancel_success_rate": round((cancel_success_count / cancel_count), 4) if cancel_count else 0.0,
+            "cancel_timeout_rate": round((cancel_timeout_count / cancel_count), 4) if cancel_count else 0.0,
+        }
+
+    def _build_execution_policy_recommendations(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped: Dict[tuple[str, str, str, str, str, str], Dict[str, Dict[str, float]]] = {}
+        for row in rows or []:
+            symbol = str(row.get("symbol") or "").strip()
+            loop_mode = str(row.get("loop_mode") or "").strip()
+            action_type = str(row.get("action_type") or "").strip()
+            urgency_bucket = str(row.get("urgency_bucket") or "").strip()
+            liquidity_bucket = str(row.get("liquidity_bucket") or "").strip()
+            risk_mode = str(row.get("risk_mode") or "").strip() or "normal"
+            profile = str(row.get("execution_profile") or "").strip()
+            order_type = str(row.get("order_type") or "").strip()
+            if not loop_mode or not action_type or not urgency_bucket or not liquidity_bucket or not profile or not order_type:
+                continue
+            for scoped_symbol in (symbol, "*"):
+                if not scoped_symbol:
+                    continue
+                key = (
+                    scoped_symbol,
+                    loop_mode,
+                    action_type,
+                    urgency_bucket,
+                    liquidity_bucket,
+                    risk_mode,
+                )
+                bucket = grouped.setdefault(key, {})
+                stats = bucket.setdefault(
+                    profile,
+                    {
+                        "sample_count": 0.0,
+                        "fill_ratio_total": 0.0,
+                        "fill_ratio_count": 0.0,
+                        "slippage_total": 0.0,
+                        "slippage_count": 0.0,
+                        "outcome_total": 0.0,
+                        "outcome_count": 0.0,
+                        "timeout_count": 0.0,
+                        "open_count": 0.0,
+                        "order_type": order_type,
+                    },
+                )
+                stats["sample_count"] += 1.0
+                fill_ratio = self._coerce_float(row.get("fill_ratio"))
+                if fill_ratio is not None:
+                    stats["fill_ratio_total"] += fill_ratio
+                    stats["fill_ratio_count"] += 1.0
+                slippage_bps = self._coerce_float(row.get("slippage_bps"))
+                if slippage_bps is not None:
+                    stats["slippage_total"] += slippage_bps
+                    stats["slippage_count"] += 1.0
+                outcome = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+                if outcome is not None:
+                    stats["outcome_total"] += outcome
+                    stats["outcome_count"] += 1.0
+                status = str(row.get("status") or "").lower()
+                if status in ("timeout_unresolved", "failed", "rejected"):
+                    stats["timeout_count"] += 1.0
+                if status in ("open", "submitted", "partial_filled", "partially_filled", "partiallyfilled"):
+                    stats["open_count"] += 1.0
+
+        recommendations: List[Dict[str, Any]] = []
+        for key, profiles in grouped.items():
+            symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, risk_mode = key
+            ranked = []
+            for profile_name, stats in profiles.items():
+                sample_count = float(stats["sample_count"])
+                avg_fill_ratio = stats["fill_ratio_total"] / max(1.0, stats["fill_ratio_count"])
+                avg_slippage_bps = stats["slippage_total"] / max(1.0, stats["slippage_count"])
+                avg_outcome = stats["outcome_total"] / max(1.0, stats["outcome_count"]) if stats["outcome_count"] else 0.0
+                timeout_rate = stats["timeout_count"] / max(1.0, sample_count)
+                open_rate = stats["open_count"] / max(1.0, sample_count)
+                if action_type == "cancel":
+                    utility = (
+                        (avg_fill_ratio * 50.0)
+                        - (timeout_rate * 30.0)
+                        - (open_rate * 20.0)
+                    )
+                else:
+                    utility = (
+                        (avg_fill_ratio * 60.0)
+                        - (avg_slippage_bps * 1.5)
+                        + (avg_outcome * 2.0)
+                        - (timeout_rate * 25.0)
+                        - (open_rate * 10.0)
+                    )
+                ranked.append(
+                    (
+                        utility,
+                        {
+                            "profile_name": profile_name,
+                            "order_type": stats["order_type"],
+                            "sample_count": int(sample_count),
+                            "avg_fill_ratio": round(avg_fill_ratio, 4),
+                            "avg_slippage_bps": round(avg_slippage_bps, 4),
+                            "avg_outcome_estimated_pnl_pct": round(avg_outcome, 4),
+                            "timeout_rate": round(timeout_rate, 4),
+                            "open_rate": round(open_rate, 4),
+                            "utility_score": round(utility, 4),
+                        },
+                    )
+                )
+            if not ranked:
+                continue
+            ranked.sort(key=lambda item: (item[0], item[1]["sample_count"]), reverse=True)
+            best = ranked[0][1]
+            recommendations.append(
+                {
+                    "symbol": symbol,
+                    "loop_mode": loop_mode,
+                    "risk_mode": risk_mode,
+                    "action_type": action_type,
+                    "urgency_bucket": urgency_bucket,
+                    "liquidity_bucket": liquidity_bucket,
+                    "recommended_order_type": best["order_type"],
+                    "recommended_execution_profile": best["profile_name"],
+                    "metrics": {
+                        "sample_count": best["sample_count"],
+                        "avg_fill_ratio": best["avg_fill_ratio"],
+                        "avg_slippage_bps": best["avg_slippage_bps"],
+                        "avg_outcome_estimated_pnl_pct": best["avg_outcome_estimated_pnl_pct"],
+                        "timeout_rate": best["timeout_rate"],
+                        "open_rate": best["open_rate"],
+                        "utility_score": best["utility_score"],
+                        "profile_ranking": [item[1] for item in ranked[:3]],
+                    },
+                }
+            )
+        return recommendations
+
+    def _build_shadow_policy_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not rows:
+            return {"candidate_count": 0, "divergence_counts": {}, "avg_outcome_estimated_pnl_pct": 0.0}
+        divergence_counts: Dict[str, int] = {}
+        outcome_total = 0.0
+        outcome_count = 0
+        candidate_ids = set()
+        for row in rows:
+            candidate_ids.add(row.get("candidate_policy_id"))
+            divergence = str(row.get("divergence_type") or "none")
+            divergence_counts[divergence] = divergence_counts.get(divergence, 0) + 1
+            outcome = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+            if outcome is not None:
+                outcome_total += outcome
+                outcome_count += 1
+        return {
+            "candidate_count": len(candidate_ids),
+            "divergence_counts": divergence_counts,
+            "avg_outcome_estimated_pnl_pct": round(outcome_total / max(1, outcome_count), 4),
+        }
+
+    def _build_candidate_policies(
+        self,
+        stats_package_seed: Dict[str, Any],
+        trade_cases: List[Dict[str, Any]],
+        execution_policy_recommendations: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for recommendation in execution_policy_recommendations or []:
+            metrics = recommendation.get("metrics") or {}
+            sample_count = int(metrics.get("sample_count") or 0)
+            if sample_count < 4:
+                continue
+            candidates.append(
+                {
+                    "domain": "execution_5m",
+                    "policy_type": "execution_profile",
+                    "policy_name": f"exec_{recommendation.get('symbol')}_{recommendation.get('loop_mode')}_{recommendation.get('action_type')}",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": (
+                        f"Prefer {recommendation.get('recommended_execution_profile')} for "
+                        f"{recommendation.get('symbol')} {recommendation.get('loop_mode')} {recommendation.get('action_type')} "
+                        f"under {recommendation.get('urgency_bucket')}/{recommendation.get('liquidity_bucket')}."
+                    ),
+                    "config": dict(recommendation),
+                    "metrics": dict(metrics, seed_type="execution_profile"),
+                }
+            )
+
+        failure_counts = ((stats_package_seed.get("trade_case_patterns") or {}).get("failure_reason_counts") or {})
+        adverse = (failure_counts.get("adverse_price_follow_through") or {}).get("count", 0)
+        if adverse >= 2:
+            candidates.append(
+                {
+                    "domain": "position_15m",
+                    "policy_type": "management_fsm",
+                    "policy_name": "position_time_stop_reduce",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": "If no follow-through within 45 minutes then reduce 50 percent.",
+                    "config": {
+                        "stalled_minutes": 45.0,
+                        "stalled_max_pnl_pct": 0.2,
+                        "weakened_reduce_pct": 0.5,
+                    },
+                    "metrics": {"support_count": adverse, "seed_type": "failure_pattern"},
+                }
+            )
+
+        candidates.extend(self._build_alpha_candidate_policies(trade_cases))
+        candidates.extend(self._build_safety_candidate_policies(trade_cases))
+        candidates.extend(self._build_exposure_candidate_policies(trade_cases))
+
+        for lesson in (stats_package_seed.get("candidate_lessons") or [])[:6]:
+            rule = str((lesson or {}).get("rule") or "").strip()
+            if not rule:
+                continue
+            category = str((lesson or {}).get("category") or "lesson")
+            domain = "alpha_1h"
+            policy_type = "entry_filter"
+            if category == "risk_control" or "reduce" in rule.lower() or "exit" in rule.lower():
+                domain = "position_15m"
+                policy_type = "management_rule"
+            config = {"rule": rule, "category": category}
+            if domain == "alpha_1h":
+                continue
+            candidates.append(
+                {
+                    "domain": domain,
+                    "policy_type": policy_type,
+                    "policy_name": f"{domain}_{abs(hash(rule)) % 100000}",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": rule,
+                    "config": config,
+                    "metrics": {
+                        "support_count": int((lesson or {}).get("support_count") or 0),
+                        "seed_type": "candidate_lesson",
+                    },
+                }
+            )
+        return candidates
+
+    def _build_safety_candidate_policies(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in trade_cases or []:
+            if str(row.get("status") or "") != "closed":
+                continue
+            risk_mode = str(row.get("risk_mode") or "").strip().lower()
+            if risk_mode not in ("trigger", "normal"):
+                continue
+            regime_key = self._extract_trade_case_regime_key(row)
+            grouped.setdefault(regime_key, []).append(row)
+
+        candidates: List[Dict[str, Any]] = []
+        for regime_key, rows in grouped.items():
+            if len(rows) < 3:
+                continue
+            pnl_values = [self._coerce_float(row.get("estimated_pnl_pct")) or 0.0 for row in rows]
+            loss_values = [value for value in pnl_values if value < 0.0]
+            loss_rate = len(loss_values) / max(1, len(rows))
+            avg_loss = sum(loss_values) / max(1, len(loss_values)) if loss_values else 0.0
+            feature_rows = [((row.get("payload") or {}).get("feature_snapshot") or {}) for row in rows]
+            spread_samples = [
+                self._coerce_float(feature.get("spread_percentile_1h"))
+                for feature in feature_rows
+                if self._coerce_float(feature.get("spread_percentile_1h")) is not None
+            ]
+            depth_samples = [
+                self._coerce_float(feature.get("depth_percentile_1h"))
+                for feature in feature_rows
+                if self._coerce_float(feature.get("depth_percentile_1h")) is not None
+            ]
+            risk_trigger_counts = [
+                len((row.get("risk_trigger_reasons") or []) or (((row.get("payload") or {}).get("risk_trigger_reasons")) or []))
+                for row in rows
+            ]
+
+            config = {
+                "loss_exit_pct": -0.9,
+                "risk_trigger_exit_count": 1,
+                "microstructure_exit_spread_percentile": 85.0,
+                "microstructure_exit_depth_percentile": 15.0,
+                "profit_protect_trigger_pct": 1.0,
+                "profit_protect_reduce_fraction": 0.35,
+                "stale_order_minutes": 12.0,
+                "stale_order_risk_trigger_count": 1,
+            }
+            changed = False
+            if loss_rate >= 0.55 or avg_loss <= -0.9:
+                config["loss_exit_pct"] = -0.65
+                config["microstructure_exit_spread_percentile"] = round(
+                    min(spread_samples) if spread_samples else 78.0,
+                    2,
+                )
+                config["microstructure_exit_depth_percentile"] = round(
+                    max(depth_samples) if depth_samples else 20.0,
+                    2,
+                )
+                changed = True
+            if risk_trigger_counts and (sum(risk_trigger_counts) / max(1, len(risk_trigger_counts))) >= 1.5:
+                config["risk_trigger_exit_count"] = 1
+                config["profit_protect_reduce_fraction"] = 0.5
+                changed = True
+            if not changed:
+                continue
+            support_count = len(rows)
+            utility_score = round(abs(avg_loss) + loss_rate, 4)
+            candidates.append(
+                {
+                    "domain": "safety_5m",
+                    "policy_type": "execution_safety_fsm",
+                    "regime_key": regime_key or None,
+                    "policy_name": f"safety_{(regime_key or 'global').replace('|', '_')}",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": (
+                        f"5m safety loop exits faster in {regime_key or 'global'} when loss acceleration, "
+                        "risk triggers, and degraded microstructure align."
+                    ),
+                    "config": config,
+                    "metrics": {
+                        "support_count": support_count,
+                        "sample_count": support_count,
+                        "utility_score": utility_score,
+                        "loss_rate": round(loss_rate, 4),
+                        "avg_loss_pct": round(avg_loss, 4),
+                        "seed_type": "trade_case_safety",
+                        "regime_key": regime_key or "",
+                    },
+                }
+            )
+        return candidates
+
+    def _build_exposure_candidate_policies(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        mode_defaults = {
+            "normal": {"base_cap_pct": 100.0, "min_cap_pct": 25.0, "max_cap_pct": 125.0},
+        }
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in trade_cases or []:
+            if str(row.get("status") or "") != "closed":
+                continue
+            risk_mode = str(row.get("risk_mode") or "").strip().lower()
+            if risk_mode not in mode_defaults:
+                continue
+            regime_key = self._extract_trade_case_regime_key(row)
+            grouped.setdefault(f"{risk_mode}|{regime_key}", []).append(row)
+
+        candidates: List[Dict[str, Any]] = []
+        for exposure_regime_key, rows in grouped.items():
+            if len(rows) < 3:
+                continue
+            risk_mode, _, market_regime_key = exposure_regime_key.partition("|")
+            defaults = mode_defaults[risk_mode]
+            pnl_values = [self._coerce_float(row.get("estimated_pnl_pct")) or 0.0 for row in rows]
+            loss_count = len([value for value in pnl_values if value < 0.0])
+            win_count = len([value for value in pnl_values if value > 0.0])
+            avg_pnl = sum(pnl_values) / max(1, len(pnl_values))
+            loss_rate = loss_count / max(1, len(rows))
+            slippage_values = [
+                abs(self._coerce_float(row.get("slippage_bps")) or 0.0)
+                for row in rows
+                if self._coerce_float(row.get("slippage_bps")) is not None
+            ]
+            avg_slippage = sum(slippage_values) / max(1, len(slippage_values)) if slippage_values else 0.0
+            target_cap_pct = defaults["base_cap_pct"]
+            entry_size_multiplier = 1.0
+            if loss_rate >= 0.55 or avg_pnl <= -0.2:
+                target_cap_pct = max(
+                    defaults["min_cap_pct"],
+                    round(defaults["base_cap_pct"] * 0.7, 2),
+                )
+                entry_size_multiplier = 0.85
+            elif win_count >= 2 and (win_count / max(1, len(rows))) >= 0.67 and avg_pnl >= 0.35 and avg_slippage <= 6.0:
+                target_cap_pct = min(
+                    defaults["max_cap_pct"],
+                    round(defaults["base_cap_pct"] * 1.1, 2),
+                )
+            if target_cap_pct == defaults["base_cap_pct"] and entry_size_multiplier == 1.0:
+                continue
+            utility_score = round(abs(avg_pnl) + abs(target_cap_pct - defaults["base_cap_pct"]) / defaults["base_cap_pct"], 4)
+            direction = "reduce" if target_cap_pct < defaults["base_cap_pct"] else "expand"
+            candidates.append(
+                {
+                    "domain": "exposure_budget",
+                    "policy_type": "risk_profile_override",
+                    "regime_key": exposure_regime_key,
+                    "policy_name": f"exposure_{risk_mode}_{market_regime_key.replace('|', '_')}",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": (
+                        f"{risk_mode} regime {market_regime_key}: {direction} max participation to "
+                        f"{target_cap_pct:.2f}% with entry multiplier {entry_size_multiplier:.2f}."
+                    ),
+                    "config": {
+                        "max_order_notional_pct_balance": target_cap_pct,
+                        "entry_size_multiplier": entry_size_multiplier,
+                    },
+                    "metrics": {
+                        "risk_mode": risk_mode,
+                        "market_regime_key": market_regime_key,
+                        "support_count": len(rows),
+                        "sample_count": len(rows),
+                        "loss_rate": round(loss_rate, 4),
+                        "avg_estimated_pnl_pct": round(avg_pnl, 4),
+                        "avg_slippage_bps": round(avg_slippage, 4),
+                        "utility_score": utility_score,
+                        "seed_type": "trade_case_exposure_regime",
+                    },
+                }
+            )
+        return candidates
+
+    def _build_alpha_candidate_policies(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        closed_cases = [
+            row
+            for row in (trade_cases or [])
+            if str(row.get("status") or "") == "closed"
+            and str(row.get("entry_decision") or "").upper() in {"BUY", "SELL"}
+        ]
+        if not closed_cases:
+            return []
+        grouped_cases: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for row in closed_cases:
+            regime_key = self._extract_trade_case_regime_key(row)
+            bucket = grouped_cases.setdefault(regime_key, {"losses": [], "wins": []})
+            pnl = self._coerce_float(row.get("estimated_pnl_pct")) or 0.0
+            if pnl < 0.0:
+                bucket["losses"].append(row)
+            elif pnl > 0.0:
+                bucket["wins"].append(row)
+        feature_specs = [
+            {
+                "feature_key": "volume_ratio_15m",
+                "config_key": "min_volume_ratio_15m",
+                "policy_name": "alpha_min_volume_ratio",
+                "direction": "min",
+                "support_min": 2,
+                "loss_floor": 1.2,
+                "delta_margin": 0.1,
+                "adjustment": 0.1,
+                "round_digits": 2,
+                "rule_prefix": "Require volume_ratio_15m >=",
+            },
+            {
+                "feature_key": "spread_percentile_1h",
+                "config_key": "max_spread_percentile_1h",
+                "policy_name": "alpha_max_spread_percentile",
+                "direction": "max",
+                "support_min": 2,
+                "loss_floor": 75.0,
+                "delta_margin": 8.0,
+                "adjustment": -5.0,
+                "round_digits": 1,
+                "rule_prefix": "Disable entries when spread_percentile_1h >",
+            },
+            {
+                "feature_key": "distance_to_invalid_level",
+                "config_key": "max_distance_to_invalid_level",
+                "policy_name": "alpha_max_distance_to_invalid",
+                "direction": "max",
+                "support_min": 2,
+                "loss_floor": 1.0,
+                "delta_margin": 0.15,
+                "adjustment": -0.1,
+                "round_digits": 3,
+                "rule_prefix": "Disable entries when distance_to_invalid_level >",
+            },
+        ]
+
+        candidates: List[Dict[str, Any]] = []
+        for regime_key, buckets in grouped_cases.items():
+            loss_cases = buckets["losses"]
+            win_cases = buckets["wins"]
+            if len(loss_cases) < 2:
+                continue
+            for spec in feature_specs:
+                candidate = self._build_alpha_feature_candidate(loss_cases, win_cases, spec, regime_key=regime_key)
+                if candidate:
+                    candidates.append(candidate)
+        return candidates
+
+    def _build_alpha_feature_candidate(
+        self,
+        loss_cases: List[Dict[str, Any]],
+        win_cases: List[Dict[str, Any]],
+        spec: Dict[str, Any],
+        regime_key: str = "",
+    ) -> Dict[str, Any]:
+        feature_key = str(spec["feature_key"])
+        loss_values = self._extract_trade_case_feature_values(loss_cases, feature_key)
+        win_values = self._extract_trade_case_feature_values(win_cases, feature_key)
+        if len(loss_values) < int(spec.get("support_min") or 2):
+            return {}
+        loss_median = statistics.median(loss_values)
+        win_median = statistics.median(win_values) if win_values else None
+        direction = str(spec.get("direction") or "max")
+        delta_margin = float(spec.get("delta_margin") or 0.0)
+        loss_floor = float(spec.get("loss_floor") or 0.0)
+        if direction == "min":
+            if loss_median > loss_floor:
+                return {}
+            if win_median is not None and (win_median - loss_median) < delta_margin:
+                return {}
+        else:
+            if loss_median < loss_floor:
+                return {}
+            if win_median is not None and (loss_median - win_median) < delta_margin:
+                return {}
+        threshold = round(
+            loss_median + float(spec.get("adjustment") or 0.0),
+            int(spec.get("round_digits") or 2),
+        )
+        utility_score = 0.0
+        if win_median is not None:
+            utility_score = round(abs(win_median - loss_median), 4)
+        else:
+            utility_score = round(abs(loss_median), 4)
+        config_key = str(spec["config_key"])
+        return {
+            "domain": "alpha_1h",
+            "policy_type": "entry_filter",
+            "regime_key": regime_key or None,
+            "policy_name": str(spec["policy_name"]),
+            "source": "memory_updater",
+            "status": "candidate",
+            "rule_text": f"{spec['rule_prefix']} {threshold}.",
+            "config": {config_key: threshold},
+            "metrics": {
+                "support_count": len(loss_values),
+                "sample_count": len(loss_values),
+                "utility_score": utility_score,
+                "feature_key": feature_key,
+                "regime_key": regime_key or "",
+                "loss_median": round(loss_median, 4),
+                "win_median": round(win_median, 4) if win_median is not None else None,
+                "seed_type": "trade_case_feature_gap",
+            },
+        }
+
+    def _extract_trade_case_feature_values(self, trade_cases: List[Dict[str, Any]], feature_key: str) -> List[float]:
+        values: List[float] = []
+        for row in trade_cases or []:
+            payload = row.get("payload") or {}
+            feature_snapshot = payload.get("feature_snapshot") or {}
+            value = self._coerce_float(feature_snapshot.get(feature_key))
+            if value is not None:
+                values.append(value)
+        return values
+
+    def _extract_trade_case_regime_key(self, trade_case: Dict[str, Any]) -> str:
+        payload = trade_case.get("payload") or {}
+        regime_tags = payload.get("regime_tags") or []
+        trend_alignment = "mixed"
+        volatility_regime = "unknown"
+        for tag in regime_tags:
+            tag_text = str(tag or "").strip()
+            if tag_text.startswith("trend:"):
+                trend_alignment = tag_text.split(":", 1)[1] or trend_alignment
+            elif tag_text.startswith("volatility:"):
+                volatility_regime = tag_text.split(":", 1)[1] or volatility_regime
+        return f"{trend_alignment}|{volatility_regime}"
 
     def _build_trade_case_clusters(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         closed_cases = [row for row in trade_cases if str(row.get("status") or "") == "closed"]
@@ -2079,6 +2723,7 @@ Computed statistics:
                 "trade_case_count": stats_package.get("trade_case_count", 0),
                 "retrieval_evaluation_count": stats_package.get("retrieval_evaluation_count", 0),
                 "replay_run_count": stats_package.get("replay_run_count", 0),
+                "execution_policy_evaluation_count": stats_package.get("execution_policy_evaluation_count", 0),
                 "closed_trade_case_count": stats_package.get("closed_trade_case_count", 0),
                 "evaluated_trade_count": stats_package["evaluated_trade_count"],
                 "trade_case_patterns": stats_package.get("trade_case_patterns", {}),
@@ -2086,6 +2731,7 @@ Computed statistics:
                 "trade_case_cluster_evaluation": stats_package.get("trade_case_cluster_evaluation", {}),
                 "retrieval_evaluation_summary": stats_package.get("retrieval_evaluation_summary", {}),
                 "retrieval_counterfactual_summary": stats_package.get("retrieval_counterfactual_summary", {}),
+                "execution_policy_summary": stats_package.get("execution_policy_summary", {}),
                 "confidence_score": confidence_score,
                 "validity_score": confidence_score,
                 "decay_score": 1.0,
@@ -2109,6 +2755,299 @@ Computed statistics:
             )
         return self._reconcile_long_term_memory_entries(entries, existing_memories or [], now)
 
+    def _sync_candidate_policies(self, candidate_policies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        saved = []
+        for candidate in candidate_policies or []:
+            candidate_id = None
+            if hasattr(self.state_store, "save_candidate_policy_version"):
+                candidate_id = self.state_store.save_candidate_policy_version(candidate)
+            saved.append({**candidate, "id": candidate_id})
+        return saved
+
+    def _evaluate_candidate_policies(
+        self,
+        candidates: List[Dict[str, Any]],
+        shadow_decisions: List[Dict[str, Any]],
+        replay_runs: List[Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        shadow_grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for row in shadow_decisions or []:
+            try:
+                candidate_id = int(row.get("candidate_policy_id"))
+            except (TypeError, ValueError):
+                continue
+            shadow_grouped.setdefault(candidate_id, []).append(row)
+        evaluations = []
+        replay_summary = self._build_replay_execution_summary(replay_runs or [])
+        for candidate in candidates or []:
+            candidate_id = candidate.get("id")
+            domain = str(candidate.get("domain") or "").strip()
+            metrics = dict(candidate.get("metrics") or {})
+            support_count = int(metrics.get("sample_count") or metrics.get("support_count") or 0)
+            score = float(metrics.get("utility_score") or 0.0)
+            sample_count = support_count
+            scope = "seed"
+            if candidate_id and candidate_id in shadow_grouped:
+                rows = shadow_grouped[candidate_id]
+                realized = []
+                for row in rows:
+                    outcome = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+                    if outcome is None:
+                        continue
+                    adjusted = outcome
+                    if domain == "alpha_1h" and str(row.get("divergence_type") or "") == "entry_block":
+                        adjusted = -outcome
+                    elif domain == "safety_5m":
+                        divergence_type = str(row.get("divergence_type") or "")
+                        if divergence_type == "risk_exit":
+                            adjusted = -outcome
+                        elif divergence_type == "risk_reduce":
+                            adjusted = -(outcome * 0.5)
+                    realized.append(adjusted)
+                sample_count = len(rows)
+                score = round(sum(realized) / max(1, len(realized)), 4) if realized else 0.0
+                scope = "shadow"
+            evaluation = {
+                "candidate_policy_id": candidate_id,
+                "evaluation_scope": scope,
+                "sample_count": sample_count,
+                "score": score,
+                "metrics": {
+                    **metrics,
+                    "domain": candidate.get("domain"),
+                    "policy_type": candidate.get("policy_type"),
+                    "replay_execution_summary": replay_summary,
+                },
+            }
+            evaluations.append(evaluation)
+            if candidate_id and hasattr(self.state_store, "save_policy_evaluation"):
+                self.state_store.save_policy_evaluation(evaluation)
+        return evaluations
+
+    def _promote_candidate_policies(self, candidates: List[Dict[str, Any]], evaluations: List[Dict[str, Any]]):
+        best_by_domain: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for candidate in candidates or []:
+            candidate_id = candidate.get("id")
+            if not candidate_id:
+                continue
+            evaluation = next((row for row in evaluations if row.get("candidate_policy_id") == candidate_id), None)
+            if not evaluation:
+                continue
+            domain = str(candidate.get("domain") or "").strip()
+            regime_key = str(candidate.get("regime_key") or ((evaluation.get("metrics") or {}).get("regime_key")) or "").strip()
+            key = (domain, regime_key)
+            current = best_by_domain.get(key)
+            if current is None or float(evaluation.get("score") or 0.0) > float(current["evaluation"].get("score") or 0.0):
+                best_by_domain[key] = {"candidate": candidate, "evaluation": evaluation}
+
+        for (domain, _), bundle in best_by_domain.items():
+            candidate = bundle["candidate"]
+            evaluation = bundle["evaluation"]
+            sample_count = int(evaluation.get("sample_count") or 0)
+            score = float(evaluation.get("score") or 0.0)
+            evaluation_scope = str(evaluation.get("evaluation_scope") or "seed")
+            if domain == "alpha_1h":
+                if evaluation_scope == "shadow":
+                    if sample_count < 2 or score <= 0:
+                        continue
+                else:
+                    if sample_count < 4 or score < 0.15:
+                        continue
+            elif sample_count < 3 or score <= 0:
+                continue
+            regime_key = str(candidate.get("regime_key") or ((evaluation.get("metrics") or {}).get("regime_key")) or "").strip()
+            policy_key = (
+                self.state_store.build_policy_key(domain, regime_key)
+                if hasattr(self.state_store, "build_policy_key")
+                else (f"champion:{domain}:{regime_key}" if regime_key else f"champion:{domain}")
+            )
+            existing = self.state_store.get_policy_registry_entry(policy_key) if hasattr(self.state_store, "get_policy_registry_entry") else {}
+            existing_score = float(((existing.get("metrics") or {}).get("score")) or 0.0) if existing else 0.0
+            if existing and score <= existing_score:
+                continue
+            version = int(existing.get("version") or 0) + 1 if existing else 1
+            registry_entry = {
+                "policy_key": policy_key,
+                "domain": domain,
+                "policy_type": candidate.get("policy_type"),
+                "regime_key": regime_key or None,
+                "active_candidate_policy_id": candidate.get("id"),
+                "version": version,
+                "config": candidate.get("config") or {},
+                "metrics": {
+                    "score": score,
+                    "sample_count": sample_count,
+                    "candidate_policy_id": candidate.get("id"),
+                    "rule_text": candidate.get("rule_text"),
+                    "regime_key": regime_key or "",
+                },
+            }
+            if hasattr(self.state_store, "upsert_policy_registry"):
+                self.state_store.upsert_policy_registry(registry_entry)
+            if hasattr(self.state_store, "save_policy_promotion"):
+                self.state_store.save_policy_promotion(
+                    {
+                        "domain": domain,
+                        "regime_key": regime_key or None,
+                        "previous_candidate_policy_id": existing.get("active_candidate_policy_id") if existing else None,
+                        "new_candidate_policy_id": candidate.get("id"),
+                        "reason": f"Auto-promoted from {evaluation.get('evaluation_scope')} evaluation.",
+                        "metrics": registry_entry["metrics"],
+                    }
+                )
+
+    def _build_replay_execution_summary(self, replay_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not replay_runs:
+            return {"count": 0, "avg_fill_ratio": 0.0, "avg_slippage_bps": 0.0, "avg_latency_seconds": 0.0}
+        fill_ratios = []
+        slippages = []
+        latencies = []
+        for row in replay_runs:
+            payload = row.get("payload") or {}
+            fill_ratio = self._coerce_float(payload.get("simulated_fill_ratio"))
+            slippage = self._coerce_float(payload.get("simulated_slippage_bps"))
+            latency = self._coerce_float(payload.get("simulated_latency_seconds"))
+            if fill_ratio is not None:
+                fill_ratios.append(fill_ratio)
+            if slippage is not None:
+                slippages.append(slippage)
+            if latency is not None:
+                latencies.append(latency)
+        return {
+            "count": len(replay_runs),
+            "avg_fill_ratio": round(sum(fill_ratios) / max(1, len(fill_ratios)), 4) if fill_ratios else 0.0,
+            "avg_slippage_bps": round(sum(slippages) / max(1, len(slippages)), 4) if slippages else 0.0,
+            "avg_latency_seconds": round(sum(latencies) / max(1, len(latencies)), 4) if latencies else 0.0,
+        }
+
+    def _build_policy_bundles(self) -> List[Dict[str, Any]]:
+        if not hasattr(self.state_store, "list_policy_registry"):
+            return []
+        registry_entries = self.state_store.list_policy_registry()
+        grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for row in registry_entries:
+            regime_key = str(row.get("regime_key") or "").strip()
+            grouped.setdefault(regime_key, {})[str(row.get("domain") or "")] = row
+        bundles = []
+        for regime_key, domains in grouped.items():
+            bundle_key = f"bundle:{regime_key or 'global'}"
+            bundles.append(
+                {
+                    "bundle_key": bundle_key,
+                    "regime_key": regime_key or None,
+                    "status": "candidate",
+                    "alpha_policy_key": (domains.get("alpha_1h") or {}).get("policy_key"),
+                    "position_policy_key": (domains.get("position_15m") or {}).get("policy_key"),
+                    "safety_policy_key": (domains.get("safety_5m") or {}).get("policy_key"),
+                    "execution_policy_key": (domains.get("execution_5m") or {}).get("policy_key"),
+                    "metrics": {
+                        "component_scores": {
+                            domain: float(((row.get("metrics") or {}).get("score")) or 0.0)
+                            for domain, row in domains.items()
+                        }
+                    },
+                }
+            )
+        return bundles
+
+    def _evaluate_policy_bundles(self, bundles: List[Dict[str, Any]], replay_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        replay_summary = self._build_replay_execution_summary(replay_runs)
+        evaluations = []
+        for bundle in bundles or []:
+            component_scores = (bundle.get("metrics") or {}).get("component_scores") or {}
+            score = 0.0
+            if component_scores:
+                score = sum(float(value or 0.0) for value in component_scores.values()) / max(1, len(component_scores))
+            score += max(0.0, (1.0 - float(replay_summary.get("avg_slippage_bps") or 0.0) / 25.0) * 0.1)
+            score += min(0.1, float(replay_summary.get("avg_fill_ratio") or 0.0) * 0.1)
+            evaluation = {
+                "bundle_key": bundle.get("bundle_key"),
+                "evaluation_scope": "bundle_batch",
+                "sample_count": len(component_scores),
+                "score": round(score, 4),
+                "metrics": {
+                    "regime_key": bundle.get("regime_key"),
+                    "component_scores": component_scores,
+                    "replay_execution_summary": replay_summary,
+                },
+            }
+            evaluations.append(evaluation)
+            if hasattr(self.state_store, "save_bundle_evaluation"):
+                self.state_store.save_bundle_evaluation(evaluation)
+        return evaluations
+
+    def _promote_policy_bundles(self, bundles: List[Dict[str, Any]], evaluations: List[Dict[str, Any]]):
+        best_by_regime: Dict[str, Dict[str, Any]] = {}
+        for bundle in bundles or []:
+            evaluation = next((row for row in evaluations if row.get("bundle_key") == bundle.get("bundle_key")), None)
+            if not evaluation:
+                continue
+            regime_key = str(bundle.get("regime_key") or "").strip()
+            current = best_by_regime.get(regime_key)
+            if current is None or float(evaluation.get("score") or 0.0) > float(current["evaluation"].get("score") or 0.0):
+                best_by_regime[regime_key] = {"bundle": bundle, "evaluation": evaluation}
+        for regime_key, payload in best_by_regime.items():
+            bundle = payload["bundle"]
+            evaluation = payload["evaluation"]
+            if int(evaluation.get("sample_count") or 0) < 2 or float(evaluation.get("score") or 0.0) <= 0:
+                continue
+            existing = self.state_store.get_active_policy_bundle(regime_key=regime_key) if hasattr(self.state_store, "get_active_policy_bundle") else {}
+            existing_score = float(((existing.get("metrics") or {}).get("score")) or 0.0) if existing else 0.0
+            if existing and float(evaluation.get("score") or 0.0) <= existing_score:
+                continue
+            upsert_payload = dict(bundle)
+            upsert_payload["status"] = "active"
+            upsert_payload["metrics"] = {**(bundle.get("metrics") or {}), "score": evaluation.get("score")}
+            if hasattr(self.state_store, "upsert_policy_bundle"):
+                self.state_store.upsert_policy_bundle(upsert_payload)
+            if hasattr(self.state_store, "save_bundle_promotion"):
+                self.state_store.save_bundle_promotion(
+                    {
+                        "regime_key": regime_key or None,
+                        "previous_bundle_key": existing.get("bundle_key") if existing else None,
+                        "new_bundle_key": bundle.get("bundle_key"),
+                        "reason": "Auto-promoted regime bundle from component champion scores.",
+                        "metrics": upsert_payload["metrics"],
+                    }
+                )
+
+    def _rollback_degraded_bundles(self, shadow_decisions: List[Dict[str, Any]]):
+        if not hasattr(self.state_store, "get_recent_bundle_promotions") or not hasattr(self.state_store, "upsert_policy_bundle"):
+            return
+        active_global = self.state_store.get_active_policy_bundle(regime_key="")
+        bundle_candidates = [active_global] if active_global else []
+        seen_regimes = {str((active_global or {}).get("regime_key") or "")} if active_global else set()
+        for bundle in self.state_store.get_policy_bundles(statuses=["active"], limit=20) if hasattr(self.state_store, "get_policy_bundles") else []:
+            regime_key = str(bundle.get("regime_key") or "")
+            if regime_key in seen_regimes:
+                continue
+            bundle_candidates.append(bundle)
+            seen_regimes.add(regime_key)
+        overall_shadow_score = 0.0
+        shadow_count = 0
+        for row in shadow_decisions or []:
+            outcome = self._coerce_float(row.get("outcome_estimated_pnl_pct"))
+            if outcome is None:
+                continue
+            overall_shadow_score += outcome
+            shadow_count += 1
+        avg_shadow_outcome = overall_shadow_score / max(1, shadow_count) if shadow_count else 0.0
+        if avg_shadow_outcome >= -0.5:
+            return
+        for bundle in bundle_candidates:
+            regime_key = str(bundle.get("regime_key") or "")
+            promotions = self.state_store.get_recent_bundle_promotions(regime_key=regime_key or None, limit=2)
+            if len(promotions) < 1:
+                continue
+            previous_bundle_key = str((promotions[0].get("previous_bundle_key")) or "").strip()
+            if not previous_bundle_key:
+                continue
+            previous_bundle = self.state_store.get_policy_bundle(previous_bundle_key) if hasattr(self.state_store, "get_policy_bundle") else {}
+            if not previous_bundle:
+                continue
+            self.state_store.upsert_policy_bundle({**bundle, "status": "shadow"})
+            self.state_store.upsert_policy_bundle({**previous_bundle, "status": "active"})
+
     def run(self, window_hours: int = 24):
         logger.info("Starting Daily Memory Update Batch with model: {}", self.model_name)
         journals = self._fetch_window_entries(window_hours=window_hours)
@@ -2120,6 +3059,8 @@ Computed statistics:
         trade_cases = self._fetch_trade_case_window_entries(window_hours=window_hours)
         retrieval_evaluations = self._fetch_retrieval_window_entries(window_hours=window_hours)
         replay_runs = self._fetch_replay_window_entries(window_hours=window_hours)
+        execution_policy_evaluations = self._fetch_execution_policy_window_entries(window_hours=window_hours)
+        shadow_decisions = self._fetch_shadow_decision_window_entries(window_hours=window_hours)
         stats_package = self._build_stats_package(
             journals,
             window_hours=window_hours,
@@ -2127,6 +3068,8 @@ Computed statistics:
             trade_cases=trade_cases,
             retrieval_evaluations=retrieval_evaluations,
             replay_runs=replay_runs,
+            execution_policy_evaluations=execution_policy_evaluations,
+            shadow_decisions=shadow_decisions,
         )
         logger.info(
             "Prepared stats for memory update: journals={}, symbol_rows={}, trade_cases={}, evaluated={}, win_rate={:.2f}%",
@@ -2145,6 +3088,24 @@ Computed statistics:
             logger.info(f"Saved {len(entries)} grounded long-term memory entries.")
         else:
             logger.info("No actionable lessons extracted.")
+        execution_profiles = stats_package.get("execution_policy_recommendations") or []
+        if execution_profiles and hasattr(self.state_store, "save_execution_policy_profiles"):
+            self.state_store.save_execution_policy_profiles(execution_profiles)
+            logger.info("Saved {} execution policy profile recommendations.", len(execution_profiles))
+        saved_candidates = self._sync_candidate_policies(stats_package.get("candidate_policies") or [])
+        candidate_evaluations = self._evaluate_candidate_policies(
+            saved_candidates,
+            shadow_decisions,
+            replay_runs=replay_runs,
+        )
+        self._promote_candidate_policies(saved_candidates, candidate_evaluations)
+        bundles = self._build_policy_bundles()
+        if bundles and hasattr(self.state_store, "upsert_policy_bundle"):
+            for bundle in bundles:
+                self.state_store.upsert_policy_bundle(bundle)
+        bundle_evaluations = self._evaluate_policy_bundles(bundles, replay_runs)
+        self._promote_policy_bundles(bundles, bundle_evaluations)
+        self._rollback_degraded_bundles(shadow_decisions)
         logger.info("Daily Memory Update Completed.")
 
 

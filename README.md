@@ -39,10 +39,10 @@ JSON mode가 있는 provider는 native JSON 응답을 우선 사용하고, 없�
 `StateStore`가 audit, journal, fills, ledger, replay, 상태 전이 기록을 SQLite에 저장한다.  
 여기서 중요한 점은 "주문 후보 생성 근거 입력 해시"와 "주문/포지션 상태 머신"까지 저장한다는 것이다.
 
-### 5. 장기 학습
+### 5. 정책 진화
 
-일일 배치가 journal과 ledger를 바탕으로 장기 메모리를 생성한다.  
-장기 메모리는 단순 격언이 아니라, 언제 적용하고 언제 무시해야 하는지를 포함한 구조화 규칙으로 저장된다.
+일일 배치는 journal, trade case, replay, shadow decision을 바탕으로 장기 메모리뿐 아니라 `정책 후보`도 만든다.  
+후보 정책은 shadow/replay/실행 결과로 평가되고, 성능이 더 좋으면 `champion`으로 승격된다.
 
 ## 시스템 목표
 
@@ -80,7 +80,11 @@ StateStore -------/                  v                                  v
 그리고 별도 배치 경로가 있다.
 
 ```text
-journal + ledger stats -> MemoryUpdater -> long_term_memory
+journal + trade_cases + replay + shadow -> MemoryUpdater
+    -> long_term_memory
+    -> candidate_policy_versions
+    -> policy_registry (champions)
+    -> policy_bundles
 ```
 
 ## 프로젝트 구조
@@ -95,10 +99,14 @@ gpt_trader/
 │  ├─ llm_provider.py         # Gemini / OpenAI / DeepSeek / Anthropic adapter
 │  └─ rag_engine.py           # 유사 과거 케이스 검색
 ├─ batch/
-│  └─ memory_updater.py       # 장기 메모리 일일 배치
+│  └─ memory_updater.py       # 장기 메모리 + 정책 후보 생성/평가/승격 배치
 ├─ core/
+│  ├─ alpha_policy.py         # 1h 진입 필터 정책 엔진
+│  ├─ execution_policy.py     # market/limit 및 execution profile 정책 엔진
 │  ├─ models.py               # Pydantic 데이터 모델
+│  ├─ position_policy.py      # 15m 포지션 FSM 정책 엔진
 │  ├─ risk_engine.py          # 정책 검증, 리스크 모드/프로파일 계산
+│  ├─ safety_policy.py        # 5m execution safety FSM 정책 엔진
 │  └─ snapshot_service.py     # 공용 계좌/시장/리스크 스냅샷 조립
 ├─ dashboard/
 │  └─ app.py                  # Flask 운영 대시보드
@@ -195,12 +203,18 @@ gpt_trader/
 - 일일 시작 잔고
 - 일일 손익률
 - 연속 손실 횟수
+- 최근 손실 강도
+- 동적 쿨다운 길이와 구성 요소
 - 쿨다운 활성 여부
 - 쿨다운 남은 시간
+- 반복 실패 패턴 점수 / 대표 실패 사유
 - 드로우다운 활성 여부
+- 심볼별 recent close / recent loss 기반 재진입 가드 상태
 
 이 값은 단순 모니터링용이 아니라, 실제로 리스크 모드를 결정하는 입력으로 사용된다.
-또한 그대로 `DecisionRequest.risk_state`에 실려 AI에도 전달된다.
+`StateStore.get_risk_state()`가 만든 기본 필드에 더해, 오케스트레이터는 현재 단일 운용 심볼에 대한
+recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입으로 덧붙여
+`DecisionRequest.risk_state`와 audit/RAG 컨텍스트에 일관되게 싣는다.
 
 ### 3. 리스크 모드와 프로파일 결정
 
@@ -227,6 +241,16 @@ gpt_trader/
 즉, 같은 `BUY`라도 지금이 `normal`인지 `drawdown`인지에 따라 허용 여부와 크기 제한이 달라질 수 있다.  
 최근 구현에서는 `drawdown`이 신규 진입을 완전히 막지는 않되, `entry_size_multiplier`, `confidence_cap`, `failure_pattern_score`를 이용해 size cap을 한 번 더 줄인다.
 
+추가로 현재 구현에서는 `normal` 모드에서만 레짐별 `exposure_budget` 챔피언 정책을 읽어
+`max_order_notional_pct_balance`와 `entry_size_multiplier`를 override할 수 있다.
+`trigger` 모드는 기본 risk profile을 그대로 사용한다.
+반면 아래 안전 가드레일은 자동 진화 대상이 아니다.
+
+- `max_leverage`
+- `drawdown_activate_pct`
+- `daily_max_loss_pct`
+- `cooldown` 최대 한도
+
 ### 4. 단일 adaptive loop와 cadence 전환
 
 현재 구현에서 중요한 변경점은 `루프가 하나만 돈다`는 것이다.  
@@ -235,7 +259,8 @@ gpt_trader/
 우선순위는 다음과 같다.
 
 - `5m`
-  - opportunity trigger가 활성화된 경우
+  - opportunity trigger가 활성화되어 있고
+  - 동시에 포지션 / 미체결 주문 / unknown order 같은 active management 대상이 있는 경우
 - `15m`
   - 포지션이 있거나
   - 미체결 주문이 있거나
@@ -249,11 +274,14 @@ gpt_trader/
 - `1h -> 15m`
   - 포지션/주문/복구 필요 상태가 생기면 즉시 승격
 - `1h or 15m -> 5m`
-  - trigger가 켜지면 즉시 승격
+  - strong trigger 조건이 충족되고
+  - 동시에 active management 대상이 있으면 즉시 승격
 - `5m -> 15m or 1h`
-  - trigger가 꺼졌다고 바로 강등하지 않고 clear streak를 만족해야 함
+  - active management 대상이 남아 있으면 clear streak를 만족한 뒤 강등
+  - 포지션 / 미체결 주문 / unknown order가 모두 사라진 flat 상태에서는 clear streak 없이 즉시 강등
 - `15m -> 1h`
-  - flat 상태가 여러 사이클 연속 확인돼야 함
+  - recent execution / recent close TTL이 남아 있으면 유지
+  - TTL까지 끝난 완전 flat 상태에서는 즉시 `1h`로 복귀
 
 이 히스테리시스는 cadence가 `5m <-> 15m <-> 1h` 사이에서 경계값 근처에서 깜빡이는 현상을 줄이기 위한 것이다.
 
@@ -262,13 +290,18 @@ gpt_trader/
 - `1h`
   - 전략 판단 중심
   - 신규 진입과 방향성 결정을 담당
+  - `AlphaPolicyEngine`이 먼저 레짐별 진입 필터를 적용하고, 통과한 심볼만 AI 판단 대상으로 보낸다
 - `15m`
   - 포지션/주문 관리 중심
-  - 기본적으로 신규 진입보다 `REDUCE`, `EXIT`, 주문 정리 쪽으로 제한
+  - 기본적으로 신규 진입보다 `REDUCE`, `EXIT`, `CANCEL`, 주문 정리 쪽으로 제한
+  - 기본 경로는 AI가 아니라 `PositionPolicyEngine` FSM이며, 예외시만 AI가 다시 본다
 - `5m`
-  - trigger 대응 중심
-  - active trigger 구간에서 더 짧은 주기로 반응
-  - 기본 정책에서는 포지션이 없을 때만 첫 진입을 허용하고, 이미 포지션이 있으면 추가 trigger-mode 진입 대신 `HOLD / REDUCE / EXIT` 위주로 제한
+  - execution safety 중심
+  - active trigger 구간에서 더 짧은 주기로 실행 품질과 급변 리스크를 감시
+  - 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이며, 신규 진입은 만들지 않고 `HOLD / REDUCE / EXIT / CANCEL`만 다룬다
+  - 포지션이 사라진 뒤에는 recent execution / close만으로 `5m`를 유지하지 않고 `15m` 관리 주기로 즉시 내린다
+
+이 구조는 `1h = alpha loop`, `15m = position management loop`, `5m = execution safety loop`라는 역할 분리를 따른다.
 
 ### 5. Trigger 분리 원칙
 
@@ -286,7 +319,7 @@ gpt_trader/
 현재 기본 구현에서는 `risk_trigger`를 신규 진입의 하드 차단으로 쓰기보다, 승인 사유에 advisory로 남겨 판단 맥락을 강화한다.
 
 현재 구현에서는 별도의 `Trigger (5m)` 작업이 따로 스케줄되지 않는다.  
-대신 공용 스냅샷에서 같은 심볼에 대해 `opportunity_trigger_reasons`가 2개 이상이면서, 그 안에 `volume_surge_15m` 또는 `range_break_1h` 같은 strong trigger가 포함될 때만 다음 cadence가 `5m`로 승격된다. fast move 단독으로는 승격되지 않는다.
+대신 공용 스냅샷에서 같은 심볼에 대해 `opportunity_trigger_reasons`가 2개 이상이면서, 그 안에 `volume_surge_15m` 또는 `range_break_1h` 같은 strong trigger가 포함될 때 `trigger_active`가 켜진다. 다만 실제 cadence가 `5m`로 승격되려면 여기에 더해 포지션, 미체결 주문, unknown order 같은 active management 대상이 있어야 한다. 즉 flat 상태에서 trigger만 켜진 경우는 `5m`로 바로 올라가지 않는다. fast move 단독으로도 승격되지 않는다.
 
 `fast_price_move_15m`, `volume_surge_15m`, `range_break_1h`에는 심볼별 히스테리시스를 적용한다.  
 즉, 경계값 부근에서는 직전 상태를 참고해 매 루프마다 `trigger mode`가 깜빡이는 현상을 줄인다.
@@ -330,7 +363,7 @@ gpt_trader/
 즉, 리스크 엔진이 나중에 막기만 하는 구조가 아니라, 애초에 더 보수적인 제안을 하도록 유도한다.
 
 둘째, AI는 `risk_state`의 구체 수치도 함께 받는다.  
-즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간, 동적 쿨다운 길이, 반복 실패 패턴 점수까지 보고 위험도를 해석할 수 있다.
+즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간, 동적 쿨다운 길이, 반복 실패 패턴 점수, 현재 심볼의 재진입 가드 상태까지 보고 위험도를 해석할 수 있다.
 
 셋째, 시장 스냅샷 안에서 `opportunity_trigger_reasons`와 `risk_trigger_reasons`를 분리해 전달한다.  
 즉, “시장이 움직였다”와 “지금 거래 품질이 나쁘다”를 같은 신호로 취급하지 않는다.
@@ -346,11 +379,11 @@ LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 �
 넷째, 장기 메모리는 더 이상 단순 문장 리스트만이 아니다.  
 규칙, 지원 근거 수, 적용 조건, 무시 조건을 가진 구조화 레코드로 전달될 수 있다.
 
-다섯째, 멀티 심볼 운영에서는 심볼별로 AI를 여러 번 부르지 않고 한 사이클에 `market_snapshots` 전체를 묶어 포트폴리오 단일 의사결정을 생성한다.  
-같은 계좌 상태, 장기 메모리, journal 문맥을 반복 전송하지 않기 때문에 API 비용이 줄고, 심볼 간 우선순위 비교도 한 번에 가능해진다.
+다섯째, 현재 프로젝트는 단일 심볼 운영을 전제로 한다.  
+`trading.symbols`에 여러 개를 적더라도 런타임에서는 첫 번째 심볼만 사용하고, `max_open_positions`도 1로 정규화한다.
 
 여섯째, RAG는 최근 audit를 심볼별로 반복 스캔하지 않는다.  
-audit 저장 시 심볼별 feature vector를 함께 저장하고, 조회 시에는 여러 심볼의 유사 케이스를 한 번의 DB 스캔으로 배치 계산한다.
+현재는 단일 심볼만 운용하지만, audit 저장 시 feature vector를 심볼 키로 남겨 이후 복기와 확장 시에도 같은 구조를 재사용한다.
 
 일곱째, RAG feature vector는 단순 시장 13차원만 쓰지 않는다.  
 시장 13차원 + 의사결정 컨텍스트 13차원(리스크 상태, 계좌 상태, 심볼 포지션/오더 상태)으로 확장한 26차원 벡터를 사용한다.
@@ -384,14 +417,50 @@ audit 저장 시 심볼별 feature vector를 함께 저장하고, 조회 시에�
 해시는 의도적으로 "주문 후보 생성의 핵심 사실 입력"에 집중하고 있다.  
 즉, 최근 journal이나 장기 메모리 같은 보조 문맥보다, 정책/시장/계좌/활성 리스크 컨텍스트의 핵심 조합을 기준으로 남긴다.
 
+## 정책 진화 계층
+
+현재 구현은 단순 `메모리 축적`이 아니라 제한된 정책 공간 안에서 자동 진화하는 구조다.
+
+- `alpha_1h`
+  - 레짐별 진입 필터 후보 생성
+  - live entry와 후보 필터의 차이를 shadow로 저장
+  - 성능 우위 시 champion 승격
+- `position_15m`
+  - FSM 관리 정책 후보 생성
+  - shadow decision과 실제 outcome을 비교
+  - 성능 우위 시 champion 승격
+- `execution_5m`
+  - market/limit 및 execution profile 추천 학습
+  - 실제 fill/slippage/latency 결과를 저장
+  - context bucket별 champion profile 승격
+- `safety_5m`
+  - 5분 safety FSM 후보 생성
+  - live safety decision과 shadow candidate 차이를 저장
+  - 손실 회피 효과가 확인되면 champion 승격
+- `exposure_budget`
+  - `normal/trigger` 레짐별 최대 참여율과 entry multiplier를 자동 조정
+  - `max_leverage`와 `drawdown` 트리거는 고정 가드레일로 유지
+
+또한 개별 champion 위에 `policy_bundle` 계층이 있다.
+
+- 레짐별로 `alpha + position + safety + execution` champion을 bundle로 묶는다
+- bundle score가 더 좋으면 active bundle로 승격한다
+- 최근 shadow 성과가 크게 악화되면 이전 bundle로 자동 rollback할 수 있다
+
 ## 의사결정 모델
 
 AI 출력은 `TradeIntent`다.
 
+프롬프트도 이제 `loop_mode`와 `cycle_role`을 직접 입력으로 받는다.
+즉 `1h`에서는 전략 판단, `15m`에서는 포지션 관리, `5m`에서는 execution safety 제약을 프롬프트 레벨에서도 명시적으로 따른다.
+
 - `decision`
-  - `HOLD`, `BUY`, `SELL`, `REDUCE`, `EXIT`
+  - `HOLD`, `BUY`, `SELL`, `REDUCE`, `EXIT`, `CANCEL`, `REPLACE_ENTRY`
 - `orders`
   - 각 주문 후보의 심볼, 액션, 주문 타입, 수량, 가격, `reduce_only`, TP, SL
+  - `CANCEL` 액션일 때는 `target_order_id` 또는 `target_client_order_id`를 함께 담아 working order cleanup에 사용한다
+  - `REPLACE_ENTRY`일 때는 cancel leg와 replacement leg를 함께 담고, replacement leg는 cancel confirmation 이후에만 제출되도록 `wait_for_cancel_confirmation`, `replace_group_id`, lineage 필드를 함께 가진다
+  - 최근 구현에서는 `execution_profile`, `urgency_score`, `time_in_force`, `post_only` 같은 실행 메타데이터도 포함한다
 - `rationale`
   - 왜 그런 결정을 내렸는지에 대한 짧은 근거
 - `rationale_items`
@@ -424,7 +493,7 @@ AI 출력은 `TradeIntent`다.
 ### 1. 안전 행동 예외
 
 - `HOLD`는 항상 허용
-- `REDUCE`, `EXIT`는 일반적으로 리스크 축소 행동으로 취급
+- `REDUCE`, `EXIT`, `CANCEL`은 일반적으로 리스크 축소 또는 주문 정리 행동으로 취급
 
 ### 2. 손실 기반 차단
 
@@ -440,7 +509,7 @@ AI 출력은 `TradeIntent`다.
 
 예:
 
-- `cooldown`에서는 `BUY`, `SELL`을 막고 `HOLD`, `REDUCE`, `EXIT`만 허용할 수 있다.
+- `cooldown`에서는 `BUY`, `SELL`을 막고 `HOLD`, `REDUCE`, `EXIT`, `CANCEL`만 허용할 수 있다.
 
 ### 4. 최대 포지션 수
 
@@ -492,7 +561,6 @@ AI 출력은 `TradeIntent`다.
 trading:
   symbols:
     - BTCUSDT
-    - ETHUSDT
   max_leverage: 3
   order_type: "market"
 
@@ -505,26 +573,26 @@ risk_limits:
     enabled: true
     base_minutes: 15
     repeated_failure_add_minutes: 15
-  max_open_positions: 2
+  max_open_positions: 1
   mode_profiles:
     normal:
-      max_open_positions: 2
+      max_open_positions: 1
       max_order_notional_pct_balance: 100
-      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
     trigger:
       max_open_positions: 1
       max_order_notional_pct_balance: 35
-      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
     cooldown:
-      max_open_positions: 2
+      max_open_positions: 1
       max_order_notional_pct_balance: 0
-      allowed_actions: [HOLD, REDUCE, EXIT]
+      allowed_actions: [HOLD, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
     drawdown:
       max_open_positions: 1
       max_order_notional_pct_balance: 20
       entry_size_multiplier: 0.75
       confidence_cap: 0.55
-      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
 
 intervals:
   strategy_loop_minutes: 60
@@ -537,6 +605,9 @@ execution_guards:
   entry_mutex_ttl_seconds: 180
   unknown_order_block_minutes: 30
   recovery_sweep_minutes: 5
+  symbol_reentry_close_cooldown_minutes: 10
+  symbol_reentry_loss_cooldown_minutes: 30
+  symbol_reentry_loss_threshold_pct: 0.0
 
 context_budget:
   journal_fetch_limit: 24
@@ -561,7 +632,9 @@ context_budget:
 - `dynamic_cooldown`
   - 작은 손실 1회는 짧게, 큰 손실이나 반복 실패 패턴은 더 길게 쉬도록 쿨다운 시간을 자동으로 늘린다.
 - `execution_guards`
-  - 루프 전역 락, 심볼별 entry mutex, 반복 판단 쿨다운, unknown 주문 상태 감시/복구 주기를 정책에서 조정한다.
+  - 루프 전역 락, 심볼별 entry mutex, 반복 판단 쿨다운, unknown 주문 상태 감시/복구 주기, recent close/loss 뒤 심볼 재진입 유예 시간을 정책에서 조정한다.
+  - recent symbol re-entry guard는 `완전히 flat`일 때만 강하게 적용된다. 포지션, working order, active trade case가 남아 있으면 재진입 가드는 cycle risk state에 실리지 않는다.
+  - startup 시 policy validator가 단일 심볼 구성, stale reprice 값 범위, re-entry cooldown 관계를 함께 검증한다.
 - `context_budget`
   - 최근 journal/long_term_memory/similar case를 전부 보내지 않고, 관련성 높은 상위 컨텍스트만 압축해 전달한다.
 
@@ -712,7 +785,7 @@ context_budget:
   "risk_profile": {
     "max_open_positions": 1,
     "max_order_notional_pct_balance": 35,
-    "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"]
+    "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"]
   },
   "market_state": {
     "symbols": ["BTCUSDT"],
@@ -863,7 +936,7 @@ LLM 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
 - `summary`, `payload`
 - 인덱스: `symbol+id`, `timestamp+id`, `audit_log_id`
 
-즉, 동일 사이클에서도 `BTCUSDT`와 `ETHUSDT`를 분리해 신호/성과를 분석할 수 있다.
+즉, journal과 별도로 현재 운용 심볼의 신호/성과를 케이스 단위로 분리해 분석할 수 있다.
 
 추가로 `symbol_journal`은 심볼별 포지션 생애주기를 `trade_case_id`로 연결한다.  
 예를 들어 flat -> open은 `opened`, open -> reducing은 `reduced`, open -> closed는 `closed`로 기록되어 이후 배치나 수동 복기에서 "한 번의 트레이드 사례" 단위로 묶어 볼 수 있다.
@@ -1078,6 +1151,9 @@ memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`,
 이 도구의 목적은 단순 재현이 아니다.  
 "프롬프트/모델/메모리/운영 정책 변경 후 판단이 어떻게 달라졌는가"를 비교하는 것이다.
 
+운영 기본값은 `수동 단건 replay + 일일 incremental replay 자동 배치`다.
+자동 경로는 최근 24시간의 대표 audit를 최대 30건까지 선별해 daily memory batch 직전에 저장한다.
+
 ### 사용법
 
 최근 리플레이 가능한 audit 목록:
@@ -1096,6 +1172,12 @@ python tools/replay_audit.py --audit-id 12
 
 ```powershell
 python tools/replay_audit.py --audit-id 12 --save
+```
+
+일일 incremental replay:
+
+```powershell
+python tools/replay_audit.py --auto --save --limit 30 --window-hours 24
 ```
 
 ### 비교 항목
@@ -1263,9 +1345,10 @@ BYBIT_TRADING_MODE="demo"
 BYBIT_TESTNET="False"
 AI_PROVIDER="gemini"
 AI_API_KEY=""
-AI_DEFAULT_MODEL="gemini-2.5-flash"
+AI_DEFAULT_MODEL="gemini-2.5-pro"
 AI_TRIGGER_MODEL="gemini-2.5-pro"
 MEMORY_MODEL="gemini-2.5-pro"
+REPLAY_MODEL="gemini-2.5-pro"
 GEMINI_API_KEY="your_gemini_api_key_here" # legacy/provider-specific fallback
 OPENAI_API_KEY=""
 DEEPSEEK_API_KEY=""
@@ -1282,13 +1365,16 @@ LOG_FORMAT="text"
 - `AI_DEFAULT_MODEL`
   - 일반 루프에서 사용하는 기본 모델
 - `AI_TRIGGER_MODEL`
-  - trigger mode에서만 따로 쓰고 싶을 때 지정
+  - trigger/safety-context에서 AI가 실제 호출될 때만 따로 쓰고 싶을 때 지정
   - 비우면 `AI_DEFAULT_MODEL`을 재사용
 - `MEMORY_PROVIDER`
   - 비우면 `AI_PROVIDER`를 재사용
 - `MEMORY_MODEL`
   - 일일 memory batch에서 사용하는 모델
   - 비우면 provider-specific memory/trigger/default 순서로 fallback
+- `REPLAY_MODEL`
+  - 일일 incremental replay에서 사용하는 모델
+  - 비우면 memory/default 계열 fallback을 사용
 - provider-specific env (`GEMINI_*`, `OPENAI_*`, `DEEPSEEK_*`, `ANTHROPIC_*`)
   - 공통 env를 쓰지 않을 때 개별 provider 설정용
   - Gemini 단일 provider 구성을 계속 유지하고 싶을 때도 그대로 사용 가능
@@ -1313,6 +1399,7 @@ LOG_FORMAT="text"
 - 최대 동시 포지션 수
 - 모드별 리스크 프로파일
 - 루프 주기
+- replay batch 설정
 
 ## 실행 방법
 
@@ -1385,6 +1472,10 @@ python -m unittest discover -s tests
 - `BYBIT_TESTNET`은 구버전 호환용 fallback이다. `BYBIT_TRADING_MODE`가 우선한다.
 - 시장 판단에는 미완성 캔들을 제외한 종가 데이터가 사용된다.
 - `EXIT` 의사결정에 `orders`가 비어 있으면 현재 포지션을 기준으로 reduce-only 시장가 청산 주문을 자동 생성한다.
+- `CANCEL` 의사결정은 stale working order를 실제로 취소하는 실행 경로를 가진다.
+- stale entry order가 오래됐지만 execution quality가 아직 괜찮으면 decision은 `REPLACE_ENTRY`로 분리되고, 내부 leg는 `CANCEL + BUY/SELL LIMIT`로 표현된다.
+- `REPLACE_ENTRY`의 replacement leg는 cancel confirmation 전에는 제출되지 않는다. cancel receipt가 미확정이면 `deferred_waiting_cancel` 상태로 남고 다음 관리 사이클에서 이어서 처리한다.
+- order runtime/state transition에는 `replace_group_id`, parent order id, lineage role이 함께 저장돼 원래 주문 -> 취소 -> 대체 주문 흐름을 추적할 수 있다.
 - 주문 실행 중 일반 예외가 나면 receipt에 `failed` 상태로 남는다.
 - 알림 웹훅이 없으면 알림은 로그만 남기고 종료한다.
 
@@ -1530,3 +1621,32 @@ python -m unittest discover -s tests
 - 메모리 배치: [`batch/memory_updater.py`](/c:/gpt_trader/batch/memory_updater.py)
 - 리플레이 도구: [`tools/replay_audit.py`](/c:/gpt_trader/tools/replay_audit.py)
 - 대시보드: [`dashboard/app.py`](/c:/gpt_trader/dashboard/app.py)
+## 실행 정책
+
+주문 타입은 더 이상 전역 `market` 또는 `limit` 고정이 아니다.
+
+- `ExecutionPolicyEngine`이 `loop_mode`, `entry/reduce/exit`, urgency, spread/depth 상태를 보고
+  `MARKET`, `LIMIT_PASSIVE`, `LIMIT_AGGRESSIVE` 성격의 실행 프로필을 선택한다
+- 실제 결과는 `execution_policy_evaluations`에 저장된다
+- 여기에는 일반 진입/청산뿐 아니라 `CANCEL` 성공률, timeout, stale order 재배치 전후 문맥도 함께 남긴다
+- 배치는 이를 집계해 context bucket별 추천 profile을 만들고 champion으로 승격한다
+
+기본 원칙은 다음과 같다.
+
+- 손절성 청산, 긴급 축소, emergency exit: 체결 확실성이 우선
+- 일반 진입: 시장 상태가 괜찮으면 limit 우선, urgency가 높으면 market
+- 부분익절: limit 우선
+
+## 현재 안전 가드레일
+
+자동 진화하지 않는 값은 의도적으로 남겨 둔다.
+
+- `trading.max_leverage`
+  - 현재 `3x`
+  - projected exposure가 `총자산 x 3`을 넘으면 진입 거절
+- `risk_limits.drawdown_activate_pct`
+  - drawdown 진입 자체는 고정 가드레일
+- `risk_limits.daily_max_loss_pct`
+  - 일일 손실 kill switch
+
+즉 시스템은 `실효 참여율`은 진화시키되, `레버리지 ceiling`과 `drawdown 트리거`는 진화시키지 않는다.

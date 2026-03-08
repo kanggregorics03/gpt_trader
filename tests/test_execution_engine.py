@@ -1,11 +1,11 @@
 import unittest
 
-from core.models import AccountState, PositionState, TradeIntent
+from core.models import AccountState, OrderIntent, PositionState, TradeIntent
 from exchange.execution_engine import ExecutionEngine
 
 
 class DummyExchange:
-    has = {"fetchClosedOrders": False, "fetchMyTrades": True}
+    has = {"fetchClosedOrders": False, "fetchMyTrades": True, "cancelOrder": True}
 
     def fetch_my_trades(self, symbol, limit=50):
         if symbol == "BTCUSDT":
@@ -24,6 +24,19 @@ class DummyExchange:
                 }
             ]
         return []
+
+    def cancel_order(self, order_id, symbol, params=None):
+        params = dict(params or {})
+        return {
+            "id": order_id or "cancelled-via-client-id",
+            "clientOrderId": params.get("clientOrderId"),
+            "symbol": symbol,
+            "status": "canceled",
+            "info": {
+                "orderStatus": "Cancelled",
+                "orderLinkId": params.get("orderLinkId"),
+            },
+        }
 
 
 class TestExecutionEngine(unittest.TestCase):
@@ -217,6 +230,165 @@ class TestExecutionEngine(unittest.TestCase):
 
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0]["trade_id"], "trade-1")
+
+    def test_cancel_intent_executes_cancel_order(self):
+        intent = TradeIntent(
+            decision="CANCEL",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="CANCEL",
+                    order_type="MARKET",
+                    quantity=0.0,
+                    target_order_id="order-123",
+                    target_client_order_id="client-123",
+                )
+            ],
+            rationale=["Cancel stale order"],
+            risk_notes=[],
+            confidence=0.9,
+        )
+
+        receipts = self.engine.execute_intent(intent)
+        transitions = self.engine.build_order_state_transitions(intent.orders, receipts, fills=[])
+
+        self.assertEqual(receipts[0]["status"].lower(), "canceled")
+        self.assertEqual(transitions[0]["to_state"], "cancel_requested")
+        self.assertEqual(transitions[1]["to_state"], "cancelled")
+
+    def test_mixed_cancel_and_entry_intent_executes_in_order(self):
+        class EntryExchange(DummyExchange):
+            def __init__(self):
+                self.calls = []
+
+            def create_order(self, symbol, type, side, amount, price=None, params=None):
+                self.calls.append(("create", symbol, type, side, amount, price, dict(params or {})))
+                return {
+                    "id": "new-order-1",
+                    "clientOrderId": (params or {}).get("clientOrderId"),
+                    "symbol": symbol,
+                    "status": "open",
+                    "type": type,
+                    "side": side,
+                    "amount": amount,
+                    "price": price,
+                    "params": params or {},
+                }
+
+            def cancel_order(self, order_id, symbol, params=None):
+                self.calls.append(("cancel", symbol, order_id, dict(params or {})))
+                return super().cancel_order(order_id, symbol, params=params)
+
+        exchange = EntryExchange()
+        engine = ExecutionEngine(exchange)
+        intent = TradeIntent(
+            decision="REPLACE_ENTRY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="CANCEL",
+                    order_type="MARKET",
+                    quantity=0.0,
+                    target_order_id="order-123",
+                    target_client_order_id="client-123",
+                    replace_group_id="replace-1",
+                    lineage_role="cancel",
+                ),
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    quantity=0.01,
+                    price=30000.0,
+                    replace_group_id="replace-1",
+                    lineage_role="replacement",
+                    lineage_parent_order_id="order-123",
+                    lineage_parent_client_order_id="client-123",
+                    wait_for_cancel_confirmation=True,
+                ),
+            ],
+            rationale=["Reprice stale order"],
+            risk_notes=[],
+            confidence=0.8,
+        )
+
+        receipts = engine.execute_intent(intent)
+
+        self.assertEqual(exchange.calls[0][0], "cancel")
+        self.assertEqual(exchange.calls[1][0], "create")
+        self.assertEqual(receipts[0]["status"].lower(), "canceled")
+        self.assertEqual(receipts[1]["status"].lower(), "open")
+        self.assertEqual(receipts[1]["replaceGroupId"], "replace-1")
+        self.assertEqual(receipts[1]["lineageRole"], "replacement")
+
+    def test_replace_entry_waits_when_cancel_is_not_confirmed(self):
+        class DeferredExchange(DummyExchange):
+            def __init__(self):
+                self.calls = []
+
+            def create_order(self, symbol, type, side, amount, price=None, params=None):
+                self.calls.append(("create", symbol, type, side, amount, price, dict(params or {})))
+                return {
+                    "id": "new-order-1",
+                    "clientOrderId": (params or {}).get("clientOrderId"),
+                    "symbol": symbol,
+                    "status": "open",
+                }
+
+            def cancel_order(self, order_id, symbol, params=None):
+                self.calls.append(("cancel", symbol, order_id, dict(params or {})))
+                return {
+                    "id": order_id,
+                    "clientOrderId": (params or {}).get("clientOrderId"),
+                    "symbol": symbol,
+                    "status": "open",
+                    "info": {
+                        "orderStatus": "New",
+                        "orderLinkId": (params or {}).get("orderLinkId"),
+                    },
+                }
+
+        exchange = DeferredExchange()
+        engine = ExecutionEngine(exchange)
+        intent = TradeIntent(
+            decision="REPLACE_ENTRY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="CANCEL",
+                    order_type="MARKET",
+                    quantity=0.0,
+                    target_order_id="order-123",
+                    target_client_order_id="client-123",
+                    replace_group_id="replace-1",
+                    lineage_role="cancel",
+                ),
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    quantity=0.01,
+                    price=30000.0,
+                    replace_group_id="replace-1",
+                    lineage_role="replacement",
+                    lineage_parent_order_id="order-123",
+                    lineage_parent_client_order_id="client-123",
+                    wait_for_cancel_confirmation=True,
+                ),
+            ],
+            rationale=["Wait for cancel confirmation before replace"],
+            risk_notes=[],
+            confidence=0.8,
+        )
+
+        receipts = engine.execute_intent(intent)
+        transitions = engine.build_order_state_transitions(intent.orders, receipts, fills=[])
+
+        self.assertEqual(exchange.calls, [("cancel", "BTCUSDT", "order-123", {"orderLinkId": "client-123", "clientOrderId": "client-123"})])
+        self.assertEqual(receipts[0]["status"].lower(), "open")
+        self.assertEqual(receipts[1]["status"], "deferred_waiting_cancel")
+        self.assertEqual(transitions[-1]["to_state"], "deferred")
+        self.assertEqual(transitions[-1]["event_type"], "replace_deferred")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,12 @@
 import unittest
 
-from core.models import AccountState, MarketSnapshot, OrderBookSnapshot
+from core.models import AccountState, MarketSnapshot, OrderBookSnapshot, RiskStateSnapshot
 from core.snapshot_service import SnapshotService
 
 
 class DummyStateStore:
     def get_risk_state(self, **_kwargs):
-        return {}
+        return {"cooldown_active": True, "cooldown_remaining_minutes": 7}
 
     def get_symbol_trigger_state(self, _symbol):
         return {}
@@ -116,6 +116,23 @@ class TestSnapshotService(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(len(service.market_collector.calls), 1)
+
+    def test_materialize_coerces_risk_state_and_uses_single_symbol(self):
+        service = SnapshotService(
+            state_store=DummyStateStore(),
+            account_reader=DummyAccountReader(),
+            market_collector=RecordingCollector(),
+            risk_engine=DummyRiskEngine(),
+            symbols=["BTCUSDT", "ETHUSDT"],
+            materialization_minutes=5,
+        )
+
+        bundle = service.materialize(now_epoch=1, force=True)
+
+        self.assertIsInstance(bundle.risk_state, RiskStateSnapshot)
+        self.assertEqual(bundle.risk_state.cooldown_remaining_minutes, 7)
+        self.assertEqual(sorted(bundle.market_snapshots.keys()), ["BTCUSDT"])
+        self.assertEqual([call["symbol"] for call in service.market_collector.calls], ["BTCUSDT"])
 
     def test_trigger_mode_requires_strong_reason_and_multiple_reasons_on_same_symbol(self):
         service = SnapshotService(

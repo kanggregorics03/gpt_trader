@@ -10,8 +10,19 @@ from dotenv import load_dotenv
 from ai.decision_engine import DecisionEngine, DecisionResult
 from ai.llm_provider import normalize_provider_name, resolve_api_key, resolve_decision_models
 from ai.rag_engine import RagEngine
-from core.models import DecisionRequest, EvidenceItem, RationaleItem, TradeIntent
+from core.alpha_policy import AlphaPolicyEngine
+from core.execution_policy import ExecutionPolicyEngine
+from core.models import (
+    DecisionRequest,
+    EvidenceItem,
+    RationaleItem,
+    RiskStateSnapshot,
+    TradeIntent,
+    coerce_risk_state_snapshot,
+)
+from core.position_policy import PositionPolicyEngine
 from core.risk_engine import RiskEngine
+from core.safety_policy import SafetyPolicyEngine
 from core.snapshot_service import SnapshotService
 from db.state_store import StateStore
 from exchange.account_reader import AccountReader
@@ -37,6 +48,9 @@ class TradingOrchestrator:
         "entry_mutex_ttl_seconds": 180,
         "unknown_order_block_minutes": 30,
         "recovery_sweep_minutes": 5,
+        "symbol_reentry_close_cooldown_minutes": 10,
+        "symbol_reentry_loss_cooldown_minutes": 30,
+        "symbol_reentry_loss_threshold_pct": 0.0,
     }
     DEFAULT_CONTEXT_BUDGET = {
         "journal_fetch_limit": 24,
@@ -46,6 +60,12 @@ class TradingOrchestrator:
         "max_rationale_items_per_journal": 2,
         "max_evidence_per_rationale_item": 2,
         "max_ignore_when_per_memory": 2,
+    }
+    DEFAULT_REPLAY_BATCH = {
+        "enabled": True,
+        "window_hours": 24,
+        "limit": 30,
+        "save": True,
     }
     DEFAULT_ADAPTIVE_LOOP = {
         "base_loop_minutes": 60,
@@ -117,7 +137,8 @@ class TradingOrchestrator:
         self.state_store = StateStore(self.db_path)
         self.risk_engine = RiskEngine()
         self.rag_engine = RagEngine(self.db_path)
-        self.symbols = self.risk_engine.policy.get('trading', {}).get('symbols', ['BTCUSDT'])
+        self.symbols = self.risk_engine.get_trading_symbols()
+        self.symbol = self.risk_engine.get_trading_symbol()
 
         self.private_exchange = create_private_exchange(
             self.api_key,
@@ -154,6 +175,22 @@ class TradingOrchestrator:
         self.execution_engine = ExecutionEngine(
             self.private_exchange,
             private_feed=self.private_account_feed,
+        )
+        self.execution_policy_engine = ExecutionPolicyEngine(
+            policy=self.risk_engine.policy,
+            state_store=self.state_store,
+        )
+        self.alpha_policy_engine = AlphaPolicyEngine(
+            policy=self.risk_engine.policy,
+            state_store=self.state_store,
+        )
+        self.position_policy_engine = PositionPolicyEngine(
+            policy=self.risk_engine.policy,
+            state_store=self.state_store,
+        )
+        self.safety_policy_engine = SafetyPolicyEngine(
+            policy=self.risk_engine.policy,
+            state_store=self.state_store,
         )
         
         self.ai_engine = DecisionEngine(
@@ -296,6 +333,406 @@ class TradingOrchestrator:
             return None
         return ((after_balance - before_balance) / before_balance) * 100.0
 
+    def _enrich_intent_metadata(self, intent, input_hash: str, loop_mode: str, risk_mode: str, market_snapshots):
+        rationale_seed = ""
+        if intent.rationale_items:
+            rationale_seed = str(intent.rationale_items[0].summary or "").strip()
+        if not rationale_seed and intent.rationale:
+            rationale_seed = str(intent.rationale[0] or "").strip()
+        invalidation_reason = str(getattr(intent, "invalidation_reason", None) or "").strip()
+        if not invalidation_reason:
+            for item in intent.rationale_items or []:
+                failure_mode = str(getattr(item, "failure_mode", "") or "").strip()
+                if failure_mode:
+                    invalidation_reason = failure_mode
+                    break
+        thesis_summary = str(getattr(intent, "thesis_summary", None) or rationale_seed or "").strip() or None
+        thesis_basis = "|".join(
+            [
+                str(input_hash or "").strip(),
+                str(intent.decision or "").strip(),
+                str(thesis_summary or ""),
+                str(invalidation_reason or ""),
+            ]
+        )
+        thesis_id = str(getattr(intent, "thesis_id", None) or "").strip()
+        if not thesis_id and thesis_basis.replace("|", "").strip():
+            thesis_id = hashlib.sha1(thesis_basis.encode("utf-8")).hexdigest()[:12]
+        management_template_id = str(getattr(intent, "management_template_id", None) or "").strip()
+        if not management_template_id:
+            management_template_id = self._derive_management_template_id(
+                intent=intent,
+                loop_mode=loop_mode,
+                risk_mode=risk_mode,
+                market_snapshots=market_snapshots,
+            )
+        exit_reason = str(getattr(intent, "exit_reason", None) or "").strip()
+        if not exit_reason:
+            exit_reason = self._derive_intent_exit_reason(intent)
+        return intent.model_copy(
+            update={
+                "thesis_id": thesis_id or None,
+                "thesis_summary": thesis_summary,
+                "invalidation_reason": invalidation_reason or None,
+                "management_template_id": management_template_id or None,
+                "exit_reason": exit_reason or None,
+            }
+        )
+
+    def _derive_management_template_id(self, intent, loop_mode: str, risk_mode: str, market_snapshots):
+        if intent.decision in ("REDUCE", "EXIT"):
+            return f"{loop_mode}_risk_reduction"
+        if intent.decision == "CANCEL":
+            return f"{loop_mode}_working_order_cleanup"
+        if intent.decision == "REPLACE_ENTRY":
+            return f"{loop_mode}_working_order_reprice"
+        strong_trigger = any(
+            bool(getattr(snapshot, "is_opportunity_trigger", False))
+            for snapshot in (market_snapshots or {}).values()
+        )
+        if loop_mode == "1h":
+            return "entry_trigger_followthrough" if strong_trigger else "entry_swing_base"
+        if loop_mode == "15m":
+            return "position_manage_adaptive"
+        if loop_mode == "5m":
+            return "execution_safety_fast"
+        return f"{loop_mode}_{risk_mode}"
+
+    def _derive_intent_exit_reason(self, intent):
+        if intent.decision == "EXIT":
+            risk_text = " ".join(str(note or "") for note in (intent.risk_notes or [])).lower()
+            rationale_text = " ".join(str(row or "") for row in (intent.rationale or [])).lower()
+            merged = f"{risk_text} {rationale_text}"
+            if "cooldown" in merged or "kill switch" in merged:
+                return "risk_control"
+            if "spread" in merged or "liquidity" in merged:
+                return "liquidity_exit"
+            if "invalid" in merged or "thesis" in merged or "failure" in merged:
+                return "thesis_break"
+            return "full_exit"
+        if intent.decision == "REDUCE":
+            return "scale_out"
+        if intent.decision == "CANCEL":
+            return "order_cleanup"
+        if intent.decision == "REPLACE_ENTRY":
+            return "order_reprice"
+        return ""
+
+    def _build_policy_decision_result(self, decision_payload: dict, input_hash: str, model_name: str):
+        metadata = dict(decision_payload.get("metadata") or {})
+        return DecisionResult(
+            intent=TradeIntent(
+                decision=decision_payload.get("decision") or "HOLD",
+                orders=decision_payload.get("orders") or [],
+                rationale=decision_payload.get("rationale") or [f"Deterministic {model_name}."],
+                rationale_items=[],
+                risk_notes=decision_payload.get("risk_notes") or [],
+                confidence=float(decision_payload.get("confidence") or 0.8),
+                exit_reason=decision_payload.get("exit_reason"),
+            ),
+            prompt="",
+            raw_response="",
+            model_name=model_name,
+            input_hash=input_hash,
+            cache_hit=False,
+            usage_metadata={"skipped": True, "policy_source": metadata.get("policy_source") or model_name, **metadata},
+        )
+
+    def _resolve_bundle_policy_config(self, bundle_summary: dict, domain: str) -> dict:
+        policy_key_field = {
+            "alpha_1h": "alpha_policy_key",
+            "position_15m": "position_policy_key",
+            "safety_5m": "safety_policy_key",
+            "execution_5m": "execution_policy_key",
+        }.get(domain, "")
+        policy_key = str((bundle_summary or {}).get(policy_key_field) or "").strip()
+        if not policy_key or not hasattr(self.state_store, "get_policy_registry_entry"):
+            return {}
+        entry = self.state_store.get_policy_registry_entry(policy_key)
+        return entry.get("config") or {}
+
+    def _prepare_decision_market_snapshots(
+        self,
+        account_state,
+        market_snapshots,
+        loop_mode: str,
+        regime_key: str = "",
+        alpha_policy_override: dict | None = None,
+    ):
+        decision_market_snapshots = dict(market_snapshots or {})
+        alpha_summary = {
+            "applied": False,
+            "allowed_symbols": sorted(decision_market_snapshots.keys()),
+            "blocked_symbols": {},
+        }
+        if (
+            loop_mode != "1h"
+            or self._has_live_positions(account_state)
+            or self._has_live_open_orders(account_state)
+            or not decision_market_snapshots
+        ):
+            return decision_market_snapshots, alpha_summary
+        filtered_snapshots, blocked_symbols = self.alpha_policy_engine.filter_market_snapshots(
+            decision_market_snapshots,
+            policy_override=alpha_policy_override,
+            regime_key=regime_key,
+        )
+        alpha_summary = {
+            "applied": bool(alpha_policy_override or self.alpha_policy_engine.get_active_policy(regime_key=regime_key)),
+            "allowed_symbols": sorted(filtered_snapshots.keys()),
+            "blocked_symbols": dict(blocked_symbols or {}),
+        }
+        return filtered_snapshots, alpha_summary
+
+    def _extract_entry_symbols(self, intent) -> list[str]:
+        if getattr(intent, "decision", "") == "REPLACE_ENTRY":
+            return []
+        entry_symbols = []
+        for order in getattr(intent, "orders", []) or []:
+            if bool(getattr(order, "reduce_only", False)) or getattr(order, "action", "") == "CANCEL":
+                continue
+            symbol = str(getattr(order, "symbol", "") or "").strip()
+            if symbol and symbol not in entry_symbols:
+                entry_symbols.append(symbol)
+        return entry_symbols
+
+    def _record_shadow_policy_decisions(
+        self,
+        audit_log_id: int,
+        loop_mode: str,
+        live_intent,
+        account_state,
+        market_snapshots,
+        risk_mode: str,
+        symbol_journal_entries: list[dict],
+        regime_key: str = "",
+    ):
+        if not hasattr(self.state_store, "get_candidate_policy_versions"):
+            return
+        trade_case_by_symbol = {
+            str((entry or {}).get("symbol") or ""): str((entry or {}).get("trade_case_id") or "")
+            for entry in (symbol_journal_entries or [])
+            if (entry or {}).get("symbol")
+        }
+        shadow_entries = []
+        if loop_mode == "15m":
+            candidates = self.state_store.get_candidate_policy_versions(
+                domain="position_15m",
+                regime_key=regime_key or None,
+                statuses=["candidate", "shadow"],
+                limit=5,
+            )
+            if not candidates and regime_key:
+                candidates = self.state_store.get_candidate_policy_versions(
+                    domain="position_15m",
+                    statuses=["candidate", "shadow"],
+                    limit=5,
+                )
+            live_summary = {
+                "decision": live_intent.decision,
+                "orders": [order.model_dump() if hasattr(order, "model_dump") else dict(order) for order in (live_intent.orders or [])],
+                "exit_reason": getattr(live_intent, "exit_reason", None),
+            }
+            for candidate in candidates:
+                candidate_result = self.position_policy_engine.evaluate(
+                    account_state=account_state,
+                    market_snapshots=market_snapshots,
+                    risk_mode=risk_mode,
+                    loop_mode=loop_mode,
+                    regime_key=regime_key,
+                    policy_override=candidate.get("config") or {},
+                )
+                if candidate_result.get("escalate_to_ai"):
+                    continue
+                shadow_payload = candidate_result.get("decision_result") or {}
+                divergence_type = self._classify_shadow_divergence(live_summary, shadow_payload)
+                if divergence_type == "none":
+                    continue
+                symbol = ""
+                shadow_orders = shadow_payload.get("orders") or []
+                if shadow_orders:
+                    symbol = str(getattr(shadow_orders[0], "symbol", None) or shadow_orders[0].get("symbol") or "")
+                if not symbol and live_intent.orders:
+                    symbol = str(getattr(live_intent.orders[0], "symbol", None) or "")
+                shadow_entries.append(
+                    {
+                        "audit_log_id": audit_log_id,
+                        "candidate_policy_id": candidate.get("id"),
+                        "domain": "position_15m",
+                        "symbol": symbol or None,
+                        "loop_mode": loop_mode,
+                        "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
+                        "divergence_type": divergence_type,
+                        "payload": {
+                            "live_intent": live_summary,
+                            "shadow_intent": {
+                                "decision": shadow_payload.get("decision"),
+                                "orders": [
+                                    order.model_dump() if hasattr(order, "model_dump") else dict(order)
+                                    for order in shadow_orders
+                                ],
+                                "exit_reason": shadow_payload.get("exit_reason"),
+                                "rationale": shadow_payload.get("rationale") or [],
+                            },
+                            "candidate_policy": candidate,
+                        },
+                    }
+                )
+        if loop_mode == "5m":
+            candidates = self.state_store.get_candidate_policy_versions(
+                domain="safety_5m",
+                regime_key=regime_key or None,
+                statuses=["candidate", "shadow"],
+                limit=5,
+            )
+            if not candidates and regime_key:
+                candidates = self.state_store.get_candidate_policy_versions(
+                    domain="safety_5m",
+                    statuses=["candidate", "shadow"],
+                    limit=5,
+                )
+            live_summary = {
+                "decision": live_intent.decision,
+                "orders": [order.model_dump() if hasattr(order, "model_dump") else dict(order) for order in (live_intent.orders or [])],
+                "exit_reason": getattr(live_intent, "exit_reason", None),
+            }
+            for candidate in candidates:
+                candidate_result = self.safety_policy_engine.evaluate(
+                    account_state=account_state,
+                    market_snapshots=market_snapshots,
+                    risk_mode=risk_mode,
+                    loop_mode=loop_mode,
+                    regime_key=regime_key,
+                    policy_override=candidate.get("config") or {},
+                )
+                if candidate_result.get("escalate_to_ai"):
+                    continue
+                shadow_payload = candidate_result.get("decision_result") or {}
+                divergence_type = self._classify_safety_shadow_divergence(live_summary, shadow_payload)
+                if divergence_type == "none":
+                    continue
+                symbol = ""
+                shadow_orders = shadow_payload.get("orders") or []
+                if shadow_orders:
+                    symbol = str(getattr(shadow_orders[0], "symbol", None) or shadow_orders[0].get("symbol") or "")
+                if not symbol and live_intent.orders:
+                    symbol = str(getattr(live_intent.orders[0], "symbol", None) or "")
+                shadow_entries.append(
+                    {
+                        "audit_log_id": audit_log_id,
+                        "candidate_policy_id": candidate.get("id"),
+                        "domain": "safety_5m",
+                        "symbol": symbol or None,
+                        "loop_mode": loop_mode,
+                        "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
+                        "divergence_type": divergence_type,
+                        "payload": {
+                            "live_intent": live_summary,
+                            "shadow_intent": {
+                                "decision": shadow_payload.get("decision"),
+                                "orders": [
+                                    order.model_dump() if hasattr(order, "model_dump") else dict(order)
+                                    for order in shadow_orders
+                                ],
+                                "exit_reason": shadow_payload.get("exit_reason"),
+                                "rationale": shadow_payload.get("rationale") or [],
+                            },
+                            "candidate_policy": candidate,
+                        },
+                    }
+                )
+        if loop_mode == "1h":
+            candidates = self.state_store.get_candidate_policy_versions(
+                domain="alpha_1h",
+                regime_key=regime_key or None,
+                statuses=["candidate", "shadow"],
+                limit=5,
+            )
+            if not candidates and regime_key:
+                candidates = self.state_store.get_candidate_policy_versions(
+                    domain="alpha_1h",
+                    statuses=["candidate", "shadow"],
+                    limit=5,
+                )
+            entry_symbols = self._extract_entry_symbols(live_intent)
+            live_orders = [
+                order.model_dump() if hasattr(order, "model_dump") else dict(order)
+                for order in (live_intent.orders or [])
+            ]
+            for candidate in candidates:
+                policy_config = candidate.get("config") or {}
+                for symbol in entry_symbols:
+                    snapshot = (market_snapshots or {}).get(symbol)
+                    blocked, reasons = self.alpha_policy_engine.would_block_symbol(snapshot, policy_config)
+                    if not blocked:
+                        continue
+                    shadow_entries.append(
+                        {
+                            "audit_log_id": audit_log_id,
+                            "candidate_policy_id": candidate.get("id"),
+                            "domain": "alpha_1h",
+                            "symbol": symbol,
+                            "loop_mode": loop_mode,
+                            "trade_case_id": trade_case_by_symbol.get(symbol),
+                            "divergence_type": "entry_block",
+                            "payload": {
+                                "live_intent": {
+                                    "decision": live_intent.decision,
+                                    "orders": live_orders,
+                                    "exit_reason": getattr(live_intent, "exit_reason", None),
+                                },
+                                "shadow_intent": {
+                                    "decision": "HOLD",
+                                    "orders": [],
+                                    "blocked_reasons": reasons,
+                                    "rationale": [
+                                        f"{symbol} blocked by alpha policy candidate: {', '.join(reasons)}"
+                                    ],
+                                },
+                                "candidate_policy": candidate,
+                            },
+                        }
+                    )
+        if shadow_entries and hasattr(self.state_store, "save_shadow_decisions"):
+            self.state_store.save_shadow_decisions(shadow_entries)
+
+    def _classify_shadow_divergence(self, live_summary: dict, shadow_payload: dict) -> str:
+        live_decision = str(live_summary.get("decision") or "")
+        shadow_decision = str(shadow_payload.get("decision") or "")
+        if live_decision != shadow_decision:
+            return "decision"
+        live_orders = live_summary.get("orders") or []
+        shadow_orders = shadow_payload.get("orders") or []
+        if len(live_orders) != len(shadow_orders):
+            return "order_count"
+        if live_orders and shadow_orders:
+            live_qty = round(sum(float(order.get("quantity") or 0.0) for order in live_orders), 8)
+            shadow_qty = round(
+                sum(
+                    float(getattr(order, "quantity", None) or (order.get("quantity") if isinstance(order, dict) else 0.0) or 0.0)
+                    for order in shadow_orders
+                ),
+                8,
+            )
+            if live_qty != shadow_qty:
+                return "size"
+        return "none"
+
+    def _classify_safety_shadow_divergence(self, live_summary: dict, shadow_payload: dict) -> str:
+        live_decision = str(live_summary.get("decision") or "")
+        shadow_decision = str(shadow_payload.get("decision") or "")
+        if live_decision == shadow_decision:
+            return self._classify_shadow_divergence(live_summary, shadow_payload)
+        conservative_rank = {"HOLD": 0, "CANCEL": 1, "REPLACE_ENTRY": 1, "REDUCE": 2, "EXIT": 3}
+        live_rank = conservative_rank.get(live_decision, 0)
+        shadow_rank = conservative_rank.get(shadow_decision, 0)
+        if shadow_rank > live_rank:
+            if shadow_decision == "EXIT":
+                return "risk_exit"
+            if shadow_decision == "REDUCE":
+                return "risk_reduce"
+        return "decision"
+
     def _build_context_budget(self):
         configured = self.risk_engine.policy.get("context_budget", {})
         budget = dict(self.DEFAULT_CONTEXT_BUDGET)
@@ -315,6 +752,16 @@ class TradingOrchestrator:
         budget["max_ignore_when_per_memory"] = max(1, int(budget.get("max_ignore_when_per_memory", 2) or 2))
         return budget
 
+    def _build_replay_batch_config(self):
+        configured = self.risk_engine.policy.get("replay_batch", {})
+        config = dict(self.DEFAULT_REPLAY_BATCH)
+        config.update(configured or {})
+        config["enabled"] = bool(config.get("enabled", True))
+        config["window_hours"] = max(1, int(config.get("window_hours", 24) or 24))
+        config["limit"] = max(1, int(config.get("limit", 30) or 30))
+        config["save"] = bool(config.get("save", True))
+        return config
+
     def _build_execution_guards(self):
         configured = self.risk_engine.policy.get("execution_guards", {})
         guards = dict(self.DEFAULT_EXECUTION_GUARDS)
@@ -327,6 +774,18 @@ class TradingOrchestrator:
             int(guards.get("unknown_order_block_minutes", 30) or 30),
         )
         guards["recovery_sweep_minutes"] = max(1, int(guards.get("recovery_sweep_minutes", 5) or 5))
+        guards["symbol_reentry_close_cooldown_minutes"] = max(
+            0,
+            int(guards.get("symbol_reentry_close_cooldown_minutes", 10) or 0),
+        )
+        guards["symbol_reentry_loss_cooldown_minutes"] = max(
+            guards["symbol_reentry_close_cooldown_minutes"],
+            int(guards.get("symbol_reentry_loss_cooldown_minutes", 30) or 0),
+        )
+        guards["symbol_reentry_loss_threshold_pct"] = min(
+            0.0,
+            float(guards.get("symbol_reentry_loss_threshold_pct", 0.0) or 0.0),
+        )
         return guards
 
     def _build_adaptive_loop_config(self):
@@ -380,44 +839,139 @@ class TradingOrchestrator:
         self._public_ws_stale = None
         self._private_ws_stale = None
 
-    def _is_daily_kill_switch_active(self, risk_state: dict | None) -> bool:
+    def _coerce_risk_state(self, risk_state) -> RiskStateSnapshot:
+        return coerce_risk_state_snapshot(risk_state)
+
+    def _serialize_risk_state(self, risk_state) -> dict:
+        return self._coerce_risk_state(risk_state).model_dump(mode="json")
+
+    def _primary_symbol(self) -> str:
+        configured = [str(symbol).strip().upper() for symbol in (self.symbols or []) if str(symbol).strip()]
+        if configured:
+            return configured[0]
+        return str(getattr(self, "symbol", "BTCUSDT") or "BTCUSDT").strip().upper()
+
+    def _normalize_market_snapshots(self, market_snapshots):
+        market_snapshots = dict(market_snapshots or {})
+        if not market_snapshots:
+            return {}
+        primary_symbol = self._primary_symbol()
+        if primary_symbol in market_snapshots:
+            return {primary_symbol: market_snapshots[primary_symbol]}
+        first_symbol = next(iter(market_snapshots.keys()))
+        return {str(first_symbol): market_snapshots[first_symbol]}
+
+    def _normalize_market_prices(self, market_prices, market_snapshots):
+        market_prices = dict(market_prices or {})
+        primary_symbol = self._primary_symbol()
+        if primary_symbol in market_prices:
+            return {primary_symbol: market_prices[primary_symbol]}
+        if primary_symbol in (market_snapshots or {}):
+            return {primary_symbol: market_snapshots[primary_symbol].current_price}
+        if market_prices:
+            first_symbol = next(iter(market_prices.keys()))
+            return {str(first_symbol): market_prices[first_symbol]}
+        if market_snapshots:
+            first_symbol = next(iter(market_snapshots.keys()))
+            return {str(first_symbol): market_snapshots[first_symbol].current_price}
+        return {}
+
+    def _get_symbol_reentry_guard(self, symbol: str, execution_guards: dict):
+        fetcher = getattr(self.state_store, "get_recent_closed_trade_case_for_symbol", None)
+        if not callable(fetcher) or not symbol:
+            return {}
+        close_minutes = int(execution_guards.get("symbol_reentry_close_cooldown_minutes", 0) or 0)
+        loss_minutes = int(execution_guards.get("symbol_reentry_loss_cooldown_minutes", 0) or 0)
+        loss_threshold_pct = float(execution_guards.get("symbol_reentry_loss_threshold_pct", 0.0) or 0.0)
+        if close_minutes <= 0 and loss_minutes <= 0:
+            return {}
+        return fetcher(
+            symbol=symbol,
+            close_cooldown_minutes=close_minutes,
+            loss_cooldown_minutes=loss_minutes,
+            loss_threshold_pct=loss_threshold_pct,
+            require_no_active_case=True,
+        ) or {}
+
+    def _enrich_risk_state_for_cycle(self, risk_state, account_state, market_snapshots, execution_guards: dict):
+        snapshot = self._coerce_risk_state(risk_state)
+        symbol = next(iter((market_snapshots or {}).keys()), self._primary_symbol())
+        has_live_position = any(
+            str(getattr(position, "symbol", "") or "").strip().upper() == symbol
+            and abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
+            for position in (getattr(account_state, "positions", []) or [])
+        )
+        has_live_open_order = any(
+            str(getattr(order, "symbol", "") or "").strip().upper() == symbol
+            for order in (getattr(account_state, "open_orders", []) or [])
+        )
+        active_case_fetcher = getattr(self.state_store, "get_active_trade_case", None)
+        has_active_trade_case = bool(active_case_fetcher(symbol)) if callable(active_case_fetcher) else False
+        if has_live_position or has_live_open_order or has_active_trade_case:
+            return snapshot.model_copy(
+                update={
+                    "reentry_guard_active": False,
+                    "reentry_guard_symbol": symbol,
+                    "reentry_guard_reason": None,
+                    "reentry_guard_remaining_minutes": 0,
+                    "reentry_guard_last_closed_at": None,
+                    "reentry_guard_last_estimated_pnl_pct": None,
+                    "reentry_guard_last_exit_reason": None,
+                }
+            )
+        guard = self._get_symbol_reentry_guard(symbol, execution_guards)
+        if not guard or not bool(guard.get("active")):
+            return snapshot
+        return snapshot.model_copy(
+            update={
+                "reentry_guard_active": True,
+                "reentry_guard_symbol": symbol,
+                "reentry_guard_reason": str(guard.get("reason") or "").strip() or "recent_symbol_close",
+                "reentry_guard_remaining_minutes": int(guard.get("remaining_minutes", 0) or 0),
+                "reentry_guard_last_closed_at": guard.get("closed_at"),
+                "reentry_guard_last_estimated_pnl_pct": guard.get("estimated_pnl_pct"),
+                "reentry_guard_last_exit_reason": guard.get("exit_reason"),
+            }
+        )
+
+    def _is_daily_kill_switch_active(self, risk_state) -> bool:
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
         if daily_max_loss_pct <= 0:
             return False
-        daily_pnl_pct = float((risk_state or {}).get("daily_pnl_pct", 0.0) or 0.0)
+        daily_pnl_pct = float(self._coerce_risk_state(risk_state).daily_pnl_pct or 0.0)
         return daily_pnl_pct <= -abs(daily_max_loss_pct)
 
     def _is_daily_kill_switch_reason(self, reason: str) -> bool:
         return "Kill switch active: daily pnl" in str(reason or "")
 
-    def _build_cooldown_extension_signature(self, risk_state: dict | None):
-        risk_state = risk_state or {}
-        if not bool(risk_state.get("cooldown_active")):
+    def _build_cooldown_extension_signature(self, risk_state):
+        risk_state = self._coerce_risk_state(risk_state)
+        if not bool(risk_state.cooldown_active):
             return None
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         dynamic_config = risk_limits.get("dynamic_cooldown", {}) or {}
         base_minutes = int(dynamic_config.get("base_minutes", risk_limits.get("cooldown_minutes", 0)) or 0)
-        effective_minutes = int(risk_state.get("cooldown_minutes_effective", 0) or 0)
+        effective_minutes = int(risk_state.cooldown_minutes_effective or 0)
         if effective_minutes <= max(0, base_minutes):
             return None
         return (
             base_minutes,
             effective_minutes,
-            tuple(str(component) for component in (risk_state.get("cooldown_components") or [])),
-            int(risk_state.get("consecutive_losses", 0) or 0),
-            str(risk_state.get("dominant_failure_reason") or "").strip(),
-            round(float(risk_state.get("last_loss_estimated_pnl_pct", 0.0) or 0.0), 4),
+            tuple(str(component) for component in (risk_state.cooldown_components or [])),
+            int(risk_state.consecutive_losses or 0),
+            str(risk_state.dominant_failure_reason or "").strip(),
+            round(float(risk_state.last_loss_estimated_pnl_pct or 0.0), 4),
         )
 
-    def _maybe_alert_risk_state_transitions(self, risk_state: dict | None):
-        risk_state = risk_state or {}
+    def _maybe_alert_risk_state_transitions(self, risk_state):
+        risk_state = self._coerce_risk_state(risk_state)
         daily_kill_switch_active = self._is_daily_kill_switch_active(risk_state)
         if daily_kill_switch_active and self._daily_kill_switch_active is not True:
             daily_max_loss_pct = abs(
                 float(self.risk_engine.policy.get("risk_limits", {}).get("daily_max_loss_pct", 0.0) or 0.0)
             )
-            daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+            daily_pnl_pct = float(risk_state.daily_pnl_pct or 0.0)
             self.alert_manager.send(
                 "Daily Kill Switch Activated",
                 (
@@ -428,9 +982,9 @@ class TradingOrchestrator:
             )
         self._daily_kill_switch_active = daily_kill_switch_active
 
-        drawdown_active = bool(risk_state.get("drawdown_active"))
-        drawdown_activate_pct = risk_state.get("drawdown_activate_pct")
-        daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+        drawdown_active = bool(risk_state.drawdown_active)
+        drawdown_activate_pct = risk_state.drawdown_activate_pct
+        daily_pnl_pct = float(risk_state.daily_pnl_pct or 0.0)
         if drawdown_active and self._drawdown_mode_active is not True:
             threshold_text = ""
             if drawdown_activate_pct is not None:
@@ -452,7 +1006,7 @@ class TradingOrchestrator:
         if cooldown_signature is not None and self._cooldown_extension_signature != cooldown_signature:
             base_minutes, effective_minutes, components, losses, pattern_reason, last_loss_pct = cooldown_signature
             detail_parts = [f"{base_minutes}m -> {effective_minutes}m"]
-            remaining_minutes = int(risk_state.get("cooldown_remaining_minutes", 0) or 0)
+            remaining_minutes = int(risk_state.cooldown_remaining_minutes or 0)
             if remaining_minutes > 0:
                 detail_parts.append(f"{remaining_minutes}m remaining")
             if losses > 0:
@@ -619,11 +1173,22 @@ class TradingOrchestrator:
             self.last_close_at,
             self.adaptive_loop_config["recent_close_window_minutes"],
         )
-        if bool(cycle_result.get("trigger_active")):
+        active_management_target = has_positions or has_open_orders or has_unknown_orders
+        if bool(cycle_result.get("trigger_active")) and active_management_target:
             return "5m"
-        if has_positions or has_open_orders or has_unknown_orders or recent_execution or recent_close:
+        if active_management_target or recent_execution or recent_close:
             return "15m"
         return "1h"
+
+    def _has_active_management_target(self, cycle_result: dict) -> bool:
+        final_account_state = cycle_result.get("final_account_state")
+        has_positions = bool(cycle_result.get("has_positions"))
+        has_open_orders = bool(cycle_result.get("has_open_orders"))
+        if final_account_state is not None:
+            has_positions = self._has_live_positions(final_account_state)
+            has_open_orders = self._has_live_open_orders(final_account_state)
+        has_unknown_orders = bool(cycle_result.get("has_unknown_orders"))
+        return has_positions or has_open_orders or has_unknown_orders
 
     def _promote_loop_mode(self, mode: str, now_epoch: float):
         previous = self.active_loop_mode
@@ -634,7 +1199,7 @@ class TradingOrchestrator:
         if previous != mode:
             log.info(f"Adaptive cadence promoted: {previous} -> {mode}")
 
-    def _apply_adaptive_loop_mode(self, desired_mode: str, now_epoch: float) -> str:
+    def _apply_adaptive_loop_mode(self, desired_mode: str, now_epoch: float, cycle_result: dict | None = None) -> str:
         current_mode = self.active_loop_mode
         if self.LOOP_MODE_PRIORITY.get(desired_mode, 0) > self.LOOP_MODE_PRIORITY.get(current_mode, 0):
             self._promote_loop_mode(desired_mode, now_epoch)
@@ -647,7 +1212,16 @@ class TradingOrchestrator:
                 self.flat_clear_streak = 0
             return current_mode
 
+        has_active_management_target = self._has_active_management_target(cycle_result or {})
         if current_mode == "5m":
+            if not has_active_management_target:
+                previous = self.active_loop_mode
+                self.active_loop_mode = desired_mode
+                self.active_loop_mode_since = now_epoch
+                self.trigger_clear_streak = 0
+                self.flat_clear_streak = 0
+                log.info(f"Adaptive cadence downgraded immediately: {previous} -> {desired_mode}")
+                return self.active_loop_mode
             self.trigger_clear_streak += 1
             if self.trigger_clear_streak < self.adaptive_loop_config["trigger_clear_cycles"]:
                 return current_mode
@@ -660,6 +1234,13 @@ class TradingOrchestrator:
             return self.active_loop_mode
 
         if current_mode == "15m" and desired_mode == "1h":
+            if not has_active_management_target:
+                previous = self.active_loop_mode
+                self.active_loop_mode = "1h"
+                self.active_loop_mode_since = now_epoch
+                self.flat_clear_streak = 0
+                log.info(f"Adaptive cadence downgraded immediately: {previous} -> 1h")
+                return self.active_loop_mode
             self.flat_clear_streak += 1
             held_long_enough = (now_epoch - self.active_loop_mode_since) >= (
                 self.adaptive_loop_config["position_min_duration_minutes"] * 60
@@ -684,12 +1265,35 @@ class TradingOrchestrator:
         if bool(cycle_result.get("position_closed")):
             self.last_close_at = now_epoch
 
-    def _build_effective_risk_profile(self, loop_mode: str, account_state, risk_profile):
+    def _build_effective_risk_profile(
+        self,
+        loop_mode: str,
+        account_state,
+        risk_profile,
+        risk_mode: str | None = None,
+        regime_key: str = "",
+    ):
         effective_profile = dict(risk_profile or {})
         allowed_actions = [
             str(action).upper()
             for action in effective_profile.get("allowed_actions", [])
         ]
+        for management_action in ("CANCEL", "REPLACE_ENTRY"):
+            if management_action not in allowed_actions:
+                allowed_actions.append(management_action)
+        if risk_mode == "normal" and regime_key:
+            exposure_regime_key = f"{risk_mode}|{regime_key}"
+            registry_fetch = getattr(self.state_store, "get_policy_registry_entry_for_regime", None)
+            exposure_registry = {}
+            if callable(registry_fetch):
+                exposure_registry = registry_fetch("exposure_budget", regime_key=exposure_regime_key)
+            if exposure_registry:
+                config = exposure_registry.get("config") or {}
+                for key in ("max_order_notional_pct_balance", "entry_size_multiplier"):
+                    if key in config:
+                        effective_profile[key] = config[key]
+                effective_profile["exposure_policy_key"] = exposure_registry.get("policy_key")
+                effective_profile["exposure_regime_key"] = exposure_regime_key
         if loop_mode == "15m":
             effective_profile["cycle_role"] = "position_management"
             effective_profile["cycle_guidance"] = (
@@ -697,26 +1301,18 @@ class TradingOrchestrator:
             )
             effective_profile["allowed_actions"] = [
                 action for action in allowed_actions
-                if action in ("HOLD", "REDUCE", "EXIT")
+                if action in ("HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY")
             ]
         elif loop_mode == "5m":
-            effective_profile["cycle_role"] = "trigger_response"
+            effective_profile["cycle_role"] = "execution_safety"
             effective_profile["cycle_guidance"] = (
-                "React to active opportunity triggers quickly while respecting trigger-mode risk limits."
+                "Run the 5m safety loop for execution quality, trigger deterioration, and emergency de-risking. "
+                "Do not open new positions in the 5m cycle."
             )
-            effective_profile["allowed_actions"] = allowed_actions
-            if (
-                bool(effective_profile.get("block_additional_entries_when_position_exists", False))
-                and self._has_live_positions(account_state)
-            ):
-                effective_profile["cycle_guidance"] = (
-                    "React to active opportunity triggers while managing existing exposure. "
-                    "Do not open additional trigger-mode entries when a live position already exists."
-                )
-                effective_profile["allowed_actions"] = [
-                    action for action in allowed_actions
-                    if action in ("HOLD", "REDUCE", "EXIT")
-                ]
+            effective_profile["allowed_actions"] = [
+                action for action in allowed_actions
+                if action in ("HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY")
+            ]
         else:
             effective_profile["cycle_role"] = "strategy"
             effective_profile["cycle_guidance"] = (
@@ -743,7 +1339,11 @@ class TradingOrchestrator:
             self.last_daily_batch_date = now_local.date().isoformat()
 
     def _extract_entry_orders(self, orders):
-        return [order for order in (orders or []) if not getattr(order, "reduce_only", False)]
+        return [
+            order
+            for order in (orders or [])
+            if not getattr(order, "reduce_only", False) and getattr(order, "action", "") in ("BUY", "SELL")
+        ]
 
     def _build_order_size_band(self, order, market_prices):
         reference_price = order.price or market_prices.get(order.symbol) or 0.0
@@ -893,6 +1493,45 @@ class TradingOrchestrator:
             "risk_mode": str(risk_mode or ""),
         }
 
+    def _derive_regime_key(self, market_snapshots) -> str:
+        trend_counts = {}
+        volatility_counts = {}
+        for snapshot in (market_snapshots or {}).values():
+            trend_alignment = str(getattr(snapshot.regime, "trend_alignment", "") or "mixed").strip() or "mixed"
+            volatility_regime = str(getattr(snapshot.regime, "volatility_regime", "") or "unknown").strip() or "unknown"
+            trend_counts[trend_alignment] = trend_counts.get(trend_alignment, 0) + 1
+            volatility_counts[volatility_regime] = volatility_counts.get(volatility_regime, 0) + 1
+        if not trend_counts and not volatility_counts:
+            return ""
+        trend = max(trend_counts.items(), key=lambda item: (item[1], item[0]))[0] if trend_counts else "mixed"
+        volatility = max(volatility_counts.items(), key=lambda item: (item[1], item[0]))[0] if volatility_counts else "unknown"
+        return f"{trend}|{volatility}"
+
+    def _build_active_policy_bundle_summary(self, regime_key: str) -> dict:
+        if not hasattr(self.state_store, "get_active_policy_bundle"):
+            return {}
+        bundle = self.state_store.get_active_policy_bundle(regime_key=regime_key)
+        if not bundle:
+            return {}
+        return {
+            "bundle_key": bundle.get("bundle_key"),
+            "regime_key": bundle.get("regime_key"),
+            "alpha_policy_key": bundle.get("alpha_policy_key"),
+            "position_policy_key": bundle.get("position_policy_key"),
+            "safety_policy_key": bundle.get("safety_policy_key"),
+            "execution_policy_key": bundle.get("execution_policy_key"),
+            "metrics": bundle.get("metrics") or {},
+        }
+
+    def _build_regime_drift_summary(self, regime_key: str, bundle_summary: dict) -> dict:
+        bundle_regime_key = str((bundle_summary or {}).get("regime_key") or "").strip()
+        drift_detected = bool(bundle_regime_key and regime_key and bundle_regime_key != regime_key)
+        return {
+            "current_regime_key": regime_key,
+            "bundle_regime_key": bundle_regime_key,
+            "drift_detected": drift_detected,
+        }
+
     def _serialize_market_snapshots(self, market_snapshots) -> dict[str, dict]:
         serialized = {}
         for symbol, snapshot in (market_snapshots or {}).items():
@@ -914,11 +1553,7 @@ class TradingOrchestrator:
             if hasattr(account_state, "model_dump")
             else (dict(account_state or {}) if isinstance(account_state, dict) else None)
         )
-        risk_payload = (
-            risk_state.model_dump(mode="json")
-            if hasattr(risk_state, "model_dump")
-            else (dict(risk_state or {}) if isinstance(risk_state, dict) else None)
-        )
+        risk_payload = self._serialize_risk_state(risk_state)
         try:
             return rag_engine.build_market_vectors(
                 serialized_snapshots,
@@ -1370,11 +2005,7 @@ class TradingOrchestrator:
             if hasattr(account_state, "model_dump")
             else dict(account_state or {})
         )
-        risk_payload = (
-            risk_state.model_dump(mode="json")
-            if hasattr(risk_state, "model_dump")
-            else dict(risk_state or {})
-        )
+        risk_payload = self._serialize_risk_state(risk_state)
         current_markets = {
             symbol: snapshot.model_dump(mode="json")
             for symbol, snapshot in market_snapshots.items()
@@ -1496,6 +2127,22 @@ class TradingOrchestrator:
                 outcome_updated_at=entry.get("case_closed_at") or entry.get("case_opened_at"),
             )
 
+    def _backfill_shadow_policy_outcomes_for_symbol_entries(
+        self,
+        symbol_journal_entries: list[dict] | None,
+    ) -> None:
+        if not hasattr(self.state_store, "update_shadow_decisions_for_trade_case"):
+            return
+        for entry in symbol_journal_entries or []:
+            trade_case_id = str(entry.get("trade_case_id") or "").strip()
+            if not trade_case_id:
+                continue
+            self.state_store.update_shadow_decisions_for_trade_case(
+                trade_case_id=trade_case_id,
+                outcome_status=entry.get("case_status"),
+                outcome_estimated_pnl_pct=entry.get("estimated_pnl_pct"),
+            )
+
     def _build_position_ledger_entries(self, intent, fills, execution_summary):
         if not fills:
             return []
@@ -1549,6 +2196,178 @@ class TradingOrchestrator:
 
         return list(grouped.values())
 
+    def _build_execution_policy_evaluation_entries(
+        self,
+        audit_log_id: int,
+        intent,
+        planned_orders,
+        receipts,
+        fills,
+        market_snapshots,
+        symbol_journal_entries,
+        loop_mode: str,
+        risk_mode: str,
+        is_trigger_mode: bool,
+    ):
+        if not audit_log_id or not planned_orders:
+            return []
+        journal_by_symbol = {
+            str((entry or {}).get("symbol") or ""): (entry or {})
+            for entry in (symbol_journal_entries or [])
+            if (entry or {}).get("symbol")
+        }
+        evaluations = []
+        for index, order in enumerate(planned_orders):
+            receipt = receipts[index] if index < len(receipts) else {}
+            matched_fills = self.execution_engine._get_fills_for_receipt(order, receipt, fills)
+            requested_quantity = abs(float(order.quantity or 0.0))
+            filled_quantity = round(sum(float(fill.get("amount") or 0.0) for fill in matched_fills), 8)
+            if filled_quantity <= 0:
+                filled_quantity = round(abs(float(receipt.get("filled") or 0.0)), 8)
+            average_fill_price = self._calculate_average_fill_price(matched_fills, receipt)
+            snapshot = market_snapshots.get(order.symbol) if isinstance(market_snapshots, dict) else None
+            reference_price = self._resolve_execution_reference_price(order, snapshot)
+            context = dict(getattr(order, "execution_context", {}) or {})
+            symbol_entry = journal_by_symbol.get(order.symbol, {})
+            order_action = str(getattr(order, "action", "") or "").upper()
+            is_cancel = order_action == "CANCEL"
+            if is_cancel:
+                status = str(receipt.get("status") or "unknown").lower()
+                cancel_success = status in ("canceled", "cancelled", "closed")
+                fill_ratio = 1.0 if cancel_success else 0.0
+                slippage_bps = None
+                requested_quantity = 1.0
+                filled_quantity = 1.0 if cancel_success else 0.0
+                average_fill_price = None
+                reference_price = None
+                action_type = context.get("action_type") or "cancel"
+                order_type = "CANCEL"
+                execution_profile = context.get("execution_profile") or "cancel_live_order"
+            else:
+                fill_ratio = round(min(1.0, filled_quantity / requested_quantity), 6) if requested_quantity > 0 else None
+                slippage_bps = self._estimate_order_execution_slippage_bps(
+                    order=order,
+                    reference_price=reference_price,
+                    average_fill_price=average_fill_price,
+                )
+                action_type = context.get("action_type") or ("reduce" if order.reduce_only else "entry")
+                order_type = order.order_type
+                execution_profile = order.execution_profile
+            evaluations.append(
+                {
+                    "symbol": order.symbol,
+                    "loop_mode": loop_mode,
+                    "risk_mode": risk_mode,
+                    "action_type": action_type,
+                    "urgency_bucket": context.get("urgency_bucket") or "unknown",
+                    "liquidity_bucket": context.get("liquidity_bucket") or "unknown",
+                    "decision": intent.decision,
+                    "order_action": order.action,
+                    "order_type": order_type,
+                    "execution_profile": execution_profile,
+                    "reduce_only": bool(order.reduce_only),
+                    "trigger_mode": bool(is_trigger_mode),
+                    "spread_bps": context.get("spread_bps"),
+                    "spread_percentile_1h": context.get("spread_percentile_1h"),
+                    "depth_percentile_1h": context.get("depth_percentile_1h"),
+                    "reference_price": reference_price,
+                    "order_price": order.price,
+                    "average_fill_price": average_fill_price,
+                    "requested_quantity": requested_quantity,
+                    "filled_quantity": filled_quantity,
+                    "fill_ratio": fill_ratio,
+                    "slippage_bps": slippage_bps,
+                    "latency_seconds": self._estimate_order_latency_seconds(receipt, matched_fills),
+                    "status": receipt.get("status") or "unknown",
+                    "outcome_trade_case_id": symbol_entry.get("trade_case_id"),
+                    "outcome_estimated_pnl_pct": symbol_entry.get("estimated_pnl_pct"),
+                    "outcome_realized_pnl": symbol_entry.get("net_realized_pnl"),
+                    "payload": {
+                        "audit_log_id": audit_log_id,
+                        "time_in_force": getattr(order, "time_in_force", None),
+                        "post_only": bool(getattr(order, "post_only", False)),
+                        "max_slippage_bps": getattr(order, "max_slippage_bps", None),
+                        "limit_offset_bps": getattr(order, "limit_offset_bps", None),
+                        "execution_context": context,
+                        "receipt": receipt,
+                    },
+                }
+            )
+        return evaluations
+
+    def _calculate_average_fill_price(self, fills, receipt):
+        total_amount = sum(float(fill.get("amount") or 0.0) for fill in fills)
+        if total_amount > 0:
+            weighted_cost = sum(float(fill.get("price") or 0.0) * float(fill.get("amount") or 0.0) for fill in fills)
+            return round(weighted_cost / total_amount, 8)
+        average = receipt.get("average")
+        if average not in (None, ""):
+            return round(float(average), 8)
+        price = receipt.get("price")
+        if price not in (None, ""):
+            return round(float(price), 8)
+        return None
+
+    def _resolve_execution_reference_price(self, order, snapshot):
+        if snapshot is None:
+            return order.price
+        order_book = getattr(snapshot, "order_book", None)
+        for candidate in (
+            getattr(order_book, "mid_price", None),
+            getattr(order_book, "microprice", None),
+            getattr(snapshot, "mark_price", None),
+            getattr(snapshot, "current_price", None),
+            order.price,
+        ):
+            try:
+                if candidate in (None, ""):
+                    continue
+                value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return None
+
+    def _estimate_order_execution_slippage_bps(self, order, reference_price, average_fill_price):
+        if reference_price in (None, 0) or average_fill_price in (None, 0):
+            return None
+        reference_price = float(reference_price)
+        average_fill_price = float(average_fill_price)
+        if order.action == "BUY":
+            adverse_delta = max(0.0, average_fill_price - reference_price)
+        else:
+            adverse_delta = max(0.0, reference_price - average_fill_price)
+        return round((adverse_delta / reference_price) * 10000.0, 4)
+
+    def _estimate_order_latency_seconds(self, receipt, matched_fills):
+        receipt_timestamp = receipt.get("timestamp")
+        if receipt_timestamp in (None, ""):
+            return None
+        try:
+            receipt_ts = float(receipt_timestamp)
+            if receipt_ts > 1_000_000_000_000:
+                receipt_ts /= 1000.0
+        except (TypeError, ValueError):
+            return None
+        if not matched_fills:
+            return None
+        normalized_fill_ts = []
+        for fill in matched_fills:
+            value = fill.get("timestamp")
+            if value in (None, ""):
+                continue
+            try:
+                timestamp = float(value)
+                if timestamp > 1_000_000_000_000:
+                    timestamp /= 1000.0
+                normalized_fill_ts.append(timestamp)
+            except (TypeError, ValueError):
+                continue
+        if not normalized_fill_ts:
+            return None
+        return round(max(0.0, min(normalized_fill_ts) - receipt_ts), 4)
+
     def _build_symbol_journal_entries(
         self,
         audit_log_id: int,
@@ -1569,8 +2388,12 @@ class TradingOrchestrator:
         }
         symbol_order_actions = {}
         for order in (intent.orders or []):
+            action_text = f"{order.action}:{order.order_type}:{order.quantity}:{getattr(order, 'execution_profile', '')}"
+            if getattr(order, "action", "") == "CANCEL":
+                target = getattr(order, "target_client_order_id", None) or getattr(order, "target_order_id", None)
+                action_text = f"CANCEL:{target or 'unknown'}"
             symbol_order_actions.setdefault(order.symbol, []).append(
-                f"{order.action}:{order.order_type}:{order.quantity}"
+                action_text
             )
 
         symbol_evidence = {}
@@ -1619,6 +2442,11 @@ class TradingOrchestrator:
                     "summary": summary_seed,
                     "payload": {
                         "order_actions": symbol_order_actions.get(symbol, []),
+                        "thesis_id": getattr(intent, "thesis_id", None),
+                        "thesis_summary": getattr(intent, "thesis_summary", None),
+                        "invalidation_reason": getattr(intent, "invalidation_reason", None),
+                        "management_template_id": getattr(intent, "management_template_id", None),
+                        "exit_reason": getattr(intent, "exit_reason", None),
                         "trigger_reasons": (
                             market_snapshots[symbol].trigger_reasons
                             if symbol in market_snapshots
@@ -2218,6 +3046,17 @@ class TradingOrchestrator:
                 observed_pnl_pct=observed_pnl_pct,
                 realized_pnl=realized_pnl,
             )
+            thesis_id = (
+                str(getattr(intent, "thesis_id", None) or "").strip()
+                or active_case.get("thesis_id")
+                or current_case.get("thesis_id")
+            )
+            management_template_id = (
+                str(getattr(intent, "management_template_id", None) or "").strip()
+                or active_case.get("management_template_id")
+                or current_case.get("management_template_id")
+            )
+            exit_reason = str(getattr(intent, "exit_reason", None) or "").strip() or None
 
             if from_state == "flat" and to_state in ("opening", "open"):
                 trade_case_id = self._make_trade_case_id(symbol, audit_log_id, observed_at)
@@ -2228,12 +3067,16 @@ class TradingOrchestrator:
                     trade_case_id=trade_case_id,
                     opened_at=case_opened_at,
                     entry_decision=entry.get("decision"),
+                    thesis_id=thesis_id,
+                    management_template_id=management_template_id,
                     last_decision=entry.get("decision"),
                     last_audit_log_id=audit_log_id,
                     payload={
                         "opened_via": transition.get("event_type"),
                         "from_state": from_state,
                         "to_state": to_state,
+                        "thesis_summary": getattr(intent, "thesis_summary", None),
+                        "invalidation_reason": getattr(intent, "invalidation_reason", None),
                     },
                 )
             elif from_state == "open" and to_state == "closed":
@@ -2257,6 +3100,8 @@ class TradingOrchestrator:
                     trade_case_id=trade_case_id,
                     opened_at=case_opened_at,
                     entry_decision=(active_case.get("entry_decision") or entry.get("decision")),
+                    thesis_id=thesis_id,
+                    management_template_id=management_template_id,
                     last_decision=entry.get("decision"),
                     last_audit_log_id=audit_log_id,
                     payload={
@@ -2274,6 +3119,8 @@ class TradingOrchestrator:
                         trade_case_id=trade_case_id,
                         opened_at=case_opened_at,
                         entry_decision=active_case.get("entry_decision"),
+                        thesis_id=thesis_id,
+                        management_template_id=management_template_id,
                         last_decision=entry.get("decision"),
                         last_audit_log_id=audit_log_id,
                         payload=active_case.get("payload") or {},
@@ -2350,19 +3197,30 @@ class TradingOrchestrator:
                     "holding_minutes": holding_minutes,
                     "observed_mfe_pct": observed_mfe_pct,
                     "observed_mae_pct": observed_mae_pct,
-                    "slippage_cost": slippage_cost,
-                    "slippage_bps": slippage_bps,
-                    "thesis_failure_reason": thesis_failure_reason,
-                    "evidence_signals": entry.get("evidence_signals") or [],
-                    "trigger_reasons": (entry.get("payload") or {}).get("trigger_reasons") or [],
-                    "risk_trigger_reasons": (entry.get("payload") or {}).get("risk_trigger_reasons") or [],
-                    "feature_vector": feature_vector or current_case.get("feature_vector") or [],
-                    "payload": {
+                     "slippage_cost": slippage_cost,
+                     "slippage_bps": slippage_bps,
+                     "thesis_failure_reason": thesis_failure_reason,
+                     "thesis_id": thesis_id,
+                     "management_template_id": management_template_id,
+                     "exit_reason": (
+                         exit_reason
+                         if case_status == "closed"
+                         else current_case.get("exit_reason")
+                     ),
+                     "evidence_signals": entry.get("evidence_signals") or [],
+                     "trigger_reasons": (entry.get("payload") or {}).get("trigger_reasons") or [],
+                     "risk_trigger_reasons": (entry.get("payload") or {}).get("risk_trigger_reasons") or [],
+                     "feature_vector": feature_vector or current_case.get("feature_vector") or [],
+                     "payload": {
                         "case_status": case_status,
                         "from_state": from_state,
                         "to_state": to_state,
-                        "risk_reason": entry.get("risk_reason"),
-                        "regime_tags": [
+                         "risk_reason": entry.get("risk_reason"),
+                         "thesis_summary": getattr(intent, "thesis_summary", None),
+                         "invalidation_reason": getattr(intent, "invalidation_reason", None),
+                         "management_template_id": management_template_id,
+                         "exit_reason": exit_reason,
+                         "regime_tags": [
                             f"trend:{getattr(symbol_snapshot.regime, 'trend_alignment', '')}"
                             if symbol_snapshot is not None else "",
                             f"volatility:{getattr(symbol_snapshot.regime, 'volatility_regime', '')}"
@@ -2417,19 +3275,23 @@ class TradingOrchestrator:
         if account_state.positions or account_state.open_orders:
             return None
 
+        risk_state = self._coerce_risk_state(risk_state)
         risk_limits = self.risk_engine.policy.get("risk_limits", {})
         daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
-        daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+        daily_pnl_pct = float(risk_state.daily_pnl_pct or 0.0)
         if daily_max_loss_pct > 0 and daily_pnl_pct <= -daily_max_loss_pct:
             return "daily_loss_kill_switch"
 
         max_consecutive_losses = int(risk_limits.get("max_consecutive_losses", 0) or 0)
-        consecutive_losses = int(risk_state.get("consecutive_losses", 0) or 0)
+        consecutive_losses = int(risk_state.consecutive_losses or 0)
         if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
             return "consecutive_loss_kill_switch"
 
-        if bool(risk_state.get("cooldown_active")):
+        if bool(risk_state.cooldown_active):
             return "cooldown_active"
+
+        if bool(risk_state.reentry_guard_active):
+            return str(risk_state.reentry_guard_reason or "recent_symbol_close_guard")
 
         allowed_actions = {str(action).upper() for action in risk_profile.get("allowed_actions", [])}
         if "BUY" not in allowed_actions and "SELL" not in allowed_actions:
@@ -2438,11 +3300,40 @@ class TradingOrchestrator:
         return None
 
     def _build_skip_rationale_items(self, skip_reason: str, risk_state, market_snapshots, risk_profile):
+        risk_state_payload = (
+            dict(risk_state)
+            if isinstance(risk_state, dict)
+            else self._serialize_risk_state(risk_state)
+        )
+        risk_state_snapshot = self._coerce_risk_state(risk_state)
+        if skip_reason == "alpha_policy_filtered_all":
+            blocked_symbols = risk_state_payload.get("alpha_policy_blocked_symbols") or {}
+            symbol, reasons = next(iter(blocked_symbols.items()), ("portfolio", ["policy_filtered"]))
+            return [
+                RationaleItem(
+                    summary="Alpha policy blocked all candidate entries.",
+                    why_it_matters="The champion 1h entry filter judged every current setup as low quality.",
+                    trade_implication="Stay flat until at least one symbol clears the alpha entry filter.",
+                    failure_mode="A future 1h snapshot satisfies the active alpha policy thresholds.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="alpha_policy_block",
+                            symbol=symbol if symbol != "portfolio" else None,
+                            timeframe="1h",
+                            operator="note",
+                            observed_value=", ".join(str(reason) for reason in reasons[:3]),
+                            threshold=None,
+                            units="rule",
+                            source="alpha_policy.blocked_symbols",
+                        )
+                    ],
+                )
+            ]
         if skip_reason == "cooldown_active":
-            remaining = float(risk_state.get("cooldown_remaining_minutes", 0) or 0.0)
-            effective_minutes = float(risk_state.get("cooldown_minutes_effective", 0) or 0.0)
-            failure_pattern_score = float(risk_state.get("failure_pattern_score", 0.0) or 0.0)
-            dominant_failure_reason = str(risk_state.get("dominant_failure_reason") or "").strip()
+            remaining = float(risk_state_snapshot.cooldown_remaining_minutes or 0.0)
+            effective_minutes = float(risk_state_snapshot.cooldown_minutes_effective or 0.0)
+            failure_pattern_score = float(risk_state_snapshot.failure_pattern_score or 0.0)
+            dominant_failure_reason = str(risk_state_snapshot.dominant_failure_reason or "").strip()
             evidence = [
                 EvidenceItem(
                     signal="cooldown_remaining_minutes",
@@ -2490,6 +3381,52 @@ class TradingOrchestrator:
                     evidence=evidence,
                 )
             ]
+        if skip_reason in ("recent_symbol_close_guard", "recent_symbol_loss_guard"):
+            remaining = float(risk_state_snapshot.reentry_guard_remaining_minutes or 0.0)
+            symbol = str(risk_state_snapshot.reentry_guard_symbol or self._primary_symbol())
+            last_pnl = risk_state_snapshot.reentry_guard_last_estimated_pnl_pct
+            last_exit_reason = str(risk_state_snapshot.reentry_guard_last_exit_reason or "").strip()
+            why_it_matters = (
+                f"{symbol} was closed too recently, so immediate re-entry would likely be churn."
+                if skip_reason == "recent_symbol_close_guard"
+                else f"{symbol} recently closed at a loss, so the symbol-level re-entry guard is still active."
+            )
+            if last_exit_reason:
+                why_it_matters += f" Last exit reason: {last_exit_reason}."
+            evidence = [
+                EvidenceItem(
+                    signal="reentry_guard_remaining_minutes",
+                    symbol=symbol,
+                    timeframe="risk",
+                    operator="gt",
+                    observed_value=remaining,
+                    threshold=0.0,
+                    units="minutes",
+                    source="risk_state.reentry_guard_remaining_minutes",
+                )
+            ]
+            if last_pnl is not None:
+                evidence.append(
+                    EvidenceItem(
+                        signal="reentry_guard_last_estimated_pnl_pct",
+                        symbol=symbol,
+                        timeframe="risk",
+                        operator="note",
+                        observed_value=float(last_pnl),
+                        threshold=None,
+                        units="pct",
+                        source="risk_state.reentry_guard_last_estimated_pnl_pct",
+                    )
+                )
+            return [
+                RationaleItem(
+                    summary="Recent symbol exit blocks immediate re-entry.",
+                    why_it_matters=why_it_matters,
+                    trade_implication="Stay flat on the configured symbol until the symbol-level re-entry window expires.",
+                    failure_mode="The re-entry guard expires and no other blocking risk state remains.",
+                    evidence=evidence,
+                )
+            ]
         if skip_reason.startswith("risk_profile_"):
             max_positions = float(risk_profile.get("max_open_positions", 0.0) or 0.0)
             return [
@@ -2512,7 +3449,7 @@ class TradingOrchestrator:
                 )
             ]
         if skip_reason == "daily_loss_kill_switch":
-            daily_pnl_pct = float(risk_state.get("daily_pnl_pct", 0.0) or 0.0)
+            daily_pnl_pct = float(risk_state_snapshot.daily_pnl_pct or 0.0)
             limit = float(self.risk_engine.policy.get("risk_limits", {}).get("daily_max_loss_pct", 0.0) or 0.0)
             return [
                 RationaleItem(
@@ -2534,7 +3471,7 @@ class TradingOrchestrator:
                 )
             ]
         if skip_reason == "consecutive_loss_kill_switch":
-            losses = float(risk_state.get("consecutive_losses", 0) or 0.0)
+            losses = float(risk_state_snapshot.consecutive_losses or 0.0)
             limit = float(self.risk_engine.policy.get("risk_limits", {}).get("max_consecutive_losses", 0) or 0.0)
             return [
                 RationaleItem(
@@ -2585,19 +3522,40 @@ class TradingOrchestrator:
                 snapshot_bundle = self.snapshot_service.build_cycle_snapshot()
 
             account_state = snapshot_bundle.account_state
-            risk_state = snapshot_bundle.risk_state
+            market_snapshots = self._normalize_market_snapshots(snapshot_bundle.market_snapshots)
+            market_prices = self._normalize_market_prices(snapshot_bundle.market_prices, market_snapshots)
+            risk_state = self._enrich_risk_state_for_cycle(
+                snapshot_bundle.risk_state,
+                account_state=account_state,
+                market_snapshots=market_snapshots,
+                execution_guards=execution_guards,
+            )
             policy_summary = snapshot_bundle.policy_summary
-            market_snapshots = snapshot_bundle.market_snapshots
-            market_prices = snapshot_bundle.market_prices
             is_trigger_mode = snapshot_bundle.is_trigger_mode
             risk_mode = snapshot_bundle.risk_mode
             risk_profile = snapshot_bundle.risk_profile
+            regime_key = self._derive_regime_key(market_snapshots)
+            active_bundle_summary = self._build_active_policy_bundle_summary(regime_key=regime_key)
+            regime_drift_summary = self._build_regime_drift_summary(regime_key=regime_key, bundle_summary=active_bundle_summary)
+            alpha_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "alpha_1h")
+            position_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "position_15m")
+            safety_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "safety_5m")
+            risk_state_payload = self._serialize_risk_state(risk_state)
             self._maybe_alert_risk_state_transitions(risk_state)
             self._maybe_alert_websocket_transitions()
             effective_risk_profile = self._build_effective_risk_profile(
                 loop_mode,
                 account_state=account_state,
                 risk_profile=risk_profile,
+                risk_mode=risk_mode,
+                regime_key=regime_key,
+            )
+            decision_market_snapshots, alpha_policy_summary = self._prepare_decision_market_snapshots(
+                account_state=account_state,
+                market_snapshots=market_snapshots,
+                loop_mode=loop_mode,
+                regime_key=regime_key,
+                alpha_policy_override=alpha_bundle_override,
             )
 
             # 3. Decision
@@ -2608,13 +3566,47 @@ class TradingOrchestrator:
                 risk_mode=risk_mode,
                 risk_profile=effective_risk_profile,
             )
+            if (
+                not skip_reason
+                and loop_mode == "1h"
+                and not self._has_live_positions(account_state)
+                and not self._has_live_open_orders(account_state)
+                and not decision_market_snapshots
+            ):
+                skip_reason = "alpha_policy_filtered_all"
+            decision_risk_state_payload = {
+                **risk_state_payload,
+                "alpha_policy_blocked_symbols": alpha_policy_summary.get("blocked_symbols") or {},
+            }
             request = None
-            if skip_reason:
+            position_policy_result = None
+            safety_policy_result = None
+            if loop_mode == "15m" and (
+                self._has_live_positions(account_state) or self._has_live_open_orders(account_state)
+            ):
+                position_policy_result = self.position_policy_engine.evaluate(
+                    account_state=account_state,
+                    market_snapshots=market_snapshots,
+                    risk_mode=risk_mode,
+                    loop_mode=loop_mode,
+                    regime_key=regime_key,
+                    policy_override=position_bundle_override or None,
+                )
+            if loop_mode == "5m":
+                safety_policy_result = self.safety_policy_engine.evaluate(
+                    account_state=account_state,
+                    market_snapshots=market_snapshots,
+                    risk_mode=risk_mode,
+                    loop_mode=loop_mode,
+                    regime_key=regime_key,
+                    policy_override=safety_bundle_override or None,
+                )
+            if safety_policy_result and not safety_policy_result.get("escalate_to_ai"):
                 request = DecisionRequest(
                     policy_summary=policy_summary,
                     account_state=account_state,
-                    market_snapshot=next(iter(market_snapshots.values())) if len(market_snapshots) == 1 else None,
-                    market_snapshots=market_snapshots,
+                    market_snapshot=next(iter(decision_market_snapshots.values())) if len(decision_market_snapshots) == 1 else None,
+                    market_snapshots=decision_market_snapshots,
                     risk_state=risk_state,
                     recent_journal_context=[],
                     long_term_memory=[],
@@ -2622,12 +3614,58 @@ class TradingOrchestrator:
                     is_trigger_mode=is_trigger_mode,
                     risk_mode=risk_mode,
                     risk_profile=effective_risk_profile,
+                    loop_mode=loop_mode,
+                    cycle_role=effective_risk_profile.get("cycle_role"),
+                )
+                input_hash = self.ai_engine._build_candidate_input_hash(request)
+                decision_result = self._build_policy_decision_result(
+                    decision_payload=safety_policy_result.get("decision_result") or {},
+                    input_hash=input_hash,
+                    model_name="safety_fsm",
+                )
+            elif position_policy_result and not position_policy_result.get("escalate_to_ai"):
+                request = DecisionRequest(
+                    policy_summary=policy_summary,
+                    account_state=account_state,
+                    market_snapshot=next(iter(decision_market_snapshots.values())) if len(decision_market_snapshots) == 1 else None,
+                    market_snapshots=decision_market_snapshots,
+                    risk_state=risk_state,
+                    recent_journal_context=[],
+                    long_term_memory=[],
+                    similar_past_cases=[],
+                    is_trigger_mode=is_trigger_mode,
+                    risk_mode=risk_mode,
+                    risk_profile=effective_risk_profile,
+                    loop_mode=loop_mode,
+                    cycle_role=effective_risk_profile.get("cycle_role"),
+                )
+                input_hash = self.ai_engine._build_candidate_input_hash(request)
+                decision_result = self._build_policy_decision_result(
+                    decision_payload=position_policy_result.get("decision_result") or {},
+                    input_hash=input_hash,
+                    model_name="position_fsm",
+                )
+            elif skip_reason:
+                request = DecisionRequest(
+                    policy_summary=policy_summary,
+                    account_state=account_state,
+                    market_snapshot=next(iter(decision_market_snapshots.values())) if len(decision_market_snapshots) == 1 else None,
+                    market_snapshots=decision_market_snapshots,
+                    risk_state=decision_risk_state_payload,
+                    recent_journal_context=[],
+                    long_term_memory=[],
+                    similar_past_cases=[],
+                    is_trigger_mode=is_trigger_mode,
+                    risk_mode=risk_mode,
+                    risk_profile=effective_risk_profile,
+                    loop_mode=loop_mode,
+                    cycle_role=effective_risk_profile.get("cycle_role"),
                 )
                 input_hash = self.ai_engine._build_candidate_input_hash(request)
                 log.info(f"Skipping AI decision call: {skip_reason}")
                 rationale_items = self._build_skip_rationale_items(
                     skip_reason=skip_reason,
-                    risk_state=risk_state,
+                    risk_state=decision_risk_state_payload,
                     market_snapshots=market_snapshots,
                     risk_profile=risk_profile,
                 )
@@ -2661,7 +3699,7 @@ class TradingOrchestrator:
                 raw_long_term_memory = self.state_store.get_long_term_memory()
                 recent_journal_context = self._select_recent_journal_context(
                     raw_recent_journal_context,
-                    market_snapshots=market_snapshots,
+                    market_snapshots=decision_market_snapshots,
                     risk_mode=risk_mode,
                     limit=context_budget["journal_keep_limit"],
                     max_rationale_items=context_budget["max_rationale_items_per_journal"],
@@ -2672,13 +3710,13 @@ class TradingOrchestrator:
                 )
                 long_term_memory = self._select_long_term_memory_context(
                     raw_long_term_memory,
-                    market_snapshots=market_snapshots,
+                    market_snapshots=decision_market_snapshots,
                     risk_mode=risk_mode,
                     limit=context_budget["memory_keep_limit"],
                     max_ignore_when=context_budget["max_ignore_when_per_memory"],
                 )
                 similar_past_cases = self._build_similar_past_cases(
-                    market_snapshots,
+                    decision_market_snapshots,
                     account_state=account_state,
                     risk_state=risk_state,
                     is_trigger_mode=is_trigger_mode,
@@ -2696,8 +3734,8 @@ class TradingOrchestrator:
                 request = DecisionRequest(
                     policy_summary=policy_summary,
                     account_state=account_state,
-                    market_snapshot=next(iter(market_snapshots.values())) if len(market_snapshots) == 1 else None,
-                    market_snapshots=market_snapshots,
+                    market_snapshot=next(iter(decision_market_snapshots.values())) if len(decision_market_snapshots) == 1 else None,
+                    market_snapshots=decision_market_snapshots,
                     risk_state=risk_state,
                     recent_journal_context=recent_journal_context,
                     long_term_memory=long_term_memory,
@@ -2705,9 +3743,26 @@ class TradingOrchestrator:
                     is_trigger_mode=is_trigger_mode,
                     risk_mode=risk_mode,
                     risk_profile=effective_risk_profile,
+                    loop_mode=loop_mode,
+                    cycle_role=effective_risk_profile.get("cycle_role"),
                 )
                 decision_result = self.ai_engine.generate_decision(request)
             intent = decision_result.intent
+            intent = self._enrich_intent_metadata(
+                intent,
+                input_hash=decision_result.input_hash,
+                loop_mode=loop_mode,
+                risk_mode=risk_mode,
+                market_snapshots=market_snapshots,
+            )
+            intent, execution_policy_summary = self.execution_policy_engine.apply_to_intent(
+                intent=intent,
+                market_snapshots=market_snapshots,
+                account_state=account_state,
+                loop_mode=loop_mode,
+                risk_mode=risk_mode,
+                is_trigger_mode=is_trigger_mode,
+            )
 
             # 4. Risk Evaluation
             unresolved_timeout_count = self.state_store.count_recent_unknown_orders(
@@ -2759,13 +3814,18 @@ class TradingOrchestrator:
                 "risk_state": risk_state,
                 "decision_input_hash": decision_result.input_hash,
                 "ai_usage": decision_result.usage_metadata or {},
+                "regime_key": regime_key,
+                "policy_bundle": active_bundle_summary,
+                "regime_drift": regime_drift_summary,
+                "alpha_policy": alpha_policy_summary,
+                "execution_policy": execution_policy_summary,
                 "evidence_quality": evidence_quality_summary,
                 "entry_size_cap": entry_size_cap_summary,
                 "executed_order_count": 0,
                 "unknown_order_states_before_execution": unresolved_timeout_count,
             }
             post_account_state = None
-            if is_approved and intent.decision in ("BUY", "SELL", "REDUCE", "EXIT"):
+            if is_approved and intent.decision in ("BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"):
                 locked_entry_symbols = []
                 try:
                     self.account_reader.invalidate_cache()
@@ -2799,7 +3859,7 @@ class TradingOrchestrator:
                             intent,
                             account_state=effective_pre_execution_state,
                         )
-                        entry_orders = self._extract_entry_orders(planned_orders)
+                        entry_orders = [] if intent.decision == "REPLACE_ENTRY" else self._extract_entry_orders(planned_orders)
                         fingerprint_entries = [
                             self._build_order_fingerprint(order, market_prices)
                             for order in entry_orders
@@ -2919,11 +3979,7 @@ class TradingOrchestrator:
                 estimated_pnl_pct = self._estimate_realized_pnl_pct(intent, effective_pre_execution_state)
             loss_signal = estimated_pnl_pct is not None and estimated_pnl_pct < 0
             account_payload = effective_pre_execution_state.model_dump(mode="json")
-            risk_payload = (
-                risk_state.model_dump(mode="json")
-                if hasattr(risk_state, "model_dump")
-                else dict(risk_state or {})
-            )
+            risk_payload = self._serialize_risk_state(risk_state)
             audit_market = {
                 "symbols": list(market_snapshots.keys()),
                 "market_snapshots": {
@@ -3013,6 +4069,34 @@ class TradingOrchestrator:
                     symbol_journal_entries=symbol_journal_entries,
                 )
                 self._backfill_retrieval_outcomes_for_symbol_entries(symbol_journal_entries)
+                self._backfill_shadow_policy_outcomes_for_symbol_entries(symbol_journal_entries)
+                execution_policy_evaluations = self._build_execution_policy_evaluation_entries(
+                    audit_log_id=audit_id,
+                    intent=intent,
+                    planned_orders=planned_orders,
+                    receipts=receipts,
+                    fills=fills,
+                    market_snapshots=market_snapshots,
+                    symbol_journal_entries=symbol_journal_entries,
+                    loop_mode=loop_mode,
+                    risk_mode=risk_mode,
+                    is_trigger_mode=is_trigger_mode,
+                )
+                if execution_policy_evaluations and hasattr(self.state_store, "save_execution_policy_evaluations"):
+                    self.state_store.save_execution_policy_evaluations(
+                        audit_id,
+                        execution_policy_evaluations,
+                    )
+                self._record_shadow_policy_decisions(
+                    audit_log_id=audit_id,
+                    loop_mode=loop_mode,
+                    live_intent=intent,
+                    account_state=post_account_state or effective_pre_execution_state,
+                    market_snapshots=market_snapshots,
+                    risk_mode=risk_mode,
+                    symbol_journal_entries=symbol_journal_entries,
+                    regime_key=regime_key,
+                )
                 self.state_store.save_symbol_journal_entries(symbol_journal_entries)
                 trade_case_snapshot_entries = self._build_trade_case_snapshot_entries(
                     audit_log_id=audit_id,
@@ -3144,6 +4228,25 @@ class TradingOrchestrator:
             )
 
     def run_daily_batch(self):
+        replay_config = self._build_replay_batch_config()
+        if replay_config["enabled"]:
+            log.info("Running incremental replay batch before daily memory updater...")
+            try:
+                replay_args = [
+                    sys.executable,
+                    "tools/replay_audit.py",
+                    "--auto",
+                    "--limit",
+                    str(replay_config["limit"]),
+                    "--window-hours",
+                    str(replay_config["window_hours"]),
+                ]
+                if replay_config["save"]:
+                    replay_args.append("--save")
+                subprocess.run(replay_args, check=True)
+                log.info("Incremental replay batch finished successfully.")
+            except Exception as e:
+                log.error(f"Incremental replay batch failed: {e}")
         log.info("Running daily memory updater batch...")
         try:
             # Reuse the current interpreter so the batch job sees the same virtualenv.
@@ -3186,7 +4289,11 @@ class TradingOrchestrator:
                 cycle_finished_at = time.time()
                 self._refresh_runtime_activity(cycle_result, cycle_finished_at)
                 desired_mode = self._determine_desired_loop_mode(cycle_result)
-                active_mode = self._apply_adaptive_loop_mode(desired_mode, cycle_finished_at)
+                active_mode = self._apply_adaptive_loop_mode(
+                    desired_mode,
+                    cycle_finished_at,
+                    cycle_result=cycle_result,
+                )
                 next_cycle_at = self._next_aligned_epoch(
                     self._loop_minutes_for_mode(active_mode),
                     cycle_finished_at,

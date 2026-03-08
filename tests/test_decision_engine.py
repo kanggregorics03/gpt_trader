@@ -92,6 +92,51 @@ class TestDecisionEngine(unittest.TestCase):
 
         self.assertNotEqual(base_hash, changed_hash)
 
+    def test_risk_state_prompt_and_hash_include_dynamic_risk_fields(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        request = DecisionRequest(
+            policy_summary="risk: adaptive",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=900.0,
+            ),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            ),
+            risk_state={
+                "daily_start_balance": 1000.0,
+                "daily_pnl_pct": -1.2,
+                "drawdown_active": False,
+                "consecutive_losses": 2,
+                "last_loss_estimated_pnl_pct": -0.9,
+                "cooldown_minutes_effective": 45,
+                "cooldown_components": ["medium_loss", "repeated_failure"],
+                "cooldown_active": True,
+                "cooldown_remaining_minutes": 20,
+                "failure_pattern_score": 0.7,
+                "dominant_failure_reason": "late_breakout_failure",
+                "dominant_failure_count": 3,
+            },
+            long_term_memory=[],
+        )
+
+        prompt = engine._create_prompt(request)
+        input_hash = engine._build_candidate_input_hash(request)
+        changed_hash = engine._build_candidate_input_hash(
+            request.model_copy(update={"risk_state": request.risk_state.model_copy(update={"failure_pattern_score": 0.2})})
+        )
+
+        self.assertIn('"failure_pattern_score":0.7', prompt)
+        self.assertIn('"dominant_failure_reason":"late_breakout_failure"', prompt)
+        self.assertNotEqual(input_hash, changed_hash)
+        self.assertEqual(request.risk_state.cooldown_minutes_effective, 45)
+        self.assertEqual(request.risk_state.dominant_failure_count, 3)
+
     def test_generate_decision_uses_exact_match_cache(self):
         tmpdir = tempfile.TemporaryDirectory()
         store = StateStore(str(Path(tmpdir.name) / "state.db"))
