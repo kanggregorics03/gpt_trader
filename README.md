@@ -87,11 +87,37 @@ journal + trade_cases + replay + shadow -> MemoryUpdater
     -> policy_bundles
 ```
 
+## 2026-03 리팩토링 상태
+
+이번 구조 리팩토링의 목적은 의사결정 로직을 바꾸는 것이 아니라, 책임 경계를 복원하고 테스트 가능한 단위로 분해하는 것이었다.
+
+- `TradingOrchestrator`의 공개 엔트리포인트는 유지했다.
+- `StateStore`의 공개 API 시그니처는 유지했다.
+- 프롬프트/학습 입력에는 여전히 `prompt-safe` 필터를 적용한다.
+- raw 저장/조회와 prompt/학습용 후보 조회를 구분한다.
+
+현재 기준으로 `main.py`와 `db/state_store.py`는 facade이고, 실제 구현은 `orchestrator/`와 `db/state_store_parts/` 아래의 책임별 mixin/module로 분리돼 있다.
+최근에는 `orchestrator/runtime_support.py`도 facade로 줄이고, runtime helper를 `runtime_state.py`, `cadence_policy.py`, `runtime_diagnostics.py`로 분리했다.
+
+의사결정 품질에 영향을 줄 수 있는 변경은 구조 리팩토링 자체가 아니라, 리팩토링 후 발견된 명시적 버그 수정으로만 반영했다.
+
+- 스키마가 깨진 audit에 연결된 trade case는 prompt/vector candidate에서 제외
+- audit row가 없는 raw trade case는 direct lookup에서 숨기지 않음
+- shadow policy score는 빈 calibration summary에서 기본 보너스를 얹지 않음
+
+검증 기준선은 repo-local `.venv`에서 아래 명령으로 고정한다.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -q
+```
+
+현재 전체 `272`개 테스트가 통과한다.
+
 ## 프로젝트 구조
 
 ```text
 gpt_trader/
-├─ main.py                    # 메인 오케스트레이터, 단일 adaptive loop 시작점
+├─ main.py                    # 메인 엔트리포인트 facade
 ├─ policy.yaml                # 거래/리스크 정책
 ├─ .env.example               # 환경 변수 예시
 ├─ ai/
@@ -108,10 +134,22 @@ gpt_trader/
 │  ├─ risk_engine.py          # 정책 검증, 리스크 모드/프로파일 계산
 │  ├─ safety_policy.py        # 5m execution safety FSM 정책 엔진
 │  └─ snapshot_service.py     # 공용 계좌/시장/리스크 스냅샷 조립
+├─ orchestrator/              # 오케스트레이터 내부 구현 분해
+│  ├─ bootstrap.py            # bootstrap facade
+│  ├─ bootstrap_config.py     # RuntimeConfig와 startup config 오류 정의
+│  ├─ bootstrap_dependencies.py # 외부 의존성 조립과 초기 wiring
+│  ├─ runtime_support.py      # runtime facade
+│  ├─ runtime_state.py        # risk/runtime helper, execution runtime 유틸
+│  ├─ cadence_policy.py       # adaptive cadence 전환 규칙과 maintenance tick
+│  ├─ runtime_diagnostics.py  # websocket/risk transition 진단과 알림
+│  ├─ cycle_*.py              # cycle 실행/리스크/감사/주문 흐름
+│  ├─ context_*.py            # recent journal / memory / similar case 선택
+│  └─ trade_case_*.py         # trade case retrieval / annotation / snapshot
 ├─ dashboard/
 │  └─ app.py                  # Flask 운영 대시보드
 ├─ db/
-│  └─ state_store.py          # SQLite 저장/조회 계층
+│  ├─ state_store.py          # SQLite facade
+│  └─ state_store_parts/      # schema / journal / trade case / runtime / query 분해
 ├─ exchange/
 │  ├─ account_reader.py       # Bybit 계좌 조회
 │  ├─ collector.py            # 시세/지표 수집
@@ -1220,7 +1258,14 @@ memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`,
 "프롬프트/모델/메모리/운영 정책 변경 후 판단이 어떻게 달라졌는가"를 비교하는 것이다.
 
 운영 기본값은 `수동 단건 replay + 일일 incremental replay 자동 배치`다.
-자동 경로는 최근 24시간의 대표 audit를 최대 30건까지 선별해 daily memory batch 직전에 저장한다.
+자동 경로는 최근 24시간의 대표 audit를 daily memory batch 직전에 저장한다.
+기본 base limit은 `30`건이지만, 후보량이 많으면 `coverage_target`에 따라 자동으로 늘어나며 기본 max limit은 `60`건이다.
+또한 자동 선별은 단순 recency가 아니라 아래 신호를 함께 본다.
+- 최근 replay가 없는 material trade / rejected entry
+- 큰 손실로 끝난 audit
+- retrieval이 실제 decision 차이를 만들었던 audit
+- missed opportunity 가능성이 높은 `HOLD`
+자동 경로에는 `HOLD`도 별도 quota를 둬서, trade 케이스에 밀려 전부 사라지지 않게 한다.
 이 자동 replay 후보는 학습 가능 audit만 대상으로 하고, 시스템 오류 fallback/loop error audit는 자동 경로에서 제외한다.
 최근 버전의 replay는 포지션이 없고 `HOLD`였던 audit에 대해서도 이후 `30m / 2h / 6h` 가격 경로를 다시 읽는다.
 즉 같은 시점에 단순 baseline entry를 넣었으면 충분히 먹을 수 있었는지 `hold_opportunity_counterfactual`로 저장한다.
@@ -1268,8 +1313,21 @@ python -m tools.replay_audit --audit-id 12 --save
 일일 incremental replay:
 
 ```powershell
-python -m tools.replay_audit --auto --save --limit 30 --window-hours 24
+python -m tools.replay_audit --auto --save --limit 30 --max-limit 60 --hold-quota 8 --window-hours 24
 ```
+
+기본 정책 값:
+
+- `replay_batch.limit`
+  - 최소 처리 기준(base limit)
+- `replay_batch.max_limit`
+  - 후보가 많을 때 늘어날 수 있는 상한
+- `replay_batch.coverage_target`
+  - 후보 pool 대비 목표 처리율
+- `replay_batch.hold_quota`
+  - 자동 경로에서 보장할 `HOLD` replay 수
+- `replay_batch.candidate_pool_limit`
+  - 하루 후보 pool을 평가할 최대 개수
 
 ### 비교 항목
 
@@ -1619,7 +1677,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 현재 테스트는 `unittest` 기반이다.
 
 ```powershell
-python -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m unittest discover -q
 ```
 
 테스트가 다루는 영역:
@@ -1633,6 +1691,8 @@ python -m unittest discover -s tests
 - 주문/포지션 상태 전이 저장
 - ExecutionEngine 체결 매칭과 상태 전이 생성
 - 장기 메모리 통계와 조건 메타데이터 저장
+
+현재 전체 테스트 수는 `272`개이며, 2026-03-09 기준 전체 통과 상태다.
 
 ## 운영 문서
 
@@ -1795,11 +1855,13 @@ python -m unittest discover -s tests
 
 ## 참고 파일
 
-- 메인 오케스트레이터: [`main.py`](/c:/gpt_trader/main.py)
+- 메인 엔트리포인트 facade: [`main.py`](/c:/gpt_trader/main.py)
+- 오케스트레이터 구현: [`orchestrator/bootstrap.py`](/c:/gpt_trader/orchestrator/bootstrap.py)
 - 정책 파일: [`policy.yaml`](/c:/gpt_trader/policy.yaml)
 - 데이터 모델: [`core/models.py`](/c:/gpt_trader/core/models.py)
 - 리스크 엔진: [`core/risk_engine.py`](/c:/gpt_trader/core/risk_engine.py)
-- 상태 저장소: [`db/state_store.py`](/c:/gpt_trader/db/state_store.py)
+- 상태 저장소 facade: [`db/state_store.py`](/c:/gpt_trader/db/state_store.py)
+- 상태 저장소 구현: [`db/state_store_parts/trade_case_repository.py`](/c:/gpt_trader/db/state_store_parts/trade_case_repository.py)
 - 의사결정 엔진: [`ai/decision_engine.py`](/c:/gpt_trader/ai/decision_engine.py)
 - 실행 엔진: [`exchange/execution_engine.py`](/c:/gpt_trader/exchange/execution_engine.py)
 - 메모리 배치: [`batch/memory_updater.py`](/c:/gpt_trader/batch/memory_updater.py)

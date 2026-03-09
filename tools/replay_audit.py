@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -915,17 +916,60 @@ def replay_and_optionally_save(
     return payload
 
 
+def resolve_incremental_replay_limit(
+    *,
+    candidate_count: int,
+    base_limit: int,
+    max_limit: int,
+    coverage_target: float = 0.5,
+) -> int:
+    candidate_count = max(0, int(candidate_count or 0))
+    if candidate_count <= 0:
+        return 0
+    base_limit = max(1, int(base_limit or 1))
+    max_limit = max(base_limit, int(max_limit or base_limit))
+    coverage_target = min(1.0, max(0.1, float(coverage_target or 0.5)))
+    scaled_limit = int(math.ceil(candidate_count * coverage_target))
+    return min(candidate_count, max_limit, max(base_limit, scaled_limit))
+
+
 def run_incremental_replay_batch(
     store: StateStore,
     *,
     window_hours: int = 24,
     limit: int = 30,
+    max_limit: int | None = None,
+    coverage_target: float = 0.5,
+    hold_quota: int = 0,
+    candidate_pool_limit: int | None = None,
     save: bool = True,
 ) -> Dict[str, Any]:
     since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=max(1, int(window_hours or 24)))
-    candidates = store.get_replay_batch_candidates(since=since, limit=max(1, int(limit or 30)))
-    if not candidates:
+    base_limit = max(1, int(limit or 30))
+    max_limit = max(base_limit, int(max_limit or max(base_limit, base_limit * 2)))
+    hold_quota = max(0, min(int(hold_quota or 0), max_limit))
+    candidate_pool_limit = max(
+        max_limit,
+        int(candidate_pool_limit or max(120, max_limit * 4)),
+    )
+    candidate_pool = store.get_replay_batch_candidates(
+        since=since,
+        limit=candidate_pool_limit,
+        hold_quota=0,
+    )
+    effective_limit = resolve_incremental_replay_limit(
+        candidate_count=len(candidate_pool),
+        base_limit=base_limit,
+        max_limit=max_limit,
+        coverage_target=coverage_target,
+    )
+    if effective_limit <= 0:
         return {"candidate_count": 0, "saved_count": 0, "replayed_audit_ids": []}
+    candidates = store.get_replay_batch_candidates(
+        since=since,
+        limit=effective_limit,
+        hold_quota=hold_quota,
+    )
     engine = build_replay_engine()
     replayed_audit_ids: List[int] = []
     saved_count = 0
@@ -945,7 +989,12 @@ def run_incremental_replay_batch(
         if save and payload:
             saved_count += 1
     summary = {
-        "candidate_count": len(candidates),
+        "candidate_count": len(candidate_pool),
+        "selected_count": len(candidates),
+        "effective_limit": effective_limit,
+        "base_limit": base_limit,
+        "max_limit": max_limit,
+        "hold_quota": hold_quota,
         "saved_count": saved_count,
         "replayed_audit_ids": replayed_audit_ids,
     }
@@ -955,6 +1004,7 @@ def run_incremental_replay_batch(
             {
                 **summary,
                 "window_hours": max(1, int(window_hours or 24)),
+                "coverage_target": round(float(coverage_target), 4),
                 "executed_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
             },
             artifact_type="heartbeat",
@@ -996,7 +1046,15 @@ def main():
     parser.add_argument("--save", action="store_true", help="Persist replay comparison into replay_runs")
     parser.add_argument("--auto", action="store_true", help="Run incremental replay batch over recent audits")
     parser.add_argument("--window-hours", type=int, default=int(os.getenv("REPLAY_WINDOW_HOURS", "24") or 24))
-    parser.add_argument("--limit", type=int, default=10, help="Number of audits to list")
+    parser.add_argument("--limit", type=int, default=int(os.getenv("REPLAY_LIMIT", "30") or 30), help="Number of audits to list")
+    parser.add_argument("--max-limit", type=int, default=int(os.getenv("REPLAY_MAX_LIMIT", "60") or 60))
+    parser.add_argument("--coverage-target", type=float, default=float(os.getenv("REPLAY_COVERAGE_TARGET", "0.5") or 0.5))
+    parser.add_argument("--hold-quota", type=int, default=int(os.getenv("REPLAY_HOLD_QUOTA", "8") or 8))
+    parser.add_argument(
+        "--candidate-pool-limit",
+        type=int,
+        default=int(os.getenv("REPLAY_CANDIDATE_POOL_LIMIT", "240") or 240),
+    )
     args = parser.parse_args()
 
     store = StateStore(args.db_path)
@@ -1009,6 +1067,10 @@ def main():
             store,
             window_hours=args.window_hours,
             limit=args.limit,
+            max_limit=args.max_limit,
+            coverage_target=args.coverage_target,
+            hold_quota=args.hold_quota,
+            candidate_pool_limit=args.candidate_pool_limit,
             save=args.save,
         )
         print(json.dumps(summary, indent=2))

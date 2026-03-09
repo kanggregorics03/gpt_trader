@@ -91,6 +91,26 @@ state_store (DB)
 
 상태(리스크 상태, 최근 트레이드 요약, 장기 메모리 버전 등) 저장
 
+orchestrator bootstrap
+
+실행 시작점은 facade `main.py`를 유지하되, 실제 bootstrap은 세 층으로 나눈다.
+
+- `bootstrap.py`: bootstrap facade와 helper mixin
+- `bootstrap_config.py`: env -> `RuntimeConfig` 해석
+- `bootstrap_dependencies.py`: 거래소/피드/엔진/스토어 조립
+
+즉 설정 해석, 의존성 생성, runtime state 초기화를 한 메서드에 섞지 않는다.
+
+orchestrator runtime support
+
+runtime helper도 facade `runtime_support.py`를 유지하되 세 층으로 나눈다.
+
+- `runtime_state.py`: risk/runtime helper, execution runtime 보조 유틸
+- `cadence_policy.py`: `1h / 15m / 5m` adaptive cadence 전환 규칙과 maintenance tick
+- `runtime_diagnostics.py`: websocket freshness, risk transition alert, runtime diagnostics
+
+즉 상태 조작, cadence 전이, 진단/알림을 같은 mixin에 섞지 않는다.
+
 snapshot_service
 
 account_reader / collector / state_store를 묶어 공용 스냅샷을 조립
@@ -450,7 +470,8 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 (주 1회도 가능하지만 통찰 업데이트가 느림)
 
 권장 운영은 `incremental replay -> memory batch` 순서다.
-즉 배치 직전에 최근 24시간 대표 audit를 20~40건 정도 자동 replay한 뒤, 그 결과를 memory/policy 평가에 반영한다.
+즉 배치 직전에 최근 24시간 대표 audit를 자동 replay한 뒤, 그 결과를 memory/policy 평가에 반영한다.
+자동 replay 수는 고정 30건이 아니라 candidate volume에 따라 가변이고, 기본적으로 `30 -> 60` 범위 안에서 `coverage_target`을 맞추도록 늘어난다.
 단, 자동 replay와 memory batch는 모든 audit를 그대로 학습 입력으로 쓰지 않는다.
 `loop error`, `execution_summary.error`, `ai_usage.validation_error`,
 `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 감사 로그로는 유지하되 자동 학습 입력에서는 제외한다.
@@ -464,6 +485,15 @@ runtime prompt retrieval도 같은 부류의 audit와 연결 trade case를 recen
 - bid/ask + spread/slippage를 반영한 assumed fill price
 - ATR 또는 invalidation 거리 기반 stop/take-profit
 - future path에서 stop/take-profit hit 순서를 순차 평가
+
+후보 우선순위는 단순 recency가 아니라 아래를 함께 반영한다.
+
+- 큰 손실로 끝난 audit
+- rejected entry / material trade audit
+- retrieval 포함 여부와 최근 replay에서 관측된 retrieval 영향도
+- `hold_opportunity_counterfactual` 또는 trigger-rich snapshot이 있는 `HOLD`
+
+또한 `HOLD`는 별도 quota를 둬 trade/rejected entry가 많은 날에도 일부가 자동 replay에 계속 포함되게 한다.
 - 수수료 포함 net realized move 계산
 을 함께 가정한다.
 미래 가격 경로는 `audit_logs.market_state`에만 의존하지 않고,

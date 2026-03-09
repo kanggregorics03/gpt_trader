@@ -7,6 +7,7 @@ from tools.replay_audit import (
     build_hold_baseline_intent,
     build_replay_payload,
     evaluate_hold_opportunity_counterfactual,
+    resolve_incremental_replay_limit,
     should_run_retrieval_counterfactual,
     strip_retrieval_context,
 )
@@ -98,6 +99,35 @@ class TestReplayAudit(unittest.TestCase):
                 audit={"intent": {"decision": "BUY"}, "risk_approved": True},
                 request_payload={"similar_past_cases": []},
             )
+        )
+
+    def test_resolve_incremental_replay_limit_scales_with_candidate_volume(self):
+        self.assertEqual(
+            resolve_incremental_replay_limit(
+                candidate_count=20,
+                base_limit=30,
+                max_limit=60,
+                coverage_target=0.5,
+            ),
+            20,
+        )
+        self.assertEqual(
+            resolve_incremental_replay_limit(
+                candidate_count=80,
+                base_limit=30,
+                max_limit=60,
+                coverage_target=0.5,
+            ),
+            40,
+        )
+        self.assertEqual(
+            resolve_incremental_replay_limit(
+                candidate_count=180,
+                base_limit=30,
+                max_limit=60,
+                coverage_target=0.5,
+            ),
+            60,
         )
 
     def test_hold_opportunity_counterfactual_detects_missed_move(self):

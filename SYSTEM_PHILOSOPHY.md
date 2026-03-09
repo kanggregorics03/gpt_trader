@@ -45,6 +45,31 @@
 
 요약하면 prompt는 설명 문서가 아니라 compact decision contract여야 한다.
 
+### 4.1 Raw 조회와 Prompt-safe 조회는 분리한다
+
+운영 시스템에는 두 종류의 조회가 있다.
+
+- raw 저장 사실을 그대로 보여주는 조회
+- 프롬프트, retrieval, 학습 입력으로 들어갈 수 있는 prompt-safe 조회
+
+여기서 중요한 원칙은 다음과 같다.
+
+- schema validation fallback, semantic validation error, system fallback 성격의 audit는 prompt-safe 후보에서 제외한다.
+- audit row가 없다는 이유만으로 raw trade case를 숨기지는 않는다.
+- 반대로 prompt-safe 후보는 audit linkage를 통해 실제로 걸러져야 한다.
+
+즉 "보여줄 수 있는가"와 "프롬프트에 넣어도 되는가"는 같은 질문이 아니다.
+
+### 4.2 구조 리팩토링은 Decision Contract를 바꾸지 않는다
+
+리팩토링의 목적은 책임 경계를 분해하고 테스트 가능성을 높이는 것이지, 의사결정 의미를 바꾸는 것이 아니다.
+
+- 공개 엔트리포인트와 policy contract는 유지한다.
+- prompt-safe 필터, risk policy, execution policy, shadow evaluation 의미는 유지한다.
+- 동작 변경이 필요하면 구조 개선과 분리해서 명시적 버그 수정으로 다룬다.
+
+즉 구조 변경은 decision quality를 바꾸지 않아야 하고, 품질 변화는 의도된 규칙 수정으로만 일어나야 한다.
+
 ## 5. 학습 철학
 
 이 시스템의 학습은 크게 네 층이다.
@@ -55,6 +80,13 @@
 4. holdout, replay, liveness 조건을 통과한 경우에만 promotion이 일어난다.
 
 즉 "좋은 답변을 한 번 받는 것"이 아니라 "운영 결과를 반영해 보조 구조를 천천히 진화시키는 것"이 학습이다.
+
+여기서 replay 자동화는 균등 샘플링이 아니라 운영적으로 의미 있는 audit를 더 자주 본다는 원칙을 따른다.
+
+- 큰 손실 audit는 더 높은 우선순위를 갖는다.
+- retrieval이 실제 decision 차이를 만든 audit는 다시 보기 가치가 높다.
+- `HOLD`도 missed opportunity를 보기 위해 별도 quota로 유지한다.
+- 하지만 system/validation fallback audit는 여전히 자동 학습 경로에서 제외한다.
 
 ## 6. Shadow Model 원칙
 
@@ -80,6 +112,9 @@
 - shadow dataset 준비 여부
 - promotion blocked 여부
 
+좋은 liveness는 단순 "replay run 개수"가 아니라, 중요한 후보군을 계속 커버하고 있는 상태를 뜻한다.
+그래서 replay batch는 후보량이 많아지면 처리 수를 가변적으로 늘리고, `HOLD`도 별도 quota로 보장한다.
+
 이 값이 stale이면 자동 승격은 멈춰야 한다. stale 상태에서의 promotion은 "학습된 시스템"이 아니라 "학습이 멈춘 시스템의 착시"다.
 
 ## 8. 좋은 상태의 정의
@@ -99,6 +134,8 @@
 - `ai/decision_engine.py`
 - `main.py`
 - `db/state_store.py`
+- `orchestrator/`
+- `db/state_store_parts/`
 - `batch/memory_updater.py`
 - `tools/replay_audit.py`
 - `dashboard/app.py`

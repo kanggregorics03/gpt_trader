@@ -67,6 +67,10 @@ replay_batch:
   enabled: true
   window_hours: 24
   limit: 30
+  max_limit: 60
+  coverage_target: 0.5
+  hold_quota: 8
+  candidate_pool_limit: 240
   save: true
 
 execution_policy:

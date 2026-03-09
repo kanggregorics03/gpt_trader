@@ -49,6 +49,7 @@ def setup_logger(
             level=log_level,
             colorize=False,
             serialize=True,
+            encoding="utf-8",
         )
     else:
         logger.add(stdout_sink, level=log_level, colorize=True, format=TEXT_LOG_FORMAT)
@@ -59,6 +60,7 @@ def setup_logger(
             level=log_level,
             colorize=False,
             format=TEXT_LOG_FORMAT,
+            encoding="utf-8",
         )
     return logger
 

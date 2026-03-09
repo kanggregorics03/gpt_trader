@@ -25,7 +25,7 @@ class TestLogger(unittest.TestCase):
             stdout_value = stdout_buffer.getvalue()
             self.assertIn("INFO", stdout_value)
             self.assertIn("text log example", stdout_value)
-            self.assertIn("text log example", Path(file_path).read_text())
+            self.assertIn("text log example", Path(file_path).read_text(encoding="utf-8"))
         finally:
             test_logger.remove()
             setup_logger()
@@ -49,7 +49,7 @@ class TestLogger(unittest.TestCase):
             payload = json.loads(stdout_value)
             self.assertEqual(payload["record"]["level"]["name"], "WARNING")
             self.assertEqual(payload["record"]["message"], "json log example")
-            file_payload = json.loads(Path(file_path).read_text().strip())
+            file_payload = json.loads(Path(file_path).read_text(encoding="utf-8").strip())
             self.assertEqual(file_payload["record"]["message"], "json log example")
         finally:
             test_logger.remove()
@@ -71,7 +71,7 @@ class TestLogger(unittest.TestCase):
             test_logger.info("directory creation example")
 
             self.assertTrue(Path(file_path).exists())
-            self.assertIn("directory creation example", Path(file_path).read_text())
+            self.assertIn("directory creation example", Path(file_path).read_text(encoding="utf-8"))
         finally:
             test_logger.remove()
             setup_logger()

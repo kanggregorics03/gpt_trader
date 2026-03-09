@@ -646,6 +646,104 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(rows[1]["id"], approved_trade_id)
         self.assertEqual(rows[2]["id"], hold_id)
 
+    def test_replay_batch_candidates_reserve_hold_quota_and_rank_by_loss_and_retrieval(self):
+        low_loss_trade_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.5},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={"policy_summary": "a", "account_state": {}, "market_snapshot": {}},
+        )
+        self.store.save_journal(
+            decision="BUY",
+            rationale=["small loss"],
+            confidence=0.5,
+            audit_log_id=low_loss_trade_id,
+            estimated_pnl_pct=-0.3,
+        )
+        high_loss_trade_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.5},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={
+                "policy_summary": "b",
+                "account_state": {},
+                "market_snapshot": {},
+                "similar_past_cases": [{"trade_case_id": "case-1"}],
+            },
+        )
+        self.store.save_journal(
+            decision="BUY",
+            rationale=["large loss"],
+            confidence=0.5,
+            audit_log_id=high_loss_trade_id,
+            estimated_pnl_pct=-1.4,
+        )
+        replayed_hold_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.2},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={
+                "policy_summary": "c",
+                "account_state": {},
+                "market_snapshots": {
+                    "ETHUSDT": {
+                        "is_opportunity_trigger": True,
+                        "volume_surge_trigger_active": True,
+                        "range_break_trigger_active": True,
+                        "opportunity_trigger_reasons": ["volume_surge_15m", "range_break_1h"],
+                    }
+                },
+            },
+        )
+        self.store.save_replay_run(
+            replayed_hold_id,
+            {
+                "comparison": {"original_decision": "HOLD", "replayed_decision": "BUY"},
+                "hold_opportunity_counterfactual": {
+                    "hold_quality": "missed_opportunity_hold",
+                    "missed_breakout_count": 2,
+                    "hold_opportunity_cost": 1.6,
+                },
+                "retrieval_counterfactual": {
+                    "with_vs_without_comparison": {
+                        "decision_changed": True,
+                        "side_changed": True,
+                        "confidence_delta": 0.25,
+                        "size_delta": 0.4,
+                    }
+                },
+            },
+        )
+        plain_hold_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.2},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "d", "account_state": {}, "market_snapshot": {}},
+        )
+
+        rows = self.store.get_replay_batch_candidates(
+            since=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
+            limit=3,
+            hold_quota=1,
+        )
+
+        self.assertEqual(rows[0]["id"], high_loss_trade_id)
+        self.assertIn(replayed_hold_id, [row["id"] for row in rows])
+        self.assertNotIn(plain_hold_id, [row["id"] for row in rows])
+        self.assertGreater(rows[0]["replay_priority_score"], rows[-1]["replay_priority_score"])
+
     def test_replay_candidates_exclude_system_error_and_validation_fallback_audits(self):
         eligible_id = self.store.save_audit(
             account={"total_balance": 1000},

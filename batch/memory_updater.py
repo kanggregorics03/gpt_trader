@@ -3765,7 +3765,12 @@ Computed statistics:
         replay_summary = self._build_replay_execution_summary(replay_runs or [])
         trading_balance_summary = trading_balance_summary or {}
         confidence_calibration_summary = confidence_calibration_summary or {}
-        confidence_alignment_score = float(confidence_calibration_summary.get("alignment_score") or 0.5)
+        raw_confidence_alignment = confidence_calibration_summary.get("alignment_score")
+        confidence_alignment_score = (
+            float(raw_confidence_alignment)
+            if raw_confidence_alignment is not None
+            else None
+        )
         for candidate in candidates or []:
             candidate_id = candidate.get("id")
             domain = str(candidate.get("domain") or "").strip()
@@ -3807,7 +3812,8 @@ Computed statistics:
                     float(trading_balance_summary.get("false_entry_cost") or 0.0) * 0.05,
                 )
             score += min(0.12, float(trading_balance_summary.get("portfolio_utility_score") or 0.0) * 0.12)
-            score += min(0.08, confidence_alignment_score * 0.08)
+            if confidence_alignment_score is not None:
+                score += min(0.08, confidence_alignment_score * 0.08)
             holdout_score = self._coerce_float(temporal_holdout_summary.get("holdout_score"))
             if holdout_score is not None:
                 score += max(-0.12, min(0.12, holdout_score * 0.12))
@@ -3823,7 +3829,7 @@ Computed statistics:
                     "replay_execution_summary": replay_summary,
                     "trading_balance_summary": trading_balance_summary,
                     "confidence_calibration_summary": confidence_calibration_summary,
-                    "confidence_alignment_score": round(confidence_alignment_score, 4),
+                    "confidence_alignment_score": round(float(confidence_alignment_score or 0.0), 4),
                     "temporal_holdout_summary": temporal_holdout_summary,
                 },
             }
