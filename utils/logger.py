@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 from loguru import logger
 
@@ -19,6 +20,15 @@ def _normalize_log_format(log_format: str) -> str:
     return normalized
 
 
+def _resolve_file_sink(file_sink: str | None) -> str:
+    resolved = str(file_sink or os.getenv("LOG_FILE", "logs/gpt_trader.log")).strip()
+    if not resolved:
+        resolved = "logs/gpt_trader.log"
+    path = Path(resolved)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def setup_logger(
     log_level: str | None = None,
     log_format: str | None = None,
@@ -28,7 +38,7 @@ def setup_logger(
     log_level = log_level or os.getenv("LOG_LEVEL", "INFO")
     log_format = _normalize_log_format(log_format or os.getenv("LOG_FORMAT", "text"))
     stdout_sink = stdout_sink or sys.stdout
-    file_sink = file_sink or "logs/gpt_trader.log"
+    file_sink = _resolve_file_sink(file_sink)
     logger.remove()
     if log_format == "json":
         logger.add(stdout_sink, level=log_level, colorize=False, serialize=True)
