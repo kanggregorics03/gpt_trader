@@ -11,6 +11,7 @@ from core.models import (
     TradeIntent,
     coerce_risk_state_snapshot,
 )
+from utils.symbols import normalize_symbol, normalize_symbol_list
 
 class RiskEngine:
     DEFAULT_PROMPT_EXECUTION_GUARDS: Dict[str, Any] = {
@@ -184,9 +185,9 @@ class RiskEngine:
         policy = dict(raw_policy or {})
         trading_policy = dict(policy.get("trading") or {})
         configured_symbols = [
-            str(symbol).strip().upper()
-            for symbol in (trading_policy.get("symbols") or [])
-            if str(symbol).strip()
+            symbol
+            for symbol in normalize_symbol_list(trading_policy.get("symbols") or [])
+            if symbol
         ]
         if not configured_symbols:
             configured_symbols = ["BTCUSDT"]
@@ -213,7 +214,7 @@ class RiskEngine:
 
     def _validate_policy(self, policy: dict) -> dict:
         trading_policy = dict(policy.get("trading") or {})
-        configured_symbols = [str(symbol).strip().upper() for symbol in (trading_policy.get("symbols") or []) if str(symbol).strip()]
+        configured_symbols = normalize_symbol_list(trading_policy.get("symbols") or [])
         if len(configured_symbols) != 1:
             raise ValueError("Single-symbol mode requires exactly one trading symbol in policy.yaml.")
 
@@ -260,7 +261,7 @@ class RiskEngine:
     def get_trading_symbol(self) -> str:
         trading_policy = self.policy.get("trading", {}) or {}
         configured = trading_policy.get("symbols") or ["BTCUSDT"]
-        return str(configured[0]).strip().upper()
+        return normalize_symbol(configured[0]) or "BTCUSDT"
 
     def get_trading_symbols(self) -> List[str]:
         return [self.get_trading_symbol()]
@@ -501,7 +502,8 @@ class RiskEngine:
             risk_state=risk_state,
             is_trigger_mode=is_trigger_mode,
         )
-        allowed_symbols = trading_policy.get('symbols', [])
+        allowed_symbols = normalize_symbol_list(trading_policy.get('symbols', []))
+        allowed_symbol_set = set(allowed_symbols)
         is_cancel_decision = intent.decision == "CANCEL"
         is_replace_entry_decision = intent.decision == "REPLACE_ENTRY"
         is_entry_decision = intent.decision in ("BUY", "SELL")
@@ -509,6 +511,7 @@ class RiskEngine:
         is_risk_reducing = intent.decision in ("REDUCE", "EXIT", "CANCEL")
 
         def get_snapshot_for_symbol(symbol: str) -> Optional[MarketSnapshot]:
+            symbol = normalize_symbol(symbol)
             if symbol in market_snapshots:
                 return market_snapshots[symbol]
             if market_snapshot is not None and market_snapshot.symbol == symbol:
@@ -524,11 +527,11 @@ class RiskEngine:
             return str(getattr(order, "side", "")).upper() in ("BUY", "SELL")
 
         def is_cancelled_by_intent(open_order) -> bool:
-            symbol = str(getattr(open_order, "symbol", "") or "")
+            symbol = normalize_symbol(getattr(open_order, "symbol", "") or "")
             order_id = getattr(open_order, "order_id", None)
             client_order_id = getattr(open_order, "client_order_id", None)
             for cancel_order in cancel_orders:
-                if cancel_order.symbol != symbol:
+                if normalize_symbol(cancel_order.symbol) != symbol:
                     continue
                 if order_id and cancel_order.target_order_id and order_id == cancel_order.target_order_id:
                     return True
@@ -546,11 +549,13 @@ class RiskEngine:
         if cancel_orders:
             open_orders_by_symbol = {}
             for open_order in account_state.open_orders:
-                open_orders_by_symbol.setdefault(str(getattr(open_order, "symbol", "") or ""), []).append(open_order)
+                symbol = normalize_symbol(getattr(open_order, "symbol", "") or "")
+                open_orders_by_symbol.setdefault(symbol, []).append(open_order)
             for order in cancel_orders:
-                if order.symbol not in allowed_symbols:
+                order_symbol = normalize_symbol(order.symbol)
+                if order_symbol not in allowed_symbol_set:
                     return False, f"Symbol {order.symbol} is not in approved policy list."
-                candidates = open_orders_by_symbol.get(order.symbol, [])
+                candidates = open_orders_by_symbol.get(order_symbol, [])
                 if not candidates:
                     return False, f"No live open orders found for {order.symbol}."
                 matches_target = any(
@@ -582,7 +587,7 @@ class RiskEngine:
                 return False, "REPLACE_ENTRY requires one replacement order per cancel leg."
             open_orders_by_key = {}
             for open_order in account_state.open_orders:
-                symbol = str(getattr(open_order, "symbol", "") or "")
+                symbol = normalize_symbol(getattr(open_order, "symbol", "") or "")
                 order_id = getattr(open_order, "order_id", None)
                 client_order_id = getattr(open_order, "client_order_id", None)
                 if order_id:
@@ -590,11 +595,12 @@ class RiskEngine:
                 if client_order_id:
                     open_orders_by_key[("client_order_id", symbol, client_order_id)] = open_order
             for replacement_order in non_cancel_orders:
+                replacement_symbol = normalize_symbol(replacement_order.symbol)
                 if replacement_order.reduce_only:
                     return False, "REPLACE_ENTRY replacement orders must not be reduce_only."
                 if replacement_order.action not in ("BUY", "SELL"):
                     return False, "REPLACE_ENTRY replacement orders must be BUY or SELL."
-                if replacement_order.symbol not in allowed_symbols:
+                if replacement_symbol not in allowed_symbol_set:
                     return False, f"Symbol {replacement_order.symbol} is not in approved policy list."
                 if replacement_order.wait_for_cancel_confirmation is not True:
                     return False, "REPLACE_ENTRY replacement orders must wait for cancel confirmation."
@@ -608,16 +614,17 @@ class RiskEngine:
                 )
                 if matched_cancel is None:
                     return False, "REPLACE_ENTRY replacement order is missing its linked cancel leg."
+                matched_cancel_symbol = normalize_symbol(matched_cancel.symbol)
                 target_open_order = None
                 if matched_cancel.target_order_id:
-                    target_open_order = open_orders_by_key.get(("order_id", matched_cancel.symbol, matched_cancel.target_order_id))
+                    target_open_order = open_orders_by_key.get(("order_id", matched_cancel_symbol, matched_cancel.target_order_id))
                 if target_open_order is None and matched_cancel.target_client_order_id:
-                    target_open_order = open_orders_by_key.get(("client_order_id", matched_cancel.symbol, matched_cancel.target_client_order_id))
+                    target_open_order = open_orders_by_key.get(("client_order_id", matched_cancel_symbol, matched_cancel.target_client_order_id))
                 if target_open_order is None:
                     return False, "REPLACE_ENTRY target order is not present in the live open-order set."
                 target_side = str(getattr(target_open_order, "side", "") or "").upper()
                 target_quantity = abs(float(getattr(target_open_order, "quantity", 0.0) or 0.0))
-                if replacement_order.symbol != matched_cancel.symbol:
+                if replacement_symbol != matched_cancel_symbol:
                     return False, "REPLACE_ENTRY cancel and replacement legs must target the same symbol."
                 if replacement_order.action != target_side:
                     return False, "REPLACE_ENTRY replacement side must match the cancelled entry order side."
@@ -676,17 +683,17 @@ class RiskEngine:
         )
         if uses_entry_exposure:
             new_symbols = {
-                order.symbol
+                normalize_symbol(order.symbol)
                 for order in non_cancel_orders
                 if not order.reduce_only
             }
             pending_symbols = {
-                order.symbol
+                normalize_symbol(order.symbol)
                 for order in account_state.open_orders
                 if is_pending_entry_order(order) and not is_cancelled_by_intent(order)
             }
             existing_symbols = {
-                position.symbol
+                normalize_symbol(position.symbol)
                 for position in account_state.positions
                 if abs(float(position.size)) > 0
             }
@@ -702,12 +709,13 @@ class RiskEngine:
         for order in intent.orders:
             if order.action == "CANCEL":
                 continue
-            symbol_market_snapshot = get_snapshot_for_symbol(order.symbol)
+            order_symbol = normalize_symbol(order.symbol)
+            symbol_market_snapshot = get_snapshot_for_symbol(order_symbol)
             risk_trigger_reasons = set(
                 symbol_market_snapshot.risk_trigger_reasons if symbol_market_snapshot else []
             )
 
-            if order.symbol not in allowed_symbols:
+            if order_symbol not in allowed_symbol_set:
                 return False, f"Symbol {order.symbol} is not in approved policy list."
 
             if allowed_order_types and order.order_type not in allowed_order_types:
@@ -746,7 +754,7 @@ class RiskEngine:
             for pending_order in account_state.open_orders:
                 if not is_pending_entry_order(pending_order) or is_cancelled_by_intent(pending_order):
                     continue
-                pending_price = pending_order.price or market_prices.get(pending_order.symbol)
+                pending_price = pending_order.price or market_prices.get(normalize_symbol(pending_order.symbol))
                 if pending_price is None:
                     pending_price = 0.0
                 pending_exposure += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
@@ -754,7 +762,7 @@ class RiskEngine:
             for order in non_cancel_orders:
                 if order.reduce_only:
                     continue
-                reference_price = order.price or market_prices.get(order.symbol)
+                reference_price = order.price or market_prices.get(normalize_symbol(order.symbol))
                 if reference_price is None:
                     logger.warning(
                         "Missing market price for {}; using 0 in exposure calculation.",
@@ -788,14 +796,14 @@ class RiskEngine:
             for pending_order in account_state.open_orders:
                 if not is_pending_entry_order(pending_order) or is_cancelled_by_intent(pending_order):
                     continue
-                pending_price = pending_order.price or market_prices.get(pending_order.symbol)
+                pending_price = pending_order.price or market_prices.get(normalize_symbol(pending_order.symbol))
                 if pending_price is None:
                     pending_price = 0.0
                 pending_notional += abs(float(pending_order.quantity or 0.0)) * float(pending_price)
             for order in non_cancel_orders:
                 if order.reduce_only:
                     continue
-                reference_price = order.price or market_prices.get(order.symbol)
+                reference_price = order.price or market_prices.get(normalize_symbol(order.symbol))
                 if reference_price is None:
                     logger.warning(
                         "Missing market price for {}; using 0 in order-size profile check.",

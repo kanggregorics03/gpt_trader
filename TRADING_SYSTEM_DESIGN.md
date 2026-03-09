@@ -79,6 +79,11 @@ WS 복구는 단순 재연결로 보지 않고, private 이벤트 수신 재개 
 
 다만 계정이 조용해 private 이벤트가 당장 없더라도, 시작 직후 REST reconcile이 1회 성공하고 안정 구간을 지나면 `healthy`로 승격될 수 있다.
 반대로 stale/down 이후 private 이벤트가 다시 들어온 직후에는 forced reconcile 정책에 따라 한 번 더 `degraded`를 거칠 수 있다.
+transport liveness는 private 계좌 변동 이벤트뿐 아니라 pybit raw websocket message / pong / open 훅으로도 갱신한다.
+즉 계좌 변화가 없는 조용한 구간 자체를 stale로 보지 않고, 최근 reconcile TTL 안에서는 healthy를 유지한다.
+
+심볼 비교는 정책/주문/포지션/체결 전 구간에서 canonical symbol로 정규화한다.
+예를 들어 `ETHUSDT`, `ETH/USDT`, `ETH/USDT:USDT`는 내부적으로 같은 심볼로 취급한다.
 
 `AccountReader.get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 볼 수 있다
 

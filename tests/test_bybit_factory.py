@@ -26,6 +26,7 @@ class TestBybitFactory(unittest.TestCase):
         self.assertFalse(exchange.options.get("enableDemoTrading", False))
         self.assertEqual(exchange.hostname, "bybit.com")
         self.assertIn("api.{hostname}", exchange.urls["api"]["public"])
+        self.assertTrue(exchange.options.get("adjustForTimeDifference"))
 
     def test_private_exchange_can_use_demo_trading(self):
         exchange = create_private_exchange("key", "secret", trading_mode="demo")
@@ -33,6 +34,8 @@ class TestBybitFactory(unittest.TestCase):
         self.assertTrue(exchange.options.get("enableDemoTrading"))
         self.assertEqual(exchange.hostname, "bybit.com")
         self.assertIn("api-demo.{hostname}", exchange.urls["api"]["private"])
+        self.assertTrue(exchange.options.get("adjustForTimeDifference"))
+        self.assertEqual(exchange.options.get("recvWindow"), 10 * 1000)
 
 
 if __name__ == "__main__":

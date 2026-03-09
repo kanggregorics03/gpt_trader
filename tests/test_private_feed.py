@@ -135,7 +135,7 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.total_balance, 1510.0)
 
-    def test_feed_moves_to_stale_and_requires_recovery_reconcile(self):
+    def test_feed_keeps_recent_reconciled_state_healthy_until_reconcile_ttl_expires(self):
         feed = ControlledTimeFeed(
             api_key="key",
             api_secret="secret",
@@ -173,6 +173,10 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertEqual(feed.get_health_status(), "healthy")
 
         feed.advance_ms(26_000)
+        self.assertEqual(feed.get_health_status(), "healthy")
+        self.assertIsNotNone(feed.get_account_state(["BTCUSDT"]))
+
+        feed.advance_ms(300_000)
         self.assertEqual(feed.get_health_status(), "stale")
         self.assertIsNone(feed.get_account_state(["BTCUSDT"]))
 
@@ -260,6 +264,72 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertEqual(feed.get_health_status(), "degraded")
         self.assertTrue(feed.needs_periodic_reconcile())
         self.assertIsNone(feed.get_account_state(["BTCUSDT"]))
+
+    def test_private_feed_normalizes_unified_symbols_for_filters(self):
+        feed = ControlledTimeFeed(
+            api_key="key",
+            api_secret="secret",
+            ws_factory=DummyPrivateWebSocket,
+            ws_recover_stability_seconds=1,
+        )
+        feed.start()
+        feed.seed_from_account_state(
+            AccountState(
+                snapshot_timestamp=feed._now_ms(),
+                total_balance=1500.0,
+                available_balance=900.0,
+                positions=[],
+                open_orders=[],
+                open_orders_count=0,
+            )
+        )
+        feed.advance_ms(1_000)
+
+        feed._handle_position_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "Buy",
+                        "size": "0.1",
+                        "avgPrice": "30000",
+                        "markPrice": "30100",
+                        "unrealisedPnl": "10",
+                        "positionIM": "300",
+                        "positionMM": "18",
+                        "positionValue": "3000",
+                        "tradeMode": "1",
+                    }
+                ]
+            }
+        )
+
+        state = feed.get_account_state(["BTCUSDT"])
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.positions[0].symbol, "BTCUSDT")
+
+    def test_transport_heartbeat_keeps_feed_healthy_without_account_events(self):
+        feed = ControlledTimeFeed(
+            api_key="key",
+            api_secret="secret",
+            ws_factory=DummyPrivateWebSocket,
+            reconcile_ttl_ms=300_000,
+            ws_stale_after_seconds=25,
+            ws_recover_stability_seconds=1,
+            forced_reconcile_on_recover=True,
+        )
+        feed.start()
+        self._seed_rest_snapshot(feed)
+        feed.advance_ms(1_000)
+        self.assertEqual(feed.get_health_status(), "healthy")
+
+        feed.advance_ms(26_000)
+        self.assertEqual(feed.get_health_status(), "healthy")
+
+        feed._record_transport_activity()
+        self.assertEqual(feed.get_health_status(), "healthy")
+        self.assertIsNotNone(feed.get_account_state(["BTCUSDT"]))
 
     def test_diagnostics_include_event_counts_lag_and_handler_stats(self):
         feed = ControlledTimeFeed(

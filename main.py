@@ -4824,7 +4824,8 @@ class TradingOrchestrator:
             try:
                 replay_args = [
                     sys.executable,
-                    "tools/replay_audit.py",
+                    "-m",
+                    "tools.replay_audit",
                     "--auto",
                     "--limit",
                     str(replay_config["limit"]),
@@ -4840,7 +4841,7 @@ class TradingOrchestrator:
         log.info("Running daily memory updater batch...")
         try:
             # Reuse the current interpreter so the batch job sees the same virtualenv.
-            subprocess.run([sys.executable, "batch/memory_updater.py"], check=True)
+            subprocess.run([sys.executable, "-m", "batch.memory_updater"], check=True)
             log.info("Daily batch finished successfully.")
         except Exception as e:
             log.error(f"Daily batch failed: {e}")

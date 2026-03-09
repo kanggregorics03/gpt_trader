@@ -7,6 +7,7 @@ from loguru import logger
 
 from core.models import AccountState, OrderIntent, TradeIntent
 from exchange.private_feed import BybitPrivateAccountFeed
+from utils.symbols import normalize_symbol
 
 class ExecutionEngine:
     def __init__(self, exchange: ccxt.bybit, private_feed: Optional[BybitPrivateAccountFeed] = None):
@@ -496,7 +497,7 @@ class ExecutionEngine:
                 or info.get("orderLinkId")
                 or fallback_client_order_id
             ),
-            "symbol": receipt.get("symbol") or info.get("symbol"),
+            "symbol": normalize_symbol(receipt.get("symbol") or info.get("symbol")),
             "side": receipt.get("side") or info.get("side"),
             "type": receipt.get("type") or info.get("orderType"),
             "status": receipt.get("status") or info.get("orderStatus") or "unknown",
@@ -533,7 +534,7 @@ class ExecutionEngine:
             "trade_id": trade.get("id") or info.get("execId"),
             "order_id": trade.get("order") or info.get("orderId"),
             "client_order_id": info.get("orderLinkId") or info.get("clientOrderId"),
-            "symbol": trade.get("symbol") or info.get("symbol"),
+            "symbol": normalize_symbol(trade.get("symbol") or info.get("symbol")),
             "side": trade.get("side") or info.get("side"),
             "price": float(trade.get("price") or info.get("execPrice") or 0.0),
             "amount": float(trade.get("amount") or info.get("execQty") or 0.0),
@@ -548,7 +549,7 @@ class ExecutionEngine:
     def _fill_matches_receipts(self, fill: Dict[str, Any], receipts: List[Dict[str, Any]]) -> bool:
         fill_order_id = fill.get("order_id")
         fill_client_order_id = fill.get("client_order_id")
-        fill_symbol = fill.get("symbol")
+        fill_symbol = normalize_symbol(fill.get("symbol"))
         for receipt in receipts:
             receipt_order_id = receipt.get("id")
             receipt_client_order_id = receipt.get("clientOrderId")
@@ -558,7 +559,7 @@ class ExecutionEngine:
                 return True
             if (
                 fill_symbol
-                and receipt.get("symbol") == fill_symbol
+                and normalize_symbol(receipt.get("symbol")) == fill_symbol
                 and str(receipt.get("status")).lower() in ("closed", "filled", "open", "recovered")
             ):
                 if receipt_client_order_id or receipt_order_id:
@@ -638,7 +639,7 @@ class ExecutionEngine:
             if client_order_id and fill.get("client_order_id") == client_order_id:
                 matches.append(fill)
                 continue
-            if fill.get("symbol") == order.symbol and not order_id and not client_order_id:
+            if normalize_symbol(fill.get("symbol")) == normalize_symbol(order.symbol) and not order_id and not client_order_id:
                 matches.append(fill)
         return matches
 

@@ -34,6 +34,7 @@ def create_public_exchange() -> ccxt.bybit:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "linear",
+                "adjustForTimeDifference": True,
             },
         }
     )
@@ -47,6 +48,8 @@ def create_private_exchange(api_key: str, api_secret: str, trading_mode: str = "
             "enableRateLimit": True,
             "options": {
                 "defaultType": "linear",
+                "adjustForTimeDifference": True,
+                "recvWindow": 10 * 1000,
             },
         }
     )

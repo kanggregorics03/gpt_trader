@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 from loguru import logger
 
 from core.models import AccountState, OpenOrderState, PositionState
+from utils.symbols import normalize_symbol, normalize_symbol_list
 
 try:
     from pybit.unified_trading import WebSocket as BybitWebSocket
@@ -67,6 +68,45 @@ class BybitPrivateAccountFeed:
             "execution": {"last_ms": None, "max_ms": 0.0},
         }
 
+    def _record_transport_activity(self, now_ms: Optional[int] = None):
+        with self._lock:
+            self._record_transport_activity_locked(now_ms=now_ms)
+
+    def _record_transport_activity_locked(self, now_ms: Optional[int] = None):
+        now_ms = self._now_ms() if now_ms is None else int(now_ms)
+        self._last_ws_message_at = now_ms
+
+    def _attach_transport_hooks(self, ws_instance: Any):
+        if ws_instance is None:
+            return
+
+        if hasattr(ws_instance, "_on_message"):
+            original_on_message = ws_instance._on_message
+
+            def wrapped_on_message(message):
+                self._record_transport_activity()
+                return original_on_message(message)
+
+            ws_instance._on_message = wrapped_on_message
+
+        if hasattr(ws_instance, "_on_pong"):
+            original_on_pong = ws_instance._on_pong
+
+            def wrapped_on_pong(*args, **kwargs):
+                self._record_transport_activity()
+                return original_on_pong(*args, **kwargs)
+
+            ws_instance._on_pong = wrapped_on_pong
+
+        if hasattr(ws_instance, "_on_open"):
+            original_on_open = ws_instance._on_open
+
+            def wrapped_on_open(*args, **kwargs):
+                self._record_transport_activity()
+                return original_on_open(*args, **kwargs)
+
+            ws_instance._on_open = wrapped_on_open
+
     @property
     def available(self) -> bool:
         return self.ws_factory is not None
@@ -87,6 +127,7 @@ class BybitPrivateAccountFeed:
                 api_key=self.api_key,
                 api_secret=self.api_secret,
             )
+            self._attach_transport_hooks(self._ws)
             self._ws.wallet_stream(callback=self._handle_wallet_message)
             self._ws.position_stream(callback=self._handle_position_message)
             self._ws.order_stream(callback=self._handle_order_message)
@@ -207,7 +248,7 @@ class BybitPrivateAccountFeed:
             if self._refresh_health_locked() != "healthy":
                 return None
 
-            allowed_symbols = set(symbols)
+            allowed_symbols = set(normalize_symbol_list(symbols))
             positions = [
                 position.model_copy(deep=True)
                 for symbol, position in self._positions_by_symbol.items()
@@ -315,7 +356,7 @@ class BybitPrivateAccountFeed:
             )
             for item in data:
                 normalized = self._normalize_position(item)
-                symbol = str(item.get("symbol") or normalized.symbol)
+                symbol = normalize_symbol(item.get("symbol") or normalized.symbol)
                 if normalized.size <= 0:
                     self._positions_by_symbol.pop(symbol, None)
                 else:
@@ -357,7 +398,7 @@ class BybitPrivateAccountFeed:
             )
             for item in data:
                 normalized = self._normalize_execution(item)
-                symbol = normalized.get("symbol") or "UNKNOWN"
+                symbol = normalize_symbol(normalized.get("symbol") or "UNKNOWN")
                 bucket = self._recent_executions_by_symbol.setdefault(symbol, [])
                 bucket.insert(0, normalized)
                 del bucket[self.execution_cache_size :]
@@ -372,7 +413,7 @@ class BybitPrivateAccountFeed:
     ):
         now_ms = self._now_ms()
         previous_state = self._compute_health_status_locked(now_ms=now_ms)
-        self._last_ws_message_at = now_ms
+        self._record_transport_activity_locked(now_ms=now_ms)
         self._last_private_event_at = now_ms
         self._event_counts["total"] += 1
         self._event_counts[stream] += 1
@@ -404,7 +445,7 @@ class BybitPrivateAccountFeed:
             return "down"
         if self._last_successful_subscribe_at <= 0:
             return "reconnecting"
-        if self._last_ws_message_at <= 0 or self._last_private_event_at <= 0:
+        if self._last_ws_message_at <= 0:
             if self._last_reconcile_ok_at <= 0 or not self._wallet_state:
                 return "reconnecting"
             recovery_since = self._recovery_candidate_since or self._last_successful_subscribe_at or self._last_reconcile_ok_at
@@ -418,13 +459,15 @@ class BybitPrivateAccountFeed:
             if (now_ms - self._last_reconcile_ok_at) > self.reconcile_ttl_ms:
                 return "degraded"
             return "healthy"
-        if (now_ms - self._last_ws_message_at) > self.ws_stale_after_ms:
-            return "stale"
-        if (now_ms - self._last_private_event_at) > self.ws_stale_after_ms:
-            return "stale"
         if self._reconcile_required:
             return "degraded"
         if self._last_reconcile_ok_at <= 0:
+            return "degraded"
+        if (now_ms - self._last_ws_message_at) > self.ws_stale_after_ms:
+            if (now_ms - self._last_reconcile_ok_at) <= self.reconcile_ttl_ms:
+                return "healthy"
+            return "stale"
+        if self._last_private_event_at <= 0 and (now_ms - self._last_reconcile_ok_at) > self.reconcile_ttl_ms:
             return "degraded"
         if self._recovery_candidate_since > 0:
             if (
@@ -460,7 +503,7 @@ class BybitPrivateAccountFeed:
         margin_mode = "isolated" if trade_mode == "1" else ("cross" if trade_mode == "0" else None)
 
         return PositionState(
-            symbol=str(item.get("symbol") or "UNKNOWN"),
+            symbol=normalize_symbol(item.get("symbol") or "UNKNOWN"),
             side=side,
             size=size,
             entry_price=entry_price,
@@ -477,7 +520,7 @@ class BybitPrivateAccountFeed:
 
     def _normalize_order(self, item: Dict[str, Any]) -> OpenOrderState:
         return OpenOrderState(
-            symbol=str(item.get("symbol") or "UNKNOWN"),
+            symbol=normalize_symbol(item.get("symbol") or "UNKNOWN"),
             order_id=str(item.get("orderId") or "") or None,
             side=str(item.get("side") or "UNKNOWN").upper(),
             order_type=str(item.get("orderType") or item.get("type") or "UNKNOWN").upper(),
@@ -496,7 +539,7 @@ class BybitPrivateAccountFeed:
             "trade_id": item.get("execId"),
             "order_id": item.get("orderId"),
             "client_order_id": item.get("orderLinkId"),
-            "symbol": item.get("symbol"),
+            "symbol": normalize_symbol(item.get("symbol")),
             "side": str(item.get("side") or "").lower(),
             "price": self._safe_float(item.get("execPrice"), 0.0) or 0.0,
             "amount": self._safe_float(item.get("execQty"), 0.0) or 0.0,

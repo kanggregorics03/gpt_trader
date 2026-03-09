@@ -265,9 +265,14 @@
 
 1. stale 구간에서는 신규 진입을 더 엄격히 막는다.
 2. REST fallback TTL과 reconcile 정책을 다시 본다.
-3. WS stale 임계치를 점검해 너무 늦게 감지하지 않는지 확인한다.
+3. WS stale 임계치를 볼 때는 `private event 부재`와 `transport silence`를 구분한다. 계좌 변화가 없는 조용한 구간만으로 stale이 나면 health 판정이 과민한 것이다.
 4. order book 기반 지표의 freshness가 낮으면 의사결정 가중치를 낮춘다.
 5. stale 상태에서 체결된 거래만 따로 분리해 성과를 본다.
+
+추가 체크:
+
+- 심볼 정책 거절이 `ETHUSDT` vs `ETH/USDT:USDT` 같은 포맷 차이 때문인지 먼저 본다.
+- 최근 구조에서는 주문/포지션/체결/정책 비교 전에 심볼 정규화가 들어가므로, 같은 거절이 반복되면 포맷 문제보다 다른 정책 문제일 가능성이 더 높다.
 
 실험 아이디어:
 

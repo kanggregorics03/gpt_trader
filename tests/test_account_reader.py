@@ -205,6 +205,55 @@ class TestAccountReader(unittest.TestCase):
         self.assertEqual(state.open_orders_count, 1)
         self.assertEqual(state.open_orders[0].symbol, "BTCUSDT")
 
+    def test_account_reader_normalizes_ccxt_unified_symbols(self):
+        class UnifiedExchange(DummyExchange):
+            def fetch_positions(self, symbols):
+                self.position_calls += 1
+                return [
+                    {
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "long",
+                        "contracts": 0.1,
+                        "entryPrice": 30000,
+                        "markPrice": 30100,
+                        "unrealizedPnl": 12.5,
+                        "initialMargin": 300.0,
+                        "info": {
+                            "positionIM": "300",
+                            "positionMM": "18",
+                            "tradeMode": "1",
+                            "positionValue": "3000",
+                        },
+                    }
+                ]
+
+            def fetch_open_orders(self, symbol=None):
+                if symbol is None:
+                    return [
+                        {
+                            "symbol": "BTC/USDT:USDT",
+                            "side": "buy",
+                            "type": "limit",
+                            "amount": 0.05,
+                            "price": 29500,
+                            "status": "open",
+                            "clientOrderId": "btc_order",
+                            "info": {},
+                        }
+                    ]
+                return []
+
+        reader = AccountReader.__new__(AccountReader)
+        reader.exchange = UnifiedExchange()
+        reader.cache_ttl_ms = 0
+        reader.private_feed = None
+        reader.invalidate_cache()
+
+        state = reader.get_account_state(["BTCUSDT"])
+
+        self.assertEqual(state.positions[0].symbol, "BTCUSDT")
+        self.assertEqual(state.open_orders[0].symbol, "BTCUSDT")
+
     def test_short_ttl_cache_reuses_account_snapshot_for_same_symbol_set(self):
         exchange = DummyExchange()
         reader = AccountReader(exchange, cache_ttl_ms=2000)

@@ -120,6 +120,7 @@ gpt_trader/
 │  └─ replay_audit.py         # 감사 로그 리플레이 및 diff 요약
 ├─ utils/
 │  ├─ logger.py               # loguru 설정
+│  ├─ symbols.py              # 거래 심볼 정규화 유틸
 │  └─ alerter.py              # 웹훅 알림
 └─ tests/                     # unittest 기반 테스트
 ```
@@ -178,7 +179,10 @@ gpt_trader/
   - WS health state는 `healthy / stale / degraded / reconnecting / down`
   - `healthy`일 때만 WS를 primary source로 사용하고, 나머지 상태에서는 REST fallback 사용
   - 시작 직후 계정이 조용해 private 이벤트가 아직 없어도, REST reconcile이 1회 성공하고 안정 구간을 지나면 `healthy`로 승격될 수 있다
+  - transport liveness는 private 계좌 변동 이벤트뿐 아니라 pybit raw message / pong / open 훅으로도 갱신한다
+  - 따라서 private event가 없다는 이유만으로 바로 `stale`로 보지 않고, 최근 reconcile TTL 안에서는 `healthy`를 유지한다
   - 반대로 stale/down 이후 private 이벤트가 다시 들어온 직후에는 forced reconcile 정책에 따라 한 번 더 `degraded`를 거칠 수 있다
+  - 주문/포지션/체결 심볼은 `ETHUSDT`, `ETH/USDT`, `ETH/USDT:USDT` 같은 표현 차이를 canonical symbol로 정규화한 뒤 비교한다
   - `get_runtime_diagnostics()`로 account cache freshness와 private WS health / event count / lag를 한 번에 확인할 수 있다
 - `MarketCollector`
   - 현재가
@@ -1237,25 +1241,25 @@ baseline은 `trigger active + acceptable spread/depth + manageable invalidation 
 최근 리플레이 가능한 audit 목록:
 
 ```powershell
-python tools/replay_audit.py --list
+python -m tools.replay_audit --list
 ```
 
 특정 audit 리플레이:
 
 ```powershell
-python tools/replay_audit.py --audit-id 12
+python -m tools.replay_audit --audit-id 12
 ```
 
 리플레이 결과를 DB에 저장:
 
 ```powershell
-python tools/replay_audit.py --audit-id 12 --save
+python -m tools.replay_audit --audit-id 12 --save
 ```
 
 일일 incremental replay:
 
 ```powershell
-python tools/replay_audit.py --auto --save --limit 30 --window-hours 24
+python -m tools.replay_audit --auto --save --limit 30 --window-hours 24
 ```
 
 ### 비교 항목
@@ -1559,7 +1563,7 @@ http://127.0.0.1:5000
 장기 메모리 배치 수동 실행:
 
 ```powershell
-python batch/memory_updater.py
+python -m batch.memory_updater
 ```
 
 context budget 튜닝(최근 audit 로그 기반):
@@ -1681,6 +1685,8 @@ python -m unittest discover -s tests
 - public/private WebSocket이 끊기면 REST fallback으로 운영은 되지만, 호출 수와 지연이 올라갈 수 있다.
 - private WS health는 시작 직후 잠깐 `reconnecting`일 수 있다.
 - 안정화 시간 이후에도 계속 `health=reconnecting, reconcile_due=False`가 반복되면 health 판정이나 private 이벤트 수신 경로를 점검해야 한다.
+- private 계좌 변화가 없는 조용한 구간만으로 `WebSocket Stale`가 반복되던 문제는 완화되었고, 이제는 transport silence와 reconcile TTL을 함께 봐야 한다.
+- `not in approved policy list`를 볼 때는 심볼 포맷 차이(`ETHUSDT` vs `ETH/USDT:USDT`)가 내부 정규화로 해소되는 구조인지 먼저 확인한다.
 - 로그에서 반복적으로 다음이 보이면 데이터 품질 이슈로 본다:
   - `Failed to fetch market data`
   - `Bulk open-order fetch failed`
@@ -1746,7 +1752,7 @@ python -m unittest discover -s tests
 3. `python main.py`로 로그와 audit를 충분히 쌓는다.
    - startup config error는 now structured startup failure로 처리되고, 명시적인 non-zero exit로 끝난다.
 4. `python -m dashboard.app`에서 input hash, risk mode, 상태 전이, replay diff, context mix, learning liveness를 확인한다.
-5. `python tools/replay_audit.py --list`와 `--audit-id`로 과거 결정 변화 양상을 점검한다.
+5. `python -m tools.replay_audit --list`와 `--audit-id`로 과거 결정 변화 양상을 점검한다.
 6. 장기 메모리에 저장된 `apply_when`, `ignore_when`가 실제 운영 관점에서 타당한지 검토한다.
 7. 문제가 없을 때만 `BYBIT_TRADING_MODE=live` 전환을 검토한다.
 

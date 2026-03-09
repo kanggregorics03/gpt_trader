@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from utils.symbols import normalize_symbol
 
 
 class TimeframeSnapshot(BaseModel):
@@ -114,6 +116,11 @@ class MarketSnapshot(BaseModel):
     risk_trigger_reasons: List[str] = Field(default_factory=list)
     trigger_reasons: List[str] = Field(default_factory=list)
 
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: Any) -> str:
+        return normalize_symbol(value)
+
 class PositionState(BaseModel):
     symbol: str
     side: str # "LONG", "SHORT", "NONE"
@@ -129,6 +136,11 @@ class PositionState(BaseModel):
     maintenance_margin: float = 0.0
     margin_mode: Optional[str] = None
 
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: Any) -> str:
+        return normalize_symbol(value)
+
 
 class OpenOrderState(BaseModel):
     symbol: str
@@ -143,6 +155,11 @@ class OpenOrderState(BaseModel):
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
     timestamp: Optional[int] = None
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: Any) -> str:
+        return normalize_symbol(value)
 
 
 class RiskStateSnapshot(BaseModel):
@@ -306,6 +323,11 @@ class OrderIntent(BaseModel):
         description="Compact execution-policy context persisted for later evaluation.",
     )
 
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: Any) -> str:
+        return normalize_symbol(value)
+
 
 class EvidenceItem(BaseModel):
     signal: str = Field(description="Observed signal name, e.g. rsi_14 or volume_ratio")
@@ -329,6 +351,14 @@ class EvidenceItem(BaseModel):
         le=1.0,
         description="Optional signed relative contribution of this evidence to the final confidence",
     )
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_optional_symbol(cls, value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        normalized = normalize_symbol(value)
+        return normalized or None
 
 
 class RationaleItem(BaseModel):

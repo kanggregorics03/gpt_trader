@@ -135,6 +135,25 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("not in approved policy list", reason)
 
+    def test_accepts_ccxt_unified_symbol_for_approved_policy_symbol(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[OrderIntent(symbol="BTC/USDT:USDT", action="BUY", order_type="MARKET", quantity=0.01)],
+            rationale=["Breakout"],
+            risk_notes=[],
+            confidence=0.8
+        )
+        acc_state = AccountState(total_balance=1000, available_balance=1000, positions=[], open_orders_count=0)
+
+        approved, reason = self.engine.evaluate_intent(
+            intent,
+            acc_state,
+            market_prices={"BTCUSDT": 30000},
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(reason, "Approved")
+
     def test_reject_max_positions_exceeded(self):
         # Simulate having 2 open positions already
         pos1 = PositionState(symbol="ETHUSDT", side="LONG", size=1.0, entry_price=2000, unrealized_pnl_pct=0)

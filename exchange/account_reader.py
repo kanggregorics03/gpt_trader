@@ -6,6 +6,7 @@ from loguru import logger
 
 from core.models import AccountState, OpenOrderState, PositionState
 from exchange.private_feed import BybitPrivateAccountFeed
+from utils.symbols import normalize_symbol, normalize_symbol_list
 
 
 class AccountReader:
@@ -28,6 +29,7 @@ class AccountReader:
         logger.info(f"AccountReader connected to Bybit private trading mode: {self.trading_mode}")
 
     def get_account_state(self, symbols: List[str], force_refresh: bool = False) -> AccountState:
+        symbols = normalize_symbol_list(symbols)
         cache_key = tuple(sorted(symbols))
         private_feed = getattr(self, "private_feed", None)
         ws_health = None
@@ -98,7 +100,7 @@ class AccountReader:
                     pnl_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
 
                     active_positions.append(PositionState(
-                        symbol=pos['symbol'],
+                        symbol=normalize_symbol(pos['symbol']),
                         side=side,
                         size=size,
                         entry_price=entry_price,
@@ -187,7 +189,7 @@ class AccountReader:
         }
 
     def _fetch_open_orders(self, symbols: List[str]) -> List[OpenOrderState]:
-        allowed_symbols = set(symbols)
+        allowed_symbols = set(normalize_symbol_list(symbols))
         try:
             raw_orders = self.exchange.fetch_open_orders()
         except Exception as exc:
@@ -215,7 +217,7 @@ class AccountReader:
     def _normalize_open_order(self, order: Dict[str, Any]) -> OpenOrderState:
         info = order.get("info") or {}
         return OpenOrderState(
-            symbol=order.get("symbol") or info.get("symbol") or "UNKNOWN",
+            symbol=normalize_symbol(order.get("symbol") or info.get("symbol") or "UNKNOWN"),
             order_id=order.get("id") or info.get("orderId"),
             side=str(order.get("side") or info.get("side") or "UNKNOWN").upper(),
             order_type=str(order.get("type") or info.get("orderType") or "UNKNOWN").upper(),
