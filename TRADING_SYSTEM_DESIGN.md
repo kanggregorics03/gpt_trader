@@ -340,6 +340,7 @@ action bias를 줄인다
 
 semantic validation 실패, JSON validation fallback, loop error로 만들어진 fallback HOLD는
 retrieval context에서 기본 제외해 "시장 판단 HOLD"와 "시스템 오류 HOLD"가 섞이지 않게 한다
+같은 기준으로 similar_past_cases의 RAG fallback audit와 그 audit에 연결된 trade case도 prompt 후보에서 제외한다
 
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
   - Lifecycle note: runtime retrieval and daily reconciliation now read the same lifecycle-managed memory pool, so older active rules are not silently dropped by a separate recent cap.
@@ -453,6 +454,7 @@ confidence: 참고값(실행은 규정 통과 여부로 결정)
 단, 자동 replay와 memory batch는 모든 audit를 그대로 학습 입력으로 쓰지 않는다.
 `loop error`, `execution_summary.error`, `ai_usage.validation_error`,
 `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 감사 로그로는 유지하되 자동 학습 입력에서는 제외한다.
+runtime prompt retrieval도 같은 부류의 audit와 연결 trade case를 recent_journal_context / similar_past_cases에서 제외한다.
 또한 최근 구조에서는 포지션이 없고 `HOLD`였던 audit를 replay할 때,
 이후 `30m / 2h / 6h` 가격 경로를 읽어 baseline probe entry 대비 `hold_opportunity_counterfactual`을 함께 계산한다.
 즉 `HOLD`가 안전했는지뿐 아니라 "좋은 기회를 놓친 HOLD였는가"도 별도로 점검한다.

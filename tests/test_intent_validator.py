@@ -235,6 +235,47 @@ class TestStructuredIntentValidator(unittest.TestCase):
 
         self.assertTrue(result.is_valid)
 
+    def test_validator_accepts_policy_summary_source_paths(self):
+        request = self.request.model_copy(
+            update={
+                "policy_summary": (
+                    "risk_limits:\n"
+                    "  max_consecutive_losses: 3\n"
+                    "  max_open_positions: 1\n"
+                )
+            }
+        )
+        intent = TradeIntent(
+            decision="HOLD",
+            orders=[],
+            rationale=["Loss guard remains active in policy."],
+            rationale_items=[
+                RationaleItem(
+                    summary="Policy loss cap is defined.",
+                    why_it_matters="The model can reference binding policy limits as evidence.",
+                    trade_implication="Avoid overstating risk flexibility beyond configured limits.",
+                    failure_mode="The policy summary is missing the loss-cap field.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="max_consecutive_losses",
+                            timeframe="risk",
+                            operator="gte",
+                            observed_value=3.0,
+                            threshold=1.0,
+                            units="count",
+                            source="policy_summary.risk_limits.max_consecutive_losses",
+                        )
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.3,
+        )
+
+        result = self.validator.validate(request, intent)
+
+        self.assertTrue(result.is_valid)
+
     def test_validator_accepts_categorical_eq_evidence(self):
         request = self.request.model_copy(
             update={

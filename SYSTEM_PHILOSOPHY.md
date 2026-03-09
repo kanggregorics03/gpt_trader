@@ -40,6 +40,7 @@
 - `policy_summary`는 원문 정책 파일이 아니라 compact digest여야 한다.
 - digest에는 반드시 들어가야 하는 정책 경로가 있고, 이것은 코드 계약으로 강제한다.
 - recent journal, memory, similar past cases는 전부 샘플링된 보조 근거일 뿐이다.
+- system/validation fallback 같은 오류성 retrieval은 prompt 컨텍스트 후보에서 기본 제외해야 한다.
 - live market snapshot, risk state, enforceable policy limit가 과거 사례보다 우선이다.
 
 요약하면 prompt는 설명 문서가 아니라 compact decision contract여야 한다.

@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from math import isclose
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 from core.models import DecisionRequest, EvidenceItem, TradeIntent
 
 
@@ -28,6 +30,7 @@ class StructuredIntentValidator:
     def validate(self, request: DecisionRequest, intent: TradeIntent) -> IntentValidationResult:
         issues: List[str] = []
         payload = request.model_dump(mode="json")
+        self._hydrate_policy_summary(payload)
 
         if not intent.rationale_items:
             issues.append("structured_rationale_missing")
@@ -71,6 +74,17 @@ class StructuredIntentValidator:
 
         issues.extend(self._validate_action_consistency(intent))
         return IntentValidationResult(is_valid=not issues, issues=issues)
+
+    def _hydrate_policy_summary(self, payload: Dict[str, Any]) -> None:
+        raw_policy_summary = payload.get("policy_summary")
+        if not isinstance(raw_policy_summary, str):
+            return
+        try:
+            parsed = yaml.safe_load(raw_policy_summary)
+        except yaml.YAMLError:
+            return
+        if isinstance(parsed, dict):
+            payload["policy_summary"] = parsed
 
     def _resolve_source_value(
         self,

@@ -264,6 +264,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 - `drawdown_activate_pct`
 - `daily_max_loss_pct`
 - `cooldown` 최대 한도
+- `max_consecutive_losses`의 일중 집계 기준
 
 ### 4. 단일 adaptive loop와 cadence 전환
 
@@ -370,6 +371,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 - `long_term_memory`
   - `risk_control / opportunity / execution_quality / hold_quality` 축을 함께 보고 균형 있게 선별한다.
 - `similar_past_cases`
+  - schema/semantic validation fallback audit와 그 audit에 연결된 trade case는 프롬프트 retrieval 후보에서 제외한다.
 - `is_trigger_mode`
 - `risk_mode`
 - `risk_profile`
@@ -646,6 +648,9 @@ context_budget:
 
 - `daily_max_loss_pct: 3.0`
   - 하루 손익률이 `-3.0%` 이하로 내려가면 신규 진입은 kill-switch에 걸린다.
+- `max_consecutive_losses: 3`
+  - 현재 UTC 일자(`00:00 UTC` 이후) 안에서 손실 종료가 3번 연속 누적되면 신규 진입은 kill-switch에 걸린다.
+  - 전일 손실 streak는 다음 UTC day boundary에서 리셋된다.
 - `drawdown_activate_pct: 1.5`
   - hard stop 전에 먼저 `drawdown` 모드로 진입해 공격성을 줄인다.
 - `trigger.max_order_notional_pct_balance: 35`
@@ -667,6 +672,7 @@ context_budget:
   - Learning note: runtime retrieval scores are additionally adjusted by batch-produced `journal_reranker_profile` and `similar_case_reranker_profile` artifacts instead of relying on static heuristics alone.
   - 최근 journal/long_term_memory/similar case를 전부 보내지 않고, 관련성 높은 상위 컨텍스트만 압축해 전달한다.
   - recent_journal_context는 action 사례만 몰리지 않도록 hold/action/fallback 버킷을 분산 선택한다.
+  - similar_past_cases는 시스템 오류성 fallback audit, validation fallback audit, 그리고 그 audit에 연결된 trade case를 기본 제외한다.
   - long_term_memory는 `risk_control`, `opportunity`, `execution_quality`를 한쪽으로 쏠리지 않게 섞고, retired/저신뢰 항목은 기본 제외한다.
 
 ## 실행 엔진 상세
@@ -846,6 +852,8 @@ context_budget:
 }
 ```
 
+여기서 `consecutive_losses`는 누적 전체 이력이 아니라 현재 UTC 거래일 안에서 아직 끊기지 않은 손실 streak다.
+
 ### `journal`
 
 사람이 읽기 쉬운 요약 로그다.
@@ -873,6 +881,7 @@ LLM 호출이 실패해도 candidate lesson은 fallback으로 남을 수 있다.
 다만 자동 학습 입력에는 모든 audit를 그대로 쓰지 않는다. `loop error`, `execution_summary.error`,
 `ai_usage.validation_error`, `ai_usage.semantic_validation_error` 같은 시스템/스키마 오류 audit는 보존하되,
 memory batch와 incremental replay의 자동 학습 후보에서는 제외한다.
+runtime prompt retrieval도 같은 부류의 audit와 연결 trade case를 recent_journal_context / similar_past_cases 후보에서 제외한다.
 추가로 memory batch는 replay의 `hold_opportunity_counterfactual`도 읽어,
 `missed_breakout_count`, `missed_move_median_pct`, `hold_opportunity_cost`를 undertrading 지표로 집계한다.
 이 수치가 반복되면 "trigger는 맞았지만 너무 자주 HOLD해서 기회를 놓친다"는 opportunity lesson seed를 만들고,
@@ -1446,6 +1455,11 @@ Copy-Item .env.example .env
 선택 변수:
 
 - `ALERT_WEBHOOK_URL`
+- `ALERT_WEBHOOK_FORMAT`
+  - `auto` 기본값. custom receiver는 기존 JSON payload를 유지하고, Slack/Discord incoming webhook URL은 자동 감지한다.
+  - `json` 또는 `generic`: 항상 `{title, message, level}` JSON으로 보낸다.
+  - `slack`: Slack incoming webhook 포맷으로 보낸다.
+  - `discord`: Discord webhook 포맷으로 보낸다.
 
 예시:
 
@@ -1469,6 +1483,28 @@ ANTHROPIC_API_KEY=""
 DB_PATH="data/gpt_trader.db"
 LOG_LEVEL="INFO"
 LOG_FORMAT="text"
+ALERT_WEBHOOK_URL=""
+ALERT_WEBHOOK_FORMAT="auto"
+```
+
+웹훅 payload:
+
+- `json` / `generic`
+
+```json
+{"title":"Execution Timeout","message":"...","level":"error"}
+```
+
+- `slack`
+
+```json
+{"text":"*Execution Timeout*\n...\n_Level: ERROR_"}
+```
+
+- `discord`
+
+```json
+{"content":"**Execution Timeout**\n...\n`level: ERROR`"}
 ```
 
 Gemini 예시는 다음처럼 바꾸면 된다.
@@ -1670,6 +1706,7 @@ python -m unittest discover -s tests
   - `risk_limits.mode_profiles.*.max_open_positions`
   - `trading.max_leverage`
   - trigger 관련 threshold
+- `risk_limits.max_consecutive_losses`는 현재 UTC day boundary 기준으로만 집계되므로, day-over-day 손실 streak를 의도했다면 코드가 아니라 운영 정책을 다시 설계해야 한다.
 - 정책 변경 후에는 바로 실거래에 넣지 말고:
   1. demo 모드로 며칠 관찰
   2. replay 결과 비교

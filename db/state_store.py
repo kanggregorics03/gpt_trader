@@ -1864,7 +1864,10 @@ class StateStore:
         row = cursor.fetchone()
         if not row:
             return {}
-        return self._decode_trade_case_row(dict(row))
+        item = self._decode_trade_case_row(dict(row))
+        if not self.is_prompt_eligible_trade_case_record(item):
+            return {}
+        return item
 
     def get_recent_trade_cases(
         self,
@@ -1889,7 +1892,13 @@ class StateStore:
         query += " ORDER BY COALESCE(closed_at, opened_at) DESC, trade_case_id DESC LIMIT ?"
         params.append(limit)
         cursor = self.conn.execute(query, params)
-        return [self._decode_trade_case_row(dict(row)) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            item = self._decode_trade_case_row(dict(row))
+            if not self.is_prompt_eligible_trade_case_record(item):
+                continue
+            rows.append(item)
+        return rows
 
     def get_trade_cases_since(
         self,
@@ -1907,7 +1916,13 @@ class StateStore:
             query += " LIMIT ?"
             params.append(limit)
         cursor = self.conn.execute(query, params)
-        return [self._decode_trade_case_row(dict(row)) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            item = self._decode_trade_case_row(dict(row))
+            if not self.is_prompt_eligible_trade_case_record(item):
+                continue
+            rows.append(item)
+        return rows
 
     def get_recent_closed_trade_case_for_symbol(
         self,
@@ -2014,7 +2029,13 @@ class StateStore:
         query += " ORDER BY COALESCE(closed_at, opened_at) DESC, trade_case_id DESC LIMIT ?"
         params.append(limit)
         cursor = self.conn.execute(query, params)
-        return [self._decode_trade_case_vector_row(dict(row)) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            item = self._decode_trade_case_row(dict(row))
+            if not self.is_prompt_eligible_trade_case_record(item):
+                continue
+            rows.append(self._decode_trade_case_vector_row(item))
+        return rows
 
     def get_trade_case_vector_band_candidates(
         self,
@@ -2064,7 +2085,13 @@ class StateStore:
         """
         params.append(limit)
         cursor = self.conn.execute(query, params)
-        return [self._decode_trade_case_vector_row(dict(row)) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            item = self._decode_trade_case_row(dict(row))
+            if not self.is_prompt_eligible_trade_case_record(item):
+                continue
+            rows.append(self._decode_trade_case_vector_row(item))
+        return rows
 
     def save_trade_case_snapshots(self, entries: List[Dict[str, Any]]):
         if not entries:
@@ -4093,7 +4120,9 @@ class StateStore:
                 account_state,
                 market_vectors,
                 intent,
-                risk_approved
+                risk_approved,
+                risk_reason,
+                execution_summary
             FROM audit_logs
             WHERE market_state IS NOT NULL
             ORDER BY id DESC
@@ -4108,6 +4137,9 @@ class StateStore:
             item["account_state"] = self._safe_json_loads(item.get("account_state"), default={})
             item["market_vectors"] = self._safe_json_loads(item.get("market_vectors"), default={})
             item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+            item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+            if not self.is_learning_eligible_audit_record(item):
+                continue
             rows.append(item)
         return rows
 
@@ -4651,7 +4683,7 @@ class StateStore:
         if drawdown_activate_pct is not None:
             drawdown_active = daily_pnl_pct <= -abs(float(drawdown_activate_pct))
 
-        recent_losses = self._get_recent_consecutive_losses()
+        recent_losses = self._get_recent_consecutive_losses(day_start=day_start)
         dynamic_config = self._build_dynamic_cooldown_config(
             cooldown_minutes=cooldown_minutes,
             cooldown_config=cooldown_config,
@@ -4859,15 +4891,23 @@ class StateStore:
         except Exception:
             return None
 
-    def _get_recent_consecutive_losses(self) -> int:
-        cursor = self.conn.execute(
-            """
+    def _get_recent_consecutive_losses(self, day_start: Optional[datetime] = None) -> int:
+        query = """
             SELECT loss_signal
             FROM journal
             WHERE estimated_pnl_pct IS NOT NULL
+        """
+        params: list[Any] = []
+        if day_start is not None:
+            query += "\n            AND timestamp >= ?"
+            params.append(day_start.strftime("%Y-%m-%d %H:%M:%S"))
+        query += """
             ORDER BY id DESC
             LIMIT 20
             """
+        cursor = self.conn.execute(
+            query,
+            tuple(params),
         )
         streak = 0
         for row in cursor.fetchall():
@@ -5173,6 +5213,52 @@ class StateStore:
             text_values.append(str(rationale).strip().lower())
         for text in text_values:
             if any(marker in text for marker in text_markers):
+                return False
+        return True
+
+    def _is_learning_eligible_audit_id(self, audit_id: Any) -> bool:
+        try:
+            audit_log_id = int(audit_id or 0)
+        except (TypeError, ValueError):
+            return False
+        if audit_log_id <= 0:
+            return True
+
+        cache = getattr(self, "_learning_eligible_audit_cache", None)
+        if cache is None:
+            cache = {}
+            self._learning_eligible_audit_cache = cache
+        if audit_log_id in cache:
+            return bool(cache[audit_log_id])
+
+        cursor = self.conn.execute(
+            """
+            SELECT id, risk_reason, intent, execution_summary
+            FROM audit_logs
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (audit_log_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            cache[audit_log_id] = False
+            return False
+
+        item = dict(row)
+        item["intent"] = self._safe_json_loads(item.get("intent"), default={})
+        item["execution_summary"] = self._safe_json_loads(item.get("execution_summary"), default={})
+        eligible = self.is_learning_eligible_audit_record(item)
+        cache[audit_log_id] = eligible
+        return eligible
+
+    def is_prompt_eligible_trade_case_record(self, row: Dict[str, Any]) -> bool:
+        record = dict(row or {})
+        for key in ("entry_audit_log_id", "exit_audit_log_id"):
+            audit_id = record.get(key)
+            if audit_id in (None, "", 0, "0"):
+                continue
+            if not self._is_learning_eligible_audit_id(audit_id):
                 return False
         return True
 

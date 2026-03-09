@@ -8,7 +8,7 @@ trading:
 risk_limits:
   daily_max_loss_pct: 3.0    # Stop trading if daily loss exceeds 3% of account balance
   drawdown_activate_pct: 1.5 # Enter drawdown mode before the hard daily kill-switch is hit
-  max_consecutive_losses: 3  # Pause trading after 3 consecutive losing trades
+  max_consecutive_losses: 3  # Pause trading after 3 consecutive losing closes within the current UTC day
   cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
   dynamic_cooldown:
     enabled: true

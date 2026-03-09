@@ -27,6 +27,15 @@ data/
 *.db
 *.sqlite3
 
+# Docker local overrides and runtime files
+.docker/
+docker-compose.override.yml
+docker-compose.local.yml
+docker-compose.*.local.yml
+compose.override.yml
+compose.local.yml
+compose.*.local.yml
+
 # IDE and editor settings
 .vscode/
 .idea/

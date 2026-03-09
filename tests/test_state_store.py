@@ -1170,6 +1170,83 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(risk_state["cooldown_remaining_minutes"], 35)
         self.assertGreater(risk_state["failure_pattern_score"], 0.6)
 
+    def test_get_risk_state_resets_consecutive_losses_at_day_boundary(self):
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        now = datetime(2026, 3, 7, 10, 0, 0)
+        with self.store.conn:
+            self.store.conn.execute(
+                """
+                INSERT INTO journal (
+                    timestamp,
+                    decision,
+                    rationale,
+                    confidence,
+                    risk_reason,
+                    estimated_pnl_pct,
+                    loss_signal,
+                    trade_case_ids,
+                    case_statuses,
+                    case_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-03-06 23:55:00",
+                    "EXIT",
+                    "yesterday loss",
+                    0.6,
+                    "setup_invalidated:breakout",
+                    -1.1,
+                    1,
+                    "[]",
+                    "{}",
+                    "BTCUSDT:closed",
+                ),
+            )
+            self.store.conn.execute(
+                """
+                INSERT INTO journal (
+                    timestamp,
+                    decision,
+                    rationale,
+                    confidence,
+                    risk_reason,
+                    estimated_pnl_pct,
+                    loss_signal,
+                    trade_case_ids,
+                    case_statuses,
+                    case_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-03-07 09:30:00",
+                    "EXIT",
+                    "today loss",
+                    0.6,
+                    "setup_invalidated:breakout",
+                    -0.9,
+                    1,
+                    "[]",
+                    "{}",
+                    "BTCUSDT:closed",
+                ),
+            )
+
+        risk_state = self.store.get_risk_state(
+            current_balance=990,
+            cooldown_minutes=30,
+            drawdown_activate_pct=1.5,
+            now=now,
+        )
+
+        self.assertEqual(risk_state["consecutive_losses"], 1)
+
     def test_symbol_and_daily_reports_aggregate_ledger_rows(self):
         audit_id = self.store.save_audit(
             account={"total_balance": 1000},
@@ -1268,6 +1345,92 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["market_vectors"]["BTCUSDT"], [0.1, 0.2, 0.3])
         self.assertEqual(rows[0]["intent"]["decision"], "BUY")
+
+    def test_get_recent_rag_candidates_excludes_validation_fallback_audits(self):
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "BUY", "rationale": ["Momentum"]},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            market_vectors={"BTCUSDT": [0.1, 0.2, 0.3]},
+        )
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "HOLD", "rationale": ["Fallback due to json validation error from AI."]},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            market_vectors={"BTCUSDT": [0.9, 0.8, 0.7]},
+            execution_summary={"ai_usage": {"validation_error": True}},
+        )
+
+        rows = self.store.get_recent_rag_candidates(limit=5)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["intent"]["decision"], "BUY")
+
+    def test_prompt_trade_case_sources_exclude_cases_linked_to_ineligible_audits(self):
+        good_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "BUY", "rationale": ["Momentum"]},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            market_vectors={"BTCUSDT": [1.0, 2.0, 3.0]},
+        )
+        bad_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"market_snapshots": {"BTCUSDT": {"symbol": "BTCUSDT"}}},
+            intent={"decision": "HOLD", "rationale": ["Fallback due to json validation error from AI."]},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            market_vectors={"BTCUSDT": [1.0, 2.0, 3.0]},
+            execution_summary={"ai_usage": {"validation_error": True}},
+        )
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-good-case",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "entry_audit_log_id": good_audit_id,
+                "entry_decision": "BUY",
+                "estimated_pnl_pct": 1.2,
+                "realized_pnl": 12.0,
+                "feature_vector": [1.0, 2.0, 3.0],
+                "payload": {},
+            }
+        )
+        self.store.upsert_trade_case(
+            {
+                "trade_case_id": "BTCUSDT-bad-case",
+                "symbol": "BTCUSDT",
+                "status": "closed",
+                "entry_audit_log_id": bad_audit_id,
+                "entry_decision": "BUY",
+                "estimated_pnl_pct": -0.8,
+                "realized_pnl": -8.0,
+                "feature_vector": [1.0, 2.0, 3.0],
+                "payload": {},
+            }
+        )
+
+        trade_case = self.store.get_trade_case("BTCUSDT-bad-case")
+        recent_cases = self.store.get_recent_trade_cases(limit=10)
+        vector_cases = self.store.get_trade_case_vector_candidates(limit=10, symbols=["BTCUSDT"])
+        band_cases = self.store.get_trade_case_vector_band_candidates(
+            current_feature_vectors={"BTCUSDT": [1.0, 2.0, 3.0]},
+            limit=10,
+        )
+
+        self.assertEqual(trade_case, {})
+        self.assertEqual([row["trade_case_id"] for row in recent_cases], ["BTCUSDT-good-case"])
+        self.assertEqual([row["trade_case_id"] for row in vector_cases], ["BTCUSDT-good-case"])
+        self.assertEqual([row["trade_case_id"] for row in band_cases], ["BTCUSDT-good-case"])
 
     def test_symbol_journal_entries_round_trip(self):
         audit_id = self.store.save_audit(
