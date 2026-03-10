@@ -55,11 +55,11 @@ PROVIDER_DEFAULT_MODEL_ENV = {
     "anthropic": "ANTHROPIC_DEFAULT_MODEL",
 }
 
-PROVIDER_TRIGGER_MODEL_ENV = {
-    "gemini": "GEMINI_TRIGGER_MODEL",
-    "openai": "OPENAI_TRIGGER_MODEL",
-    "deepseek": "DEEPSEEK_TRIGGER_MODEL",
-    "anthropic": "ANTHROPIC_TRIGGER_MODEL",
+PROVIDER_GUARDED_ATTENTION_MODEL_ENV = {
+    "gemini": "GEMINI_GUARDED_ATTENTION_MODEL",
+    "openai": "OPENAI_GUARDED_ATTENTION_MODEL",
+    "deepseek": "DEEPSEEK_GUARDED_ATTENTION_MODEL",
+    "anthropic": "ANTHROPIC_GUARDED_ATTENTION_MODEL",
 }
 
 PROVIDER_MEMORY_MODEL_ENV = {
@@ -136,7 +136,7 @@ def resolve_decision_models(
     provider: str,
     *,
     default_model: Optional[str] = None,
-    trigger_model: Optional[str] = None,
+    guarded_attention_model: Optional[str] = None,
 ) -> tuple[str, str]:
     legacy_model = os.getenv("GEMINI_MODEL", "").strip() if provider == "gemini" else ""
     resolved_default = (
@@ -147,18 +147,13 @@ def resolve_decision_models(
         or ("gemini-3.0-pro" if provider == "gemini" else "")
     )
     resolved_default = _require_model_name(provider, resolved_default, "default")
-    resolved_trigger = (
-        (trigger_model or "").strip()
-        or os.getenv("AI_TRIGGER_MODEL", "").strip()
-        or os.getenv(PROVIDER_TRIGGER_MODEL_ENV.get(provider, ""), "").strip()
-        or (
-            os.getenv("GEMINI_TRIGGER_MODEL", "").strip()
-            if provider == "gemini"
-            else ""
-        )
+    resolved_guarded_attention = (
+        (guarded_attention_model or "").strip()
+        or os.getenv("AI_GUARDED_ATTENTION_MODEL", "").strip()
+        or os.getenv(PROVIDER_GUARDED_ATTENTION_MODEL_ENV.get(provider, ""), "").strip()
         or resolved_default
     )
-    return resolved_default, _require_model_name(provider, resolved_trigger, "trigger")
+    return resolved_default, _require_model_name(provider, resolved_guarded_attention, "guarded_attention")
 
 
 def resolve_memory_model_name(provider: str, explicit_model: Optional[str] = None) -> str:
@@ -167,17 +162,12 @@ def resolve_memory_model_name(provider: str, explicit_model: Optional[str] = Non
         (explicit_model or "").strip()
         or os.getenv("MEMORY_MODEL", "").strip()
         or os.getenv(PROVIDER_MEMORY_MODEL_ENV.get(provider, ""), "").strip()
-        or os.getenv("AI_TRIGGER_MODEL", "").strip()
+        or os.getenv("AI_GUARDED_ATTENTION_MODEL", "").strip()
         or os.getenv("AI_DEFAULT_MODEL", "").strip()
-        or os.getenv(PROVIDER_TRIGGER_MODEL_ENV.get(provider, ""), "").strip()
+        or os.getenv(PROVIDER_GUARDED_ATTENTION_MODEL_ENV.get(provider, ""), "").strip()
         or os.getenv(PROVIDER_DEFAULT_MODEL_ENV.get(provider, ""), "").strip()
         or (
             os.getenv("GEMINI_MEMORY_MODEL", "").strip()
-            if provider == "gemini"
-            else ""
-        )
-        or (
-            os.getenv("GEMINI_TRIGGER_MODEL", "").strip()
             if provider == "gemini"
             else ""
         )

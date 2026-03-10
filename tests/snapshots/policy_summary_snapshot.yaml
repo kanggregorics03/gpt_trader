@@ -8,8 +8,8 @@ trading:
   default_order_type: MARKET
   max_leverage: 3
 risk_limits:
-  daily_max_loss_pct: 3.0
-  drawdown_activate_pct: 1.5
+  daily_max_loss_pct: 10.0
+  drawdown_activate_pct: 5.0
   max_consecutive_losses: 3
   cooldown_minutes: 30
   max_open_positions: 1
@@ -26,13 +26,11 @@ risk_limits:
       - CANCEL
       - REPLACE_ENTRY
       block_additional_entries_when_position_exists: false
-    trigger:
+    guarded:
       max_open_positions: 1
-      max_order_notional_pct_balance: 35
+      max_order_notional_pct_balance: 0
       allowed_actions:
       - HOLD
-      - BUY
-      - SELL
       - REDUCE
       - EXIT
       - CANCEL
@@ -67,14 +65,10 @@ execution_guards:
 stale_order_controls:
   position_policy:
     stale_order_minutes: 30
-    stale_order_reprice_spread_percentile_max: 75
-    stale_order_reprice_depth_percentile_min: 25
-    stale_order_reprice_limit_offset_bps: 4
+    stale_order_action: cancel_only
   safety_policy:
     stale_order_minutes: 12
-    stale_order_reprice_spread_percentile_max: 70
-    stale_order_reprice_depth_percentile_min: 30
-    stale_order_reprice_limit_offset_bps: 3
+    stale_order_action: cancel_only
 execution_policy:
   time_in_force: null
   post_only_default: null

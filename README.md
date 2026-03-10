@@ -42,7 +42,7 @@ JSON mode가 있는 provider는 native JSON 응답을 우선 사용하고, 없�
 ### 5. 정책 진화
 
 일일 배치는 journal, trade case, replay, shadow decision을 바탕으로 장기 메모리뿐 아니라 `정책 후보`도 만든다.  
-후보 정책은 shadow/replay/실행 결과로 평가되고, 성능이 더 좋으면 `champion`으로 승격된다.
+후보 정책 평가는 shadow/replay/실행 결과로 계속 저장하지만, live runtime contract는 자동 승격으로 바꾸지 않는다.
 
 ## 시스템 목표
 
@@ -57,7 +57,7 @@ JSON mode가 있는 provider는 native JSON 응답을 우선 사용하고, 없�
 현재 구현은 위 문제를 아래 방식으로 다룬다.
 
 - `decision_input_hash`로 입력 추적 가능성 강화
-- `normal / trigger / cooldown / drawdown` 리스크 모드 도입
+- `normal / guarded / cooldown / drawdown` 리스크 모드 도입
 - 주문/포지션 상태 전이 테이블 저장
 - replay diff를 수치와 키워드 단위로 저장
 - 장기 메모리에 `apply_when`, `ignore_when` 강제
@@ -84,7 +84,6 @@ journal + trade_cases + replay + shadow -> MemoryUpdater
     -> long_term_memory
     -> candidate_policy_versions
     -> policy_registry (champions)
-    -> policy_bundles
 ```
 
 ## 2026-03 리팩토링 상태
@@ -125,7 +124,7 @@ gpt_trader/
 │  ├─ llm_provider.py         # Gemini / OpenAI / DeepSeek / Anthropic adapter
 │  └─ rag_engine.py           # 유사 과거 케이스 검색
 ├─ batch/
-│  └─ memory_updater.py       # 장기 메모리 + 정책 후보 생성/평가/승격 배치
+│  └─ memory_updater.py       # 장기 메모리 + 오프라인 정책 후보 평가 배치
 ├─ core/
 │  ├─ alpha_policy.py         # 1h 진입 필터 정책 엔진
 │  ├─ execution_policy.py     # market/limit 및 execution profile 정책 엔진
@@ -175,7 +174,8 @@ gpt_trader/
 - `AccountReader`로 계좌 상태 조회
 - `StateStore`로 현재 리스크 상태 계산
 - `MarketCollector`로 심볼별 시장 스냅샷 수집
-- 현재 스냅샷을 바탕으로 `is_trigger_mode`, `risk_mode`, `risk_profile` 결정
+- 현재 스냅샷을 바탕으로 `is_guarded_attention`, `risk_mode`, `risk_profile` 결정
+  - 여기서 `is_guarded_attention`은 더 이상 opportunity/attention 신호가 아니라 `risk_trigger` 기반 guarded state 플래그다
 
 즉, 정보 수집과 판단을 분리해 같은 사이클 안에서 중복 조회를 줄이는 구조다.
 계좌 상태는 `SnapshotService -> AccountReader -> private WS cache` 경로를 우선 사용하고, REST는 fallback + reconcile 시에만 호출한다.
@@ -227,7 +227,8 @@ gpt_trader/
   - ATR 15m / ATR 1h
   - 1시간 추세
   - 15분 거래량 비율과 즉시 거래량 급증 여부
-  - 히스테리시스가 반영된 fast move / volume surge / range break trigger 상태
+  - 히스테리시스가 반영된 fast move / volume surge / range break signal 상태
+  - 다만 이 short-horizon signal은 15m/5m follow-through 판단용이고, 1h decision payload에서는 제거된다
   - open interest / funding / basis의 변화율 요약
   - spread와 depth의 최근 1시간 상대 수준(percentile / avg 대비 악화 여부)
     - 이 percentile 계열은 in-memory rolling history가 쌓여야 계산된다
@@ -236,11 +237,11 @@ gpt_trader/
     - 최소한 `current_price`, `mark_price`, `mid_price`, `spread_bps`, `depth_notional_top5`
     - `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`
     - `distance_to_invalid_level`
-    - `volume_surge / fast_move / range_break / opportunity / risk trigger` 상태
+    - `volume_surge / fast_move / range_break / risk trigger` 상태
     - `trend_1h`
   - 따라서 replay의 미래 가격 경로는 audit 저장 빈도에만 의존하지 않고, 5분 materialization 기반 시계열을 우선 읽는다
   - breakout 기준선 및 invalidation까지의 거리 요약
-  - opportunity trigger 여부와 사유
+  - follow-through / breakout trigger 상태
   - risk trigger 여부와 사유
   - public WebSocket은 `ticker + 얕은 order book` 위주로 유지하고, closed-candle 기반인 OHLCV는 기본적으로 5분 materialization 시점의 incremental REST fetch에 더 의존
   - 즉 `1h / 4h` 진행 중 봉을 계속 스트리밍하는 것보다, 봉 마감 시점과 5분 cadence에 맞춘 저빈도 fetch를 우선한다
@@ -273,7 +274,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 `RiskEngine`은 현재 상황을 아래 네 모드 중 하나로 분류한다.
 
 - `normal`
-- `trigger`
+- `guarded`
 - `cooldown`
 - `drawdown`
 
@@ -281,7 +282,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 
 1. 쿨다운이면 `cooldown`
 2. 드로우다운이면 `drawdown`
-3. 트리거 이벤트면 `trigger`
+3. risk trigger 기반 guarded 조건이면 `guarded`
 4. 아니면 `normal`
 
 이후 현재 모드에 대응하는 프로파일을 읽는다.
@@ -293,9 +294,9 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 즉, 같은 `BUY`라도 지금이 `normal`인지 `drawdown`인지에 따라 허용 여부와 크기 제한이 달라질 수 있다.  
 최근 구현에서는 `drawdown`이 신규 진입을 완전히 막지는 않되, `entry_size_multiplier`, `confidence_cap`, `failure_pattern_score`를 이용해 size cap을 한 번 더 줄인다.
 
-추가로 현재 구현에서는 `normal` 모드에서만 레짐별 `exposure_budget` 챔피언 정책을 읽어
-`max_order_notional_pct_balance`와 `entry_size_multiplier`를 override할 수 있다.
-`trigger` 모드는 기본 risk profile을 그대로 사용한다.
+현재 구현에서는 live runtime이 레짐별 `policy_registry` champion을 직접 읽어
+`max_order_notional_pct_balance`나 `entry_size_multiplier`를 override하지 않는다.
+노출 조정은 기본 risk profile을 그대로 사용한다.
 반면 아래 안전 가드레일은 자동 진화 대상이 아니다.
 
 - `max_leverage`
@@ -312,7 +313,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 우선순위는 다음과 같다.
 
 - `5m`
-  - opportunity trigger가 활성화되어 있고
+  - risk/emergency trigger가 활성화되어 있고
   - 동시에 포지션 / 미체결 주문 / unknown order 같은 active management 대상이 있는 경우
 - `15m`
   - 포지션이 있거나
@@ -327,7 +328,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 - `1h -> 15m`
   - 포지션/주문/복구 필요 상태가 생기면 즉시 승격
 - `1h or 15m -> 5m`
-  - strong trigger 조건이 충족되고
+  - risk/emergency trigger 조건이 충족되고
   - 동시에 active management 대상이 있으면 즉시 승격
 - `5m -> 15m or 1h`
   - active management 대상이 남아 있으면 clear streak를 만족한 뒤 강등
@@ -351,33 +352,32 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
   - 기본 경로는 AI가 아니라 `PositionPolicyEngine` FSM이며, 예외시만 AI가 다시 본다
 - `5m`
   - execution safety 중심
-  - active trigger 구간에서 더 짧은 주기로 실행 품질과 급변 리스크를 감시
-  - 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이며, 신규 진입은 만들지 않고 `HOLD / EXIT / CANCEL / REPLACE_ENTRY`만 다룬다
+  - risk/emergency trigger 구간에서 더 짧은 주기로 실행 품질과 급변 리스크를 감시
+  - 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이며, 신규 진입은 만들지 않고 `HOLD / EXIT / CANCEL`만 다룬다
   - acute account-loss, stale order execution 문제, 연속 확인된 liquidity deterioration 같은 emergency path만 다룬다
   - 포지션이 사라진 뒤에는 recent execution / close만으로 `5m`를 유지하지 않고 `15m` 관리 주기로 즉시 내린다
 
 이 구조는 `1h = alpha loop`, `15m = position management loop`, `5m = execution safety loop`라는 역할 분리를 따른다.
 
-### 5. Trigger 분리 원칙
+### 5. Attention / Risk Signal 분리 원칙
 
-이 프로젝트는 트리거를 두 부류로 나눈다.
+이 프로젝트는 시장 attention 신호와 risk trigger를 분리한다.
 
-- `opportunity_trigger`
+- `attention_signal`
   - 시장에 실제 이벤트가 발생해 더 자주 관찰하거나 대응할 가치가 있는 상황
   - 예: `fast_price_move_15m`, `volume_surge_15m`, `range_break_1h`
 - `risk_trigger`
   - 거래 품질이나 포지션 보유 비용이 나빠져 신규 진입을 줄이거나 막아야 하는 상황
   - 예: `wide_spread`, `elevated_funding`
 
-중요한 점은 `trigger mode` 자체가 단순히 `opportunity_trigger` 하나로 켜지지는 않는다는 것이다.  
-반면 `risk_trigger`는 AI와 리스크 엔진에 전달되어 더 보수적인 행동을 유도한다.  
-현재 기본 구현에서는 `risk_trigger`를 신규 진입의 하드 차단으로 쓰기보다, 승인 사유에 advisory로 남겨 판단 맥락을 강화한다.
+중요한 점은 `guarded`가 더 이상 opportunity/attention 계열 신호로 켜지지 않는다는 것이다.  
+현재는 `risk_trigger`가 있을 때만 guarded state로 본다. 즉 guarded는 위험/비상 상황용 보수 상태다.
 
 현재 구현에서는 별도의 `Trigger (5m)` 작업이 따로 스케줄되지 않는다.  
-대신 공용 스냅샷에서 같은 심볼에 대해 `opportunity_trigger_reasons`가 2개 이상이면서, 그 안에 `volume_surge_15m` 또는 `range_break_1h` 같은 strong trigger가 포함될 때 `trigger_active`가 켜진다. 다만 실제 cadence가 `5m`로 승격되려면 여기에 더해 포지션, 미체결 주문, unknown order 같은 active management 대상이 있어야 한다. 즉 flat 상태에서 trigger만 켜진 경우는 `5m`로 바로 올라가지 않는다. fast move 단독으로도 승격되지 않는다.
+`5m` 승격은 `risk_trigger` 같은 safety/emergency 신호와 포지션 / 미체결 주문 / unknown order 같은 active management 대상이 함께 있을 때만 의미가 있다.
 
 `fast_price_move_15m`, `volume_surge_15m`, `range_break_1h`에는 심볼별 히스테리시스를 적용한다.  
-즉, 경계값 부근에서는 직전 상태를 참고해 매 루프마다 `trigger mode`가 깜빡이는 현상을 줄인다.
+이 값들은 시장 follow-through / breakout 상태를 나타내는 관찰 정보로 남지만, 더 이상 guarded 진입 조건으로 직접 쓰이지 않는다.
 
 현재 구현 기준의 대표 조건은 다음과 같다.
 
@@ -412,7 +412,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
   - `risk_control / opportunity / execution_quality / hold_quality` 축을 함께 보고 균형 있게 선별한다.
 - `similar_past_cases`
   - schema/semantic validation fallback audit와 그 audit에 연결된 trade case는 프롬프트 retrieval 후보에서 제외한다.
-- `is_trigger_mode`
+- `is_guarded_attention`
 - `risk_mode`
 - `risk_profile`
 
@@ -424,8 +424,8 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 둘째, AI는 `risk_state`의 구체 수치도 함께 받는다.  
 즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간, 동적 쿨다운 길이, 반복 실패 패턴 점수, 현재 심볼의 재진입 가드 상태까지 보고 위험도를 해석할 수 있다.
 
-셋째, 시장 스냅샷 안에서 `opportunity_trigger_reasons`와 `risk_trigger_reasons`를 분리해 전달한다.  
-즉, “시장이 움직였다”와 “지금 거래 품질이 나쁘다”를 같은 신호로 취급하지 않는다.
+셋째, 시장 스냅샷은 `fast_move_signal_active`, `volume_surge_signal_active`, `range_break_signal_active`, `risk_trigger_reasons`를 전달한다.  
+즉, follow-through / breakout 상태와 실제 위험 신호를 구분해서 본다.
 
 또한 시장 스냅샷은 raw 값만 나열하지 않고, `oi_change_15m`, `oi_change_1h`, `funding_rate_change_1h`,
 `basis_change_1h`, `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`,
@@ -435,7 +435,7 @@ LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 �
 최근 프롬프트는 입력 섹션 이름을 `market_context`가 아니라 `market_snapshots`로 통일한다.
 구조화 evidence의 `source`도 `market_snapshots.*`, `risk_state.*`, `account_state.*` 같은 실제 `DecisionRequest` 경로를 가리켜야 한다.
 
-`volume_surge_15m_now`와 `volume_surge_trigger_active`는 의도적으로 분리한다.  
+`volume_surge_15m_now`와 `volume_surge_signal_active`는 의도적으로 분리한다.  
 전자는 현재 15분 봉의 즉시 조건이고, 후자는 히스테리시스가 반영된 안정화된 trigger 상태다.
 
 넷째, 장기 메모리는 더 이상 단순 문장 리스트만이 아니다.  
@@ -486,30 +486,25 @@ LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 �
 - `alpha_1h`
   - 레짐별 진입 필터 후보 생성
   - live entry와 후보 필터의 차이를 shadow로 저장
-  - 성능 우위 시 champion 승격
+  - 평가 결과는 offline 비교용으로만 유지
 - `position_15m`
   - FSM 관리 정책 후보 생성
   - recent trade case의 invalidation 거리와 microstructure stress를 읽어 `invalidation_reduce_distance_atr`, liquidity exit 임계치를 함께 튜닝
   - shadow decision과 실제 outcome을 비교
-  - 성능 우위 시 champion 승격
+  - 평가 결과는 offline 비교용으로만 유지
 - `execution_5m`
-  - market/limit 및 execution profile 추천 학습
-  - 실제 fill/slippage/latency 결과를 저장
-  - context bucket별 champion profile 승격
+  - 실제 fill/slippage/latency 결과를 오프라인 분석용으로 저장
+  - live policy domain이 아니라 post-trade observability surface로만 유지
 - `safety_5m`
   - 5분 safety FSM 후보 생성
   - acute exit 후보만 shadow로 비교하며, 과거 `risk_reduce` 보너스는 더 이상 승격 점수에 반영하지 않음
   - live safety decision과 shadow candidate 차이를 저장
-  - 손실 회피 효과가 확인되면 champion 승격
-- `exposure_budget`
-  - `normal/trigger` 레짐별 최대 참여율과 entry multiplier를 자동 조정
-  - `max_leverage`와 `drawdown` 트리거는 고정 가드레일로 유지
+  - 손실 회피 효과는 offline 비교 지표로만 본다
+`policy_bundle` 계층은 제거했다.
 
-또한 개별 champion 위에 `policy_bundle` 계층이 있다.
-
-- 레짐별로 `alpha + position + safety + execution` champion을 bundle로 묶는다
-- bundle score가 더 좋으면 active bundle로 승격한다
-- 최근 shadow 성과가 크게 악화되면 이전 bundle로 자동 rollback할 수 있다
+- live loop는 bundle override를 전혀 주입하지 않는다
+- `policy_registry`는 live runtime source가 아니라 offline 평가/이력 저장소로만 남긴다
+- 학습 결과도 candidate/evaluation 단위로만 남기고 bundle 상태는 더 이상 저장하지 않는다
 
 ## 의사결정 모델
 
@@ -528,8 +523,16 @@ AI 출력은 `TradeIntent`다.
 - `orders`
   - 각 주문 후보의 심볼, 액션, 주문 타입, 수량, 가격, `reduce_only`, TP, SL
   - `CANCEL` 액션일 때는 `target_order_id` 또는 `target_client_order_id`를 함께 담아 working order cleanup에 사용한다
-  - `REPLACE_ENTRY`일 때는 cancel leg와 replacement leg를 함께 담고, replacement leg는 cancel confirmation 이후에만 제출되도록 `wait_for_cancel_confirmation`, `replace_group_id`, lineage 필드를 함께 가진다
-  - 최근 구현에서는 `execution_profile`, `urgency_score`, `time_in_force`, `post_only` 같은 실행 메타데이터도 포함한다
+  - `REPLACE_ENTRY`는 현재 자동 관리 루프가 아니라 명시적 1h working-order 관리 상황에서만 사용한다
+  - AI 응답 스키마에는 `execution_profile`, `urgency_score`, `time_in_force`, `post_only`, `limit_offset_bps`, `max_slippage_bps`를 노출하지 않는다. 실행 메타데이터는 runtime이 채운다
+  - `EXIT`와 `REDUCE`는 실행 레이어에서 항상 시장가 성격을 유지한다. 포지션 정리를 passive limit로 늦추지 않는다
+  - 신규 `BUY/SELL` entry는 `entry_style`로 의미를 명시한다. `immediate`는 지금 진입, `retest`는 breakout/reclaim 레벨 재진입 대기, `value`는 일반 눌림 대기다
+  - live execution layer는 학습 추천을 참고해 의미를 바꾸지 않는다. `MARKET` entry는 `market_urgent`, `LIMIT + immediate`는 `limit_aggressive`, `LIMIT + retest/value`는 `limit_passive`로 결정론적으로 번역한다
+  - passive limit 가격도 intent별로 다르다. `retest`는 breakout level 근처 구조 가격을 우선 쓰고, `value`는 현재가 기준 passive offset을 사용하되 spread/ATR가 커지면 offset을 제한적으로 넓힌다
+  - 프롬프트는 `retest`를 구조 레벨 근거가 있을 때만, `value`를 trend/invalidation이 여전히 허용되는 passive retrace일 때만 쓰도록 더 명확히 고정한다
+  - 리스크 엔진은 entry 총량도 고정 규칙으로 제한한다. `max_leverage`는 계정 총 익스포저 상한이고, `max_order_notional_pct_balance`는 현재 모드에서 허용하는 주문 후보 총 notional의 상한이다. `drawdown`에서는 `entry_size_multiplier`, `confidence_cap`, `failure_pattern_size_multiplier`, `risk_trigger_size_multiplier`가 이 cap을 추가로 감쇠한다
+  - 같은 cap 계산에서도 `evidence_quality` 외에 `setup_quality`를 추가로 본다. `retest`가 구조에서 너무 멀거나 `value`의 trend/invalidation/execution quality가 나쁘면 size cap을 더 줄인다
+  - execution learning은 현재 live override 용도가 아니라 사후 분석과 파라미터 튜닝 후보 탐색 용도로만 남긴다
 - `rationale`
   - 왜 그런 결정을 내렸는지에 대한 짧은 근거
 - `rationale_items`
@@ -549,12 +552,13 @@ AI 출력은 `TradeIntent`다.
 - 유효한 JSON만 반환
 - 리스크 우회 금지
 - 영어 텍스트 강제
-- 트리거 모드에서는 신규 진입보다 리스크 축소 우선
+- guarded 상태에서는 신규 진입보다 리스크 축소 우선
 - `risk_trigger`가 있으면 스프레드와 펀딩 같은 거래 품질 악화를 별도 위험 신호로 해석
 - `rationale_items.evidence[].source`는 실제 `DecisionRequest` 경로를 가리켜야 하며, 관측값과 어긋나면 보수적으로 `HOLD` fallback
 - `operator`도 의미 검증한다. 즉 `gte`, `lt`, `cross_up`, `delta_abs_gte` 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 `HOLD` fallback
 - 신규 진입에서는 `trade_implication`이 실제 행동 방향과 맞지 않거나, 근거 품질 대비 confidence가 과하면 보수적으로 `HOLD` fallback
 - 신규 진입에서 `rationale_items`가 있으면 evidence 품질도 본다. 신호 다양성, symbol 커버리지, failure_mode 유무가 약하면 entry size cap을 더 낮춘다.
+- 프롬프트에는 `entry_headroom`도 들어간다. 이는 남은 entry budget, pending entry notional, leverage 여유를 compact하게 요약한 입력이다.
 
 ## 리스크 관리 상세
 
@@ -602,7 +606,7 @@ AI 출력은 `TradeIntent`다.
 예:
 
 - `normal`에서는 상대적으로 크게 허용
-- `trigger`에서는 축소
+- `guarded`에서는 축소
 - `drawdown`에서는 더 보수적으로 축소
 - `cooldown`에서는 신규 진입이 사실상 0으로 제한될 수 있음
 
@@ -635,8 +639,8 @@ trading:
   order_type: "market"
 
 risk_limits:
-  daily_max_loss_pct: 3.0
-  drawdown_activate_pct: 1.5
+  daily_max_loss_pct: 10.0
+  drawdown_activate_pct: 5.0
   max_consecutive_losses: 3
   cooldown_minutes: 30
   dynamic_cooldown:
@@ -649,10 +653,10 @@ risk_limits:
       max_open_positions: 1
       max_order_notional_pct_balance: 100
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
-    trigger:
+    guarded:
       max_open_positions: 1
-      max_order_notional_pct_balance: 35
-      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
+      max_order_notional_pct_balance: 0
+      allowed_actions: [HOLD, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]
     cooldown:
       max_open_positions: 1
       max_order_notional_pct_balance: 0
@@ -675,6 +679,7 @@ daily_batch:
   run_minute_local: 0
   replay_timeout_seconds: 1800
   memory_timeout_seconds: 1800
+  deepseek_memory_timeout_seconds: 5400
 
 execution_guards:
   loop_lock_ttl_seconds: 240
@@ -700,11 +705,12 @@ context_budget:
 
 해석 예:
 
-- `daily_max_loss_pct: 3.0`
-  - 하루 손익률이 `-3.0%` 이하로 내려가면 신규 진입은 kill-switch에 걸린다.
-  - 이 값은 일중 계좌 가드레일이지, 개별 포지션 손절 퍼센트가 아니다.
+- `daily_max_loss_pct: 10.0`
+  - 하루 손익률이 `-10.0%` 이하로 내려가면 신규 진입은 kill-switch에 걸린다.
+  - 이 값은 일중 계좌 가드레일이고, 개별 트레이드 손실 한도는 별도로 둔다.
 - `position_policy.losing_exit_pct`, `safety_policy.loss_exit_pct`
   - 15m/5m deterministic 손절은 포지션의 `account_unrealized_pnl_pct`를 기준으로 본다.
+  - 현재 기본 per-trade 손실 한도는 `-3.0%`다.
   - 즉 `미실현손익 / 총자본 * 100` 기준이며, 레버리지로 증폭된 `margin ROE%`를 그대로 손절 트리거로 쓰지 않는다.
 - `position_policy.invalidation_reduce_distance_atr`
   - 15m 관리 루프는 단순히 약손실이라고 줄이지 않는다.
@@ -715,10 +721,10 @@ context_budget:
 - `max_consecutive_losses: 3`
   - 현재 UTC 일자(`00:00 UTC` 이후) 안에서 손실 종료가 3번 연속 누적되면 신규 진입은 kill-switch에 걸린다.
   - 전일 손실 streak는 다음 UTC day boundary에서 리셋된다.
-- `drawdown_activate_pct: 1.5`
+- `drawdown_activate_pct: 5.0`
   - hard stop 전에 먼저 `drawdown` 모드로 진입해 공격성을 줄인다.
-- `trigger.max_order_notional_pct_balance: 35`
-  - 변동성 이벤트 구간에서는 주문 후보 총 노출을 잔고의 35% 이내로 제한한다.
+- `guarded.max_order_notional_pct_balance: 0`
+  - guarded 상태에서는 신규 진입을 허용하지 않는다. 이 상태는 진입 모드가 아니라 경계/관리 상태다.
 - `cooldown.allowed_actions`
   - 쿨다운 구간에서는 신규 진입 없이 축소/청산 위주 행동만 허용할 수 있다.
 - `dynamic_cooldown`
@@ -734,7 +740,7 @@ context_budget:
 - `context_budget`
   - Retrieval note: recent journal candidates now mix a recent slice with semantic anchor rows such as `good_hold`, `missed_opportunity_hold`, and loss/risk outcomes.
   - Lifecycle note: runtime `long_term_memory` retrieval and batch reconciliation now read the same full lifecycle-managed pool instead of separate recent caps.
-  - Support note: `similar_past_cases` stays dense in trigger mode, but normal mode still receives a small background-support case set.
+  - Support note: `similar_past_cases` stays dense in guarded state, but normal mode still receives a small background-support case set.
   - Policy note: `policy_summary` is now a compact digest of enforceable limits, mode profiles, and execution guards rather than a raw `policy.yaml` dump.
   - Contract note: critical policy paths are registered in `RiskEngine.PROMPT_POLICY_CONTRACT`. Startup fails if the prompt digest cannot carry those fields.
   - Learning note: runtime retrieval scores are additionally adjusted by batch-produced `journal_reranker_profile` and `similar_case_reranker_profile` artifacts instead of relying on static heuristics alone.
@@ -886,11 +892,11 @@ context_budget:
   "risk_approved": 1,
   "risk_reason": "Approved",
   "decision_input_hash": "a13f2b6e...9c21",
-  "risk_mode": "trigger",
+  "risk_mode": "guarded",
   "risk_profile": {
     "max_open_positions": 1,
-    "max_order_notional_pct_balance": 35,
-    "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"]
+    "max_order_notional_pct_balance": 0,
+    "allowed_actions": ["HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"]
   },
   "market_state": {
     "symbols": ["BTCUSDT"],
@@ -914,7 +920,7 @@ context_budget:
   },
   "execution_summary": {
     "loop_type": "Adaptive (5m)",
-    "trigger_mode": true,
+    "guarded_attention": true,
     "executed_order_count": 1
   }
 }
@@ -939,7 +945,7 @@ context_budget:
 동시에 `rationale_json`에는 구조화 근거를 그대로 저장해 리플레이, 메모리 생성, 사후 분석에서 재사용한다.
 
 최근 journal 요약을 AI에 다시 넣을 때는 텍스트 이유만 보내지 않는다.  
-가능한 경우 audit/ledger와 연결해 실제 결과, 수수료, risk mode, trigger 정보를 함께 요약해 피드백 루프를 강화한다.
+가능한 경우 audit/ledger와 연결해 실제 결과, 수수료, risk mode, guarded state 정보를 함께 요약해 피드백 루프를 강화한다.
 
 최근 구조에서는 journal도 단순 1회성 로그에 머무르지 않고, 같은 사이클에서 생성된 심볼별 `trade_case_id`와 `case_status` 요약을 함께 남긴다.  
 즉 포트폴리오 journal만 봐도 "이번 판단이 어떤 케이스를 열었는지, 줄였는지, 닫았는지"를 빠르게 복기할 수 있다.
@@ -969,7 +975,7 @@ policy 평가에도 같은 opportunity cost를 함께 반영한다.
 이 컨텍스트는 저장만 하는 메타데이터가 아니다.
 실시간 loop는 `long_term_memory`를 고를 때 기존 `apply_when.regime/volatility/trend` 축뿐 아니라,
 현재 시장의 `trigger_context`, `execution_context`, `trend_context` signature와 직접 비교해 맞는 memory를 우선 적용한다.
-특히 opportunity memory는 trigger/execution/trend 문맥이 어긋나면 강하게 감점한다.
+특히 opportunity memory는 attention/execution/trend 문맥이 어긋나면 강하게 감점한다.
 구조화 evidence는 단일 스키마를 유지하되 타입 규칙은 강하게 둔다.
 즉 `gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte` 는 숫자 값만 허용하고,
 `eq/note` 만 숫자/문자열/불리언 evidence를 허용한다.
@@ -1100,7 +1106,7 @@ policy 평가에도 같은 opportunity cost를 함께 반영한다.
 가능하면 `entry_audit_log_id` / `exit_audit_log_id`의 실제 fill timestamp를 복원해, 그 체결 구간 안쪽 snapshot만 우선 사용한다.  
 아직 체결 틱 단위는 아니지만, cycle별 경로를 누적하므로 이전보다 훨씬 신뢰도 높은 case quality 지표로 사용한다.
 
-최근 `journal` 선별은 이제 단순 최신순 점수보다, 이 `trade_cases`의 심볼/trigger/risk mode/regime/결과 패턴을 같이 보고 유사한 사례를 우선 선택한다.  
+최근 `journal` 선별은 이제 단순 최신순 점수보다, 이 `trade_cases`의 심볼/guarded state/risk mode/regime/결과 패턴을 같이 보고 유사한 사례를 우선 선택한다.  
 여기에 `feature_vector` 기반 cosine similarity도 섞어서 규칙 태그만으로는 놓치기 쉬운 수치적 유사 케이스를 같이 반영한다.
 
 ### `trade_case_snapshots`
@@ -1300,7 +1306,7 @@ memory batch의 `retrieval_counterfactual_summary`에는 `outcome_linked_count`,
 이 자동 replay 후보는 학습 가능 audit만 대상으로 하고, 시스템 오류 fallback/loop error audit는 자동 경로에서 제외한다.
 최근 버전의 replay는 포지션이 없고 `HOLD`였던 audit에 대해서도 이후 `30m / 2h / 6h` 가격 경로를 다시 읽는다.
 즉 같은 시점에 단순 baseline entry를 넣었으면 충분히 먹을 수 있었는지 `hold_opportunity_counterfactual`로 저장한다.
-baseline은 `trigger active + acceptable spread/depth + manageable invalidation distance`를 만족할 때만 만든다.
+baseline은 `attention active + acceptable spread/depth + manageable invalidation distance`를 만족할 때만 만든다.
 이때 단순 진입 여부만 가정하지 않고,
 - 방향은 trend / breakout / RSI / 단기 변화율을 조합해 추정
 - 크기는 available balance 기준 소액 notional로 제한
@@ -1389,6 +1395,7 @@ python -m tools.replay_audit --auto --save --limit 30 --max-limit 60 --hold-quot
 즉 어떤 evidence signal이 추가되거나 사라져서 결정이 바뀌었는지까지 추적할 수 있다.
 
 대시보드는 최근 replay evidence diff, 최근 memory candidate seed, 최근 symbol_journal을 함께 보여준다.
+또한 `Entry Styles 24h`와 `Post-Trade Labels` 요약을 추가로 보여줘 `immediate/retest/value`별 win rate, avg pnl pct, no-fill, missed-on-no-fill과 `edge_failed`, `missed_due_to_no_fill`, `risk_exit`, `stale_entry_cancelled` 라벨 빈도를 같이 본다.
 
 audit detail 화면은 raw JSON 외에도 `rationale_items`와 evidence quality / entry size cap 요약을 카드로 보여준다.
 `rationale_items.evidence[].source`는 클릭해서 stored DecisionRequest 안의 실제 값을 바로 lookup할 수 있다.
@@ -1408,12 +1415,12 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 또한 `retired`, `retirement_reason`을 함께 계산해, holdout에서 더 이상 같은 손실 패턴이 재현되지 않거나 품질이 너무 낮은 cluster는 candidate lesson seed에서 자동 제외한다.
 배치는 replay에서 집계한 `hold_opportunity_summary`와 `trading_balance_summary`도 함께 읽는다.
 즉 최근 시스템이 과도한 HOLD 편향인지, 반대로 false entry cost가 더 큰 과잉 진입 상태인지도 함께 본다.
-이 값은 candidate lesson 생성뿐 아니라 `alpha_1h` 후보/번들 평가와 promotion gate에도 들어간다.
-최근 promotion gate는 `hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
+이 값은 candidate lesson 생성뿐 아니라 `alpha_1h` 후보 평가와 offline review gate에도 들어간다.
+최근 review gate는 `hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
 `portfolio_utility_score`, `confidence_alignment_score`, `temporal_holdout_summary`도 같이 본다.
 즉 한쪽 비용이 과도하게 큰 상태이거나 두 비용의 비율이 너무 깨져 있거나,
-walk-forward 성격의 holdout 구간이 무너지거나 confidence calibration이 나쁘면 score가 좋아도 자동 승격을 막는다.
-여기서 `false_entry_cost`는 promotion용 정규화 퍼센트 비용이고, 금액 손실 합계는 `false_entry_cost_amount`로 별도 저장한다.
+walk-forward 성격의 holdout 구간이 무너지거나 confidence calibration이 나쁘면 score가 좋아도 live 자동 반영 대상으로 보지 않는다.
+여기서 `false_entry_cost`는 review용 정규화 퍼센트 비용이고, 금액 손실 합계는 `false_entry_cost_amount`로 별도 저장한다.
 또한 memory batch는 `retrieval_evaluation_summary`와 `retrieval_counterfactual_summary`를 함께 읽어,
 retrieval이 실제 성과와 반사실 비교 기준에서 얼마나 의미 있었는지, 그리고 그 차이가 path quality 기준으로도 유지되는지 장기 메모리 판단 근거로 남긴다.
 또한 최근 journal의 `confidence`와 사후 outcome을 비교해 `calibration_gap`, `brier_score`,
@@ -1507,6 +1514,7 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 
 - 대시보드는 `.env`를 읽고 `DB_PATH`를 그대로 사용한다.
 - `DB_PATH`를 비우면 기본값 `data/gpt_trader.db`를 사용한다.
+- 새 스키마로 다시 시작할 때는 Docker bind mount의 기존 `./data/gpt_trader.db`를 그대로 재사용하지 말고 비운 뒤 시작한다.
 - 상단 모델 라우팅 표시는 `AI_PROVIDER`, `MEMORY_PROVIDER`, `REPLAY_PROVIDER`와 각 모델 env를 반영한다.
 - audit replay 버튼은 `REPLAY_*` 설정을 우선 사용하고, 비어 있으면 `AI_*` 설정으로 fallback 한다.
 
@@ -1560,7 +1568,7 @@ BYBIT_TESTNET="False"
 AI_PROVIDER="deepseek"
 AI_API_KEY=""
 AI_DEFAULT_MODEL="deepseek-reasoner"
-AI_TRIGGER_MODEL="deepseek-reasoner"
+AI_GUARDED_ATTENTION_MODEL="deepseek-reasoner"
 MEMORY_PROVIDER="deepseek"
 MEMORY_MODEL="deepseek-reasoner"
 REPLAY_PROVIDER="deepseek"
@@ -1584,6 +1592,12 @@ ALERT_WEBHOOK_FORMAT="auto"
 {"title":"Execution Timeout","message":"...","level":"error"}
 ```
 
+- cycle decision summary 예시
+
+```json
+{"title":"Cycle Decision","message":"loop=1h risk=guarded role=strategy decision=BUY approved=yes model=gemini-2.5-pro\nwhy=Breakout retest has volume support.\norders=BUY LIMIT retest x1","level":"info"}
+```
+
 - `slack`
 
 ```json
@@ -1601,7 +1615,7 @@ Gemini 예시는 다음처럼 바꾸면 된다.
 ```env
 AI_PROVIDER="gemini"
 AI_DEFAULT_MODEL="gemini-2.5-pro"
-AI_TRIGGER_MODEL="gemini-2.5-pro"
+AI_GUARDED_ATTENTION_MODEL="gemini-2.5-pro"
 GEMINI_API_KEY="your_gemini_api_key_here"
 ```
 
@@ -1611,8 +1625,8 @@ GEMINI_API_KEY="your_gemini_api_key_here"
   - `gemini`, `openai`, `deepseek`, `anthropic`
 - `AI_DEFAULT_MODEL`
   - 일반 루프에서 사용하는 기본 모델
-- `AI_TRIGGER_MODEL`
-  - trigger/safety-context에서 AI가 실제 호출될 때만 따로 쓰고 싶을 때 지정
+- `AI_GUARDED_ATTENTION_MODEL`
+  - guarded-attention/safety-context에서 AI가 실제 호출될 때만 따로 쓰고 싶을 때 지정
   - 비우면 `AI_DEFAULT_MODEL`을 재사용
 - `MEMORY_PROVIDER`
   - 비우면 `AI_PROVIDER`를 재사용
@@ -1631,7 +1645,7 @@ GEMINI_API_KEY="your_gemini_api_key_here"
 - Gemini는 native schema JSON 응답을 사용한다.
 - OpenAI와 DeepSeek는 chat completion의 `json_object` 모드를 우선 사용한다.
 - Anthropic은 JSON-only system prompt를 사용하고, 모든 provider는 마지막에 Pydantic 검증으로 `TradeIntent` 스키마를 다시 확인한다.
-- DeepSeek reasoning 계열은 응답 시간이 수 분까지 길어질 수 있다. 특히 `AI_TRIGGER_MODEL=deepseek-reasoner`를 쓰면 첫 trigger cycle이 느릴 수 있다.
+- DeepSeek reasoning 계열은 응답 시간이 수 분까지 길어질 수 있다. 특히 `AI_GUARDED_ATTENTION_MODEL=deepseek-reasoner`를 쓰면 첫 guarded-attention cycle이 느릴 수 있다.
 
 ### 3. 정책 확인
 
@@ -1649,6 +1663,7 @@ GEMINI_API_KEY="your_gemini_api_key_here"
 - 루프 주기
 - replay batch 설정
 - daily batch 스케줄/timeout
+- `MEMORY_PROVIDER=deepseek`이면 memory batch timeout은 `deepseek_memory_timeout_seconds` 이상으로 자동 상향된다.
 
 ## 실행 방법
 
@@ -1678,7 +1693,7 @@ Dashboard startup now resolves `.env` and opens `StateStore` lazily on the first
 - shadow dataset 준비 여부
 - stale learning으로 인한 promotion 차단 여부
 
-`Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도 `policy_promotions`, `bundle_promotions`는 자동으로 멈춘다.
+`Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도 `policy_promotions`는 자동으로 멈춘다.
 
 대시보드는 `.env`의 `DB_PATH`를 사용해 같은 SQLite를 읽는다.  
 audit replay를 대시보드에서 실행할 때는 `REPLAY_PROVIDER`, `REPLAY_API_KEY`, `REPLAY_MODEL`을 우선 보고, 비어 있으면 `AI_PROVIDER`, `AI_API_KEY`, `AI_DEFAULT_MODEL` 계열 설정으로 fallback 한다.
@@ -1743,8 +1758,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - 시장 판단에는 미완성 캔들을 제외한 종가 데이터가 사용된다.
 - `EXIT` 의사결정에 `orders`가 비어 있으면 현재 포지션을 기준으로 reduce-only 시장가 청산 주문을 자동 생성한다.
 - `CANCEL` 의사결정은 stale working order를 실제로 취소하는 실행 경로를 가진다.
-- stale entry order가 오래됐지만 execution quality가 아직 괜찮으면 decision은 `REPLACE_ENTRY`로 분리되고, 내부 leg는 `CANCEL + BUY/SELL LIMIT`로 표현된다.
-- `REPLACE_ENTRY`의 replacement leg는 cancel confirmation 전에는 제출되지 않는다. cancel receipt가 미확정이면 `deferred_waiting_cancel` 상태로 남고 다음 관리 사이클에서 이어서 처리한다.
+- stale entry order는 15m/5m 관리 루프에서 재호가하지 않는다. 현재 계약은 cancel-only다.
 - order runtime/state transition에는 `replace_group_id`, parent order id, lineage role이 함께 저장돼 원래 주문 -> 취소 -> 대체 주문 흐름을 추적할 수 있다.
 - live position이 있으면 `1h` 전략 루프도 새 엔트리를 열지 않고 기존 케이스 관리만 수행한다.
 - 즉 한 번 열린 트레이드는 기본적으로 같은 `trade_case_id` / `thesis_id` 아래에서 관리되고, 반대 새 thesis로 즉시 뒤집는 행동은 허용하지 않는다.
@@ -1777,7 +1791,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 ### 월간 체크리스트
 
 1. `policy.yaml`의 손실 한도, size cap, max positions, trigger threshold를 다시 검토한다.
-2. `GEMINI_DEFAULT_MODEL`, `GEMINI_TRIGGER_MODEL`, `GEMINI_MEMORY_MODEL` 역할 분리가 여전히 적절한지 본다.
+2. `GEMINI_DEFAULT_MODEL`, `GEMINI_GUARDED_ATTENTION_MODEL`, `GEMINI_MEMORY_MODEL` 역할 분리가 여전히 적절한지 본다.
 3. SQLite 파일 크기, `audit_logs`, `position_ledger`, `replay_runs` 증가량을 점검한다.
 4. 오래된 audit archive 정책이 필요한지 판단한다.
 5. 오래된 memory rule 중 현재 시장 레짐에서 더 이상 맞지 않는 항목을 pruning 할지 검토한다.
@@ -1788,7 +1802,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - 대시보드의 `Semantic Fallbacks`를 먼저 본다.
 - `24h / 7d / latest 50 calls` 기준으로 fallback 수가 올라가면 최근 모델 변경, 프롬프트 변경, journal 문맥 변화가 있었는지 확인한다.
 - 특정 모델의 failure rate가 높으면:
-  - `GEMINI_DEFAULT_MODEL`, `GEMINI_TRIGGER_MODEL`, `GEMINI_MEMORY_MODEL` 분리를 다시 점검
+  - `GEMINI_DEFAULT_MODEL`, `GEMINI_GUARDED_ATTENTION_MODEL`, `GEMINI_MEMORY_MODEL` 분리를 다시 점검
   - 저가 모델을 실시간 루프에만 쓰고, memory batch는 상위 모델 유지
   - fallback issue가 `operator_condition_failed`인지 `trade_implication_action_mismatch`인지 구분
 - replay detail에서 `current value / previous value / threshold`를 같이 보면서 모델이 숫자는 맞게 읽었는지, 교차 해석을 잘못했는지 확인한다.
@@ -1885,9 +1899,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - `15m`는 thesis-aware management, 약손실 자체보다 invalidation 근접과 시간 경과를 우선
 - `5m`는 execution safety emergency path만 담당
 - 정책 진화는 즉시 반응하지만 `long_term_memory`는 새 사례가 누적되며 천천히 반영
-- `2026-03-10` contract cutover 이후 batch learning은 기본적으로 그 날짜 이후 journal/trade_case만 학습에 사용한다.
-- 과거 `audit_logs` / `journal` / `trade_cases` / `shadow_decisions`는 사실 이력으로 보존하고, `policy_registry` / `candidate_policy_versions` / `long_term_memory`만 soft-migration 한다.
-- 일회성 정리가 필요하면 `python -m tools.migrate_contract_cutover_20260310 --db-path data/gpt_trader.db`로 DB 백업 후 migration summary를 남긴다.
+- 운영 계약을 크게 바꿀 때는 기존 학습 표면을 보존하려 애쓰기보다 `data/gpt_trader.db`와 `data/learning/`을 비우고 새로 시작하는 쪽을 기본으로 둔다.
 
 ## 권장 운영 순서
 
@@ -1912,7 +1924,6 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - 의사결정 엔진: [`ai/decision_engine.py`](./ai/decision_engine.py)
 - 실행 엔진: [`exchange/execution_engine.py`](./exchange/execution_engine.py)
 - 메모리 배치: [`batch/memory_updater.py`](./batch/memory_updater.py)
-- 계약 컷오버 마이그레이션: [`tools/migrate_contract_cutover_20260310.py`](./tools/migrate_contract_cutover_20260310.py)
 - 리플레이 도구: [`tools/replay_audit.py`](./tools/replay_audit.py)
 - 시스템 철학: [`SYSTEM_PHILOSOPHY.md`](./SYSTEM_PHILOSOPHY.md)
 - 개선 로드맵: [`IMPROVEMENT_ROADMAP.md`](./IMPROVEMENT_ROADMAP.md)
@@ -1924,8 +1935,8 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - `ExecutionPolicyEngine`이 `loop_mode`, `entry/reduce/exit`, urgency, spread/depth 상태를 보고
   `MARKET`, `LIMIT_PASSIVE`, `LIMIT_AGGRESSIVE` 성격의 실행 프로필을 선택한다
 - 실제 결과는 `execution_policy_evaluations`에 저장된다
-- 여기에는 일반 진입/청산뿐 아니라 `CANCEL` 성공률, timeout, stale order 재배치 전후 문맥도 함께 남긴다
-- 배치는 이를 집계해 context bucket별 추천 profile을 만들고 champion으로 승격한다
+- 여기에는 일반 진입/청산뿐 아니라 `CANCEL` 성공률, timeout, stale order 정리 문맥도 함께 남긴다
+- 배치는 이를 집계해 offline 평가 지표와 후보 비교 기록으로만 남긴다
 
 기본 원칙은 다음과 같다.
 

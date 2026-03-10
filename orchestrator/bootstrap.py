@@ -1,5 +1,4 @@
 
-import hashlib
 import threading
 import time
 from datetime import UTC, datetime
@@ -28,7 +27,7 @@ class TradingBootstrapMixin:
         self.ai_api_key = self.runtime_config.ai_api_key
         self.ai_base_url = self.runtime_config.ai_base_url
         self.ai_default_model = self.runtime_config.ai_default_model
-        self.ai_trigger_model = self.runtime_config.ai_trigger_model
+        self.ai_guarded_attention_model = self.runtime_config.ai_guarded_attention_model
         self.db_path = self.runtime_config.db_path
         self.state_store = dependencies.state_store
         self.risk_engine = dependencies.risk_engine
@@ -66,7 +65,7 @@ class TradingBootstrapMixin:
                 ai_api_key=getattr(self, "ai_api_key", None),
                 ai_base_url=getattr(self, "ai_base_url", None),
                 ai_default_model=getattr(self, "ai_default_model", None),
-                ai_trigger_model=getattr(self, "ai_trigger_model", None),
+                ai_guarded_attention_model=getattr(self, "ai_guarded_attention_model", None),
                 db_path=getattr(self, "db_path", "data/gpt_trader.db"),
             )
         resolve_api_key(
@@ -76,7 +75,7 @@ class TradingBootstrapMixin:
         resolve_decision_models(
             config.ai_provider,
             default_model=config.ai_default_model,
-            trigger_model=config.ai_trigger_model,
+            guarded_attention_model=config.ai_guarded_attention_model,
         )
 
     def _build_private_account_ws_config(self, risk_engine=None):
@@ -198,76 +197,15 @@ class TradingBootstrapMixin:
                     invalidation_reason = failure_mode
                     break
         thesis_summary = str(getattr(intent, "thesis_summary", None) or rationale_seed or "").strip() or None
-        thesis_basis = "|".join(
-            [
-                str(input_hash or "").strip(),
-                str(intent.decision or "").strip(),
-                str(thesis_summary or ""),
-                str(invalidation_reason or ""),
-            ]
-        )
-        thesis_id = str(getattr(intent, "thesis_id", None) or "").strip()
-        if not thesis_id and thesis_basis.replace("|", "").strip():
-            thesis_id = hashlib.sha1(thesis_basis.encode("utf-8")).hexdigest()[:12]
-        management_template_id = str(getattr(intent, "management_template_id", None) or "").strip()
-        if not management_template_id:
-            management_template_id = self._derive_management_template_id(
-                intent=intent,
-                loop_mode=loop_mode,
-                risk_mode=risk_mode,
-                market_snapshots=market_snapshots,
-            )
-        exit_reason = str(getattr(intent, "exit_reason", None) or "").strip()
-        if not exit_reason:
-            exit_reason = self._derive_intent_exit_reason(intent)
         return intent.model_copy(
             update={
-                "thesis_id": thesis_id or None,
+                "thesis_id": str(getattr(intent, "thesis_id", None) or "").strip() or None,
                 "thesis_summary": thesis_summary,
                 "invalidation_reason": invalidation_reason or None,
-                "management_template_id": management_template_id or None,
-                "exit_reason": exit_reason or None,
+                "management_template_id": str(getattr(intent, "management_template_id", None) or "").strip() or None,
+                "exit_reason": str(getattr(intent, "exit_reason", None) or "").strip() or None,
             }
         )
-
-    def _derive_management_template_id(self, intent, loop_mode: str, risk_mode: str, market_snapshots):
-        if intent.decision in ("REDUCE", "EXIT"):
-            return f"{loop_mode}_risk_reduction"
-        if intent.decision == "CANCEL":
-            return f"{loop_mode}_working_order_cleanup"
-        if intent.decision == "REPLACE_ENTRY":
-            return f"{loop_mode}_working_order_reprice"
-        strong_trigger = any(
-            bool(getattr(snapshot, "is_opportunity_trigger", False))
-            for snapshot in (market_snapshots or {}).values()
-        )
-        if loop_mode == "1h":
-            return "entry_trigger_followthrough" if strong_trigger else "entry_swing_base"
-        if loop_mode == "15m":
-            return "position_manage_adaptive"
-        if loop_mode == "5m":
-            return "execution_safety_fast"
-        return f"{loop_mode}_{risk_mode}"
-
-    def _derive_intent_exit_reason(self, intent):
-        if intent.decision == "EXIT":
-            risk_text = " ".join(str(note or "") for note in (intent.risk_notes or [])).lower()
-            rationale_text = " ".join(str(row or "") for row in (intent.rationale or [])).lower()
-            merged = f"{risk_text} {rationale_text}"
-            if "cooldown" in merged or "kill switch" in merged:
-                return "risk_control"
-            if "spread" in merged or "liquidity" in merged:
-                return "liquidity_exit"
-            if "invalid" in merged or "thesis" in merged or "failure" in merged:
-                return "thesis_break"
-            return "full_exit"
-        if intent.decision == "REDUCE":
-            return "scale_out"
-        if intent.decision == "CANCEL":
-            return "order_cleanup"
-        if intent.decision == "REPLACE_ENTRY":
-            return "order_reprice"
-        return ""
 
     def _build_policy_decision_result(self, decision_payload: dict, input_hash: str, model_name: str):
         metadata = dict(decision_payload.get("metadata") or {})
@@ -289,19 +227,6 @@ class TradingBootstrapMixin:
             usage_metadata={"skipped": True, "policy_source": metadata.get("policy_source") or model_name, **metadata},
         )
 
-    def _resolve_bundle_policy_config(self, bundle_summary: dict, domain: str) -> dict:
-        policy_key_field = {
-            "alpha_1h": "alpha_policy_key",
-            "position_15m": "position_policy_key",
-            "safety_5m": "safety_policy_key",
-            "execution_5m": "execution_policy_key",
-        }.get(domain, "")
-        policy_key = str((bundle_summary or {}).get(policy_key_field) or "").strip()
-        if not policy_key or not hasattr(self.state_store, "get_policy_registry_entry"):
-            return {}
-        entry = self.state_store.get_policy_registry_entry(policy_key)
-        return entry.get("config") or {}
-
     def _prepare_decision_market_snapshots(
         self,
         account_state,
@@ -316,13 +241,16 @@ class TradingBootstrapMixin:
             "allowed_symbols": sorted(decision_market_snapshots.keys()),
             "blocked_symbols": {},
         }
+        if loop_mode == "5m":
+            return self._sanitize_base_loop_market_context(decision_market_snapshots), alpha_summary
+        if loop_mode != "1h":
+            return decision_market_snapshots, alpha_summary
         if (
-            loop_mode != "1h"
-            or self._has_live_positions(account_state)
+            self._has_live_positions(account_state)
             or self._has_live_open_orders(account_state)
             or not decision_market_snapshots
         ):
-            return decision_market_snapshots, alpha_summary
+            return self._sanitize_base_loop_market_context(decision_market_snapshots), alpha_summary
         filtered_snapshots, blocked_symbols = self.alpha_policy_engine.filter_market_snapshots(
             decision_market_snapshots,
             policy_override=alpha_policy_override,
@@ -333,7 +261,37 @@ class TradingBootstrapMixin:
             "allowed_symbols": sorted(filtered_snapshots.keys()),
             "blocked_symbols": dict(blocked_symbols or {}),
         }
-        return filtered_snapshots, alpha_summary
+        return self._sanitize_base_loop_market_context(filtered_snapshots), alpha_summary
+
+    def _sanitize_base_loop_market_context(self, market_snapshots):
+        stripped = {}
+        for symbol, snapshot in (market_snapshots or {}).items():
+            if snapshot is None or not hasattr(snapshot, "model_copy"):
+                stripped[symbol] = snapshot
+                continue
+            regime = getattr(snapshot, "regime", None)
+            stripped_regime = regime
+            if regime is not None and hasattr(regime, "model_copy"):
+                stripped_regime = regime.model_copy(
+                    update={
+                        "fast_move_signal_active": False,
+                        "volume_surge_signal_active": False,
+                        "range_break_signal_active": False,
+                    }
+                )
+            stripped[symbol] = snapshot.model_copy(
+                update={
+                    "fast_move_signal_active": False,
+                    "volume_surge_signal_active": False,
+                    "range_break_signal_active": False,
+                    "trigger_reasons": list(getattr(snapshot, "risk_trigger_reasons", []) or []),
+                    "regime": stripped_regime,
+                }
+            )
+        return stripped
+
+    def _sanitize_safety_loop_market_context(self, market_snapshots):
+        return self._sanitize_base_loop_market_context(market_snapshots)
 
     def _extract_entry_symbols(self, intent) -> list[str]:
         if getattr(intent, "decision", "") == "REPLACE_ENTRY":
@@ -355,6 +313,8 @@ class TradingBootstrapMixin:
         account_state,
         market_snapshots,
         risk_mode: str,
+        is_guarded_attention: bool,
+        is_safety_mode: bool,
         symbol_journal_entries: list[dict],
         regime_key: str = "",
     ):
@@ -412,6 +372,8 @@ class TradingBootstrapMixin:
                         "domain": "position_15m",
                         "symbol": symbol or None,
                         "loop_mode": loop_mode,
+                        "guarded_attention": bool(is_guarded_attention),
+                        "safety_mode": bool(is_safety_mode),
                         "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
                         "divergence_type": divergence_type,
                         "payload": {
@@ -475,6 +437,8 @@ class TradingBootstrapMixin:
                         "domain": "safety_5m",
                         "symbol": symbol or None,
                         "loop_mode": loop_mode,
+                        "guarded_attention": bool(is_guarded_attention),
+                        "safety_mode": bool(is_safety_mode),
                         "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
                         "divergence_type": divergence_type,
                         "payload": {
@@ -492,58 +456,6 @@ class TradingBootstrapMixin:
                         },
                     }
                 )
-        if loop_mode == "1h":
-            candidates = self.state_store.get_candidate_policy_versions(
-                domain="alpha_1h",
-                regime_key=regime_key or None,
-                statuses=["candidate", "shadow"],
-                limit=5,
-            )
-            if not candidates and regime_key:
-                candidates = self.state_store.get_candidate_policy_versions(
-                    domain="alpha_1h",
-                    statuses=["candidate", "shadow"],
-                    limit=5,
-                )
-            entry_symbols = self._extract_entry_symbols(live_intent)
-            live_orders = [
-                order.model_dump() if hasattr(order, "model_dump") else dict(order)
-                for order in (live_intent.orders or [])
-            ]
-            for candidate in candidates:
-                policy_config = candidate.get("config") or {}
-                for symbol in entry_symbols:
-                    snapshot = (market_snapshots or {}).get(symbol)
-                    blocked, reasons = self.alpha_policy_engine.would_block_symbol(snapshot, policy_config)
-                    if not blocked:
-                        continue
-                    shadow_entries.append(
-                        {
-                            "audit_log_id": audit_log_id,
-                            "candidate_policy_id": candidate.get("id"),
-                            "domain": "alpha_1h",
-                            "symbol": symbol,
-                            "loop_mode": loop_mode,
-                            "trade_case_id": trade_case_by_symbol.get(symbol),
-                            "divergence_type": "entry_block",
-                            "payload": {
-                                "live_intent": {
-                                    "decision": live_intent.decision,
-                                    "orders": live_orders,
-                                    "exit_reason": getattr(live_intent, "exit_reason", None),
-                                },
-                                "shadow_intent": {
-                                    "decision": "HOLD",
-                                    "orders": [],
-                                    "blocked_reasons": reasons,
-                                    "rationale": [
-                                        f"{symbol} blocked by alpha policy candidate: {', '.join(reasons)}"
-                                    ],
-                                },
-                                "candidate_policy": candidate,
-                            },
-                        }
-                    )
         if shadow_entries and hasattr(self.state_store, "save_shadow_decisions"):
             self.state_store.save_shadow_decisions(shadow_entries)
 

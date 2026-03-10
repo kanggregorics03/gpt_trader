@@ -55,6 +55,7 @@ class TradingOrchestrator(
         "run_minute_local": 0,
         "replay_timeout_seconds": 1800,
         "memory_timeout_seconds": 1800,
+        "deepseek_memory_timeout_seconds": 5400,
     }
     DEFAULT_ADAPTIVE_LOOP = {
         "base_loop_minutes": 60,

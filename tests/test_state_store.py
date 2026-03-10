@@ -115,6 +115,67 @@ class TestStateStore(unittest.TestCase):
         self.assertTrue(snapshot["learning_liveness"]["reranker_ready"]["recent_journal"])
         self.assertTrue(snapshot["learning_liveness"]["shadow_dataset_ready"])
 
+    def test_execution_policy_evaluations_and_shadow_decisions_store_safety_mode(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "EXIT", "orders": [], "confidence": 0.9},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshot": {}},
+        )
+        self.store.save_execution_policy_evaluations(
+            audit_id,
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "loop_mode": "5m",
+                    "risk_mode": "guarded",
+                    "action_type": "reduce",
+                    "entry_style": None,
+                    "urgency_bucket": "high",
+                    "liquidity_bucket": "poor",
+                    "decision": "EXIT",
+                    "order_action": "SELL",
+                    "order_type": "MARKET",
+                    "execution_profile": "market_urgent",
+                    "reduce_only": True,
+                    "guarded_attention": True,
+                    "safety_mode": True,
+                    "status": "filled",
+                    "outcome_label": "risk_exit",
+                    "payload": {"note": "safety exit"},
+                }
+            ],
+        )
+        self.store.save_shadow_decisions(
+            [
+                {
+                    "audit_log_id": audit_id,
+                    "candidate_policy_id": 7,
+                    "domain": "safety_5m",
+                    "symbol": "BTCUSDT",
+                    "loop_mode": "5m",
+                    "guarded_attention": False,
+                    "safety_mode": True,
+                    "trade_case_id": "case-1",
+                    "divergence_type": "risk_exit",
+                    "payload": {"note": "safety exit"},
+                }
+            ]
+        )
+
+        eval_rows = self.store.get_execution_policy_evaluations_since(datetime(1970, 1, 1))
+        shadow_rows = self.store.get_shadow_decisions_since(datetime(1970, 1, 1))
+
+        self.assertEqual(eval_rows[0]["safety_mode"], 1)
+        self.assertEqual(eval_rows[0]["guarded_attention"], 1)
+        self.assertEqual(eval_rows[0]["outcome_label"], "risk_exit")
+        self.assertEqual(shadow_rows[0]["safety_mode"], 1)
+        self.assertEqual(shadow_rows[0]["guarded_attention"], 0)
+        self.assertEqual(shadow_rows[0]["payload"]["note"], "safety exit")
+
     def test_monitoring_snapshot_summarizes_semantic_validation_issues(self):
         self.store.save_audit(
             account={"total_balance": 1000},
@@ -285,7 +346,7 @@ class TestStateStore(unittest.TestCase):
             risk_ok=True,
             reason="Approved",
             receipts=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
         )
         self.store.save_retrieval_evaluations(
             audit_id,
@@ -303,7 +364,7 @@ class TestStateStore(unittest.TestCase):
                     "final_score": 1.42,
                     "retrieval_source": "band_index",
                     "matched_band_count": 4,
-                    "risk_mode": "trigger",
+                    "risk_mode": "guarded",
                     "payload": {"thesis_failure_reason": "execution_quality_degraded:wide_spread"},
                 }
             ],
@@ -351,7 +412,7 @@ class TestStateStore(unittest.TestCase):
             risk_ok=True,
             reason="Approved with risk advisories",
             receipts=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
         )
         self.store.save_symbol_journal_entries(
             [
@@ -360,7 +421,7 @@ class TestStateStore(unittest.TestCase):
                     "symbol": "ETHUSDT",
                     "decision": "SELL",
                     "risk_reason": "Approved with risk advisories",
-                    "risk_mode": "trigger",
+                    "risk_mode": "guarded",
                     "risk_approved": True,
                     "triggered": True,
                     "risk_triggered": False,
@@ -438,7 +499,7 @@ class TestStateStore(unittest.TestCase):
             risk_ok=False,
             reason="Entry blocked",
             receipts=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
             execution_summary={
                 "evidence_quality": {
                     "factor": 0.7,
@@ -696,10 +757,9 @@ class TestStateStore(unittest.TestCase):
                 "account_state": {},
                 "market_snapshots": {
                     "ETHUSDT": {
-                        "is_opportunity_trigger": True,
-                        "volume_surge_trigger_active": True,
-                        "range_break_trigger_active": True,
-                        "opportunity_trigger_reasons": ["volume_surge_15m", "range_break_1h"],
+                        "fast_move_signal_active": True,
+                        "volume_surge_signal_active": True,
+                        "range_break_signal_active": True,
                     }
                 },
             },
@@ -897,9 +957,9 @@ class TestStateStore(unittest.TestCase):
                     "distance_to_invalid_level": 1.1,
                     "trigger_active": True,
                     "risk_trigger_active": False,
-                    "volume_surge_trigger_active": True,
-                    "fast_move_trigger_active": False,
-                    "range_break_trigger_active": True,
+                    "volume_surge_signal_active": True,
+                    "fast_move_signal_active": False,
+                    "range_break_signal_active": True,
                     "trend_1h": "UP",
                     "payload": {"trend_1h": "UP"},
                 },
@@ -918,9 +978,9 @@ class TestStateStore(unittest.TestCase):
                     "distance_to_invalid_level": 1.0,
                     "trigger_active": True,
                     "risk_trigger_active": False,
-                    "volume_surge_trigger_active": True,
-                    "fast_move_trigger_active": False,
-                    "range_break_trigger_active": True,
+                    "volume_surge_signal_active": True,
+                    "fast_move_signal_active": False,
+                    "range_break_signal_active": True,
                     "trend_1h": "UP",
                     "payload": {"trend_1h": "UP"},
                 },
@@ -941,7 +1001,7 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["payload"]["trend_1h"], "UP")
         self.assertEqual(rows[0]["depth_notional_top5"], 45000.0)
-        self.assertTrue(rows[0]["volume_surge_trigger_active"])
+        self.assertTrue(rows[0]["volume_surge_signal_active"])
         self.assertEqual(len(path_rows), 2)
         self.assertEqual(path_rows[0]["current_price"], 100.0)
         self.assertEqual(path_rows[1]["mid_price"], 101.95)
@@ -1395,13 +1455,13 @@ class TestStateStore(unittest.TestCase):
     def test_symbol_trigger_state_round_trip(self):
         self.store.save_symbol_trigger_state(
             "BTCUSDT",
-            {"fast_price_move_15m_active": True},
+            {"fast_move_signal_15m_active": True},
         )
 
         state = self.store.get_symbol_trigger_state("BTCUSDT")
         missing = self.store.get_symbol_trigger_state("ETHUSDT")
 
-        self.assertEqual(state["fast_price_move_15m_active"], True)
+        self.assertEqual(state["fast_move_signal_15m_active"], True)
         self.assertEqual(missing, {})
 
     def test_decision_cache_round_trip(self):
@@ -1538,7 +1598,7 @@ class TestStateStore(unittest.TestCase):
             risk_ok=True,
             reason="Approved with risk advisories: BTCUSDT: wide_spread=12.30bps",
             receipts=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
         )
         self.store.save_symbol_journal_entries(
             [
@@ -1547,7 +1607,7 @@ class TestStateStore(unittest.TestCase):
                     "symbol": "BTCUSDT",
                     "decision": "BUY",
                     "risk_reason": "Approved with risk advisories: BTCUSDT: wide_spread=12.30bps",
-                    "risk_mode": "trigger",
+                    "risk_mode": "guarded",
                     "risk_approved": True,
                     "triggered": True,
                     "risk_triggered": True,
@@ -1571,7 +1631,7 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["audit_log_id"], audit_id)
         self.assertEqual(rows[0]["symbol"], "BTCUSDT")
-        self.assertEqual(rows[0]["risk_mode"], "trigger")
+        self.assertEqual(rows[0]["risk_mode"], "guarded")
         self.assertEqual(rows[0]["triggered"], 1)
         self.assertEqual(rows[0]["risk_triggered"], 1)
         self.assertEqual(rows[0]["evidence_signals"], ["volume_ratio@15m", "spread_bps@microstructure"])
@@ -1702,42 +1762,16 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(candidates[0]["config"], {})
         self.assertEqual(candidates[0]["metrics"]["retirement_reason"], "contract_cutover_20260310")
 
-    def test_policy_bundle_round_trip(self):
-        self.store.upsert_policy_bundle(
-            {
-                "bundle_key": "bundle:aligned_up|high",
-                "regime_key": "aligned_up|high",
-                "status": "active",
-                "alpha_policy_key": "champion:alpha_1h:aligned_up|high",
-                "position_policy_key": "champion:position_15m:aligned_up|high",
-                "safety_policy_key": "champion:safety_5m:aligned_up|high",
-                "execution_policy_key": "champion:execution_5m:aligned_up|high",
-                "metrics": {"score": 0.9},
-            }
-        )
-        bundle = self.store.get_active_policy_bundle(regime_key="aligned_up|high")
-        self.store.save_bundle_evaluation(
-            {
-                "bundle_key": "bundle:aligned_up|high",
-                "evaluation_scope": "bundle_batch",
-                "sample_count": 3,
-                "score": 0.9,
-                "metrics": {"component_scores": {"alpha_1h": 0.8}},
-            }
-        )
-        evaluations = self.store.get_bundle_evaluations("bundle:aligned_up|high")
-        self.assertEqual(bundle["bundle_key"], "bundle:aligned_up|high")
-        self.assertEqual(bundle["safety_policy_key"], "champion:safety_5m:aligned_up|high")
-        self.assertEqual(bundle["metrics"]["score"], 0.9)
-        self.assertEqual(evaluations[0]["sample_count"], 3)
-
     def test_trade_case_round_trip_and_query(self):
         self.store.upsert_trade_case(
             {
                 "trade_case_id": "BTCUSDT-case-5",
                 "symbol": "BTCUSDT",
                 "status": "closed",
-                "risk_mode": "trigger",
+                "loop_mode": "5m",
+                "risk_mode": "guarded",
+                "guarded_attention": False,
+                "safety_mode": True,
                 "opened_at": "2026-03-07 13:00:00",
                 "closed_at": "2026-03-07 13:20:00",
                 "entry_audit_log_id": 15,
@@ -1799,6 +1833,9 @@ class TestStateStore(unittest.TestCase):
 
         self.assertEqual(row["symbol"], "BTCUSDT")
         self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["loop_mode"], "5m")
+        self.assertEqual(row["guarded_attention"], 0)
+        self.assertEqual(row["safety_mode"], 1)
         self.assertEqual(row["evidence_signals"], ["volume_ratio@15m"])
         self.assertEqual(row["feature_vector"], [30000.0, 120.0, 240.0])
         self.assertEqual(row["payload"]["regime_tags"], ["trend:aligned_up"])
@@ -1808,8 +1845,13 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(len(bounded_snapshots), 1)
         self.assertEqual(snapshots[0]["payload"]["case_status"], "active")
         self.assertEqual(vector_candidates[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertEqual(vector_candidates[0]["loop_mode"], "5m")
+        self.assertEqual(vector_candidates[0]["guarded_attention"], 0)
+        self.assertEqual(vector_candidates[0]["safety_mode"], 1)
         self.assertEqual(vector_candidates[0]["feature_vector"], [30000.0, 120.0, 240.0])
         self.assertEqual(band_candidates[0]["trade_case_id"], "BTCUSDT-case-5")
+        self.assertEqual(band_candidates[0]["loop_mode"], "5m")
+        self.assertEqual(band_candidates[0]["safety_mode"], 1)
         self.assertGreaterEqual(band_candidates[0]["matched_band_count"], 1)
 
     def test_symbol_journal_indexes_exist(self):

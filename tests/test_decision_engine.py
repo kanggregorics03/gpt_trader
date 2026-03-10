@@ -268,7 +268,8 @@ class TestDecisionEngine(unittest.TestCase):
         class DummyResponse:
             text = (
                 '{"decision":"hold","orders":{"symbol":"ethusdt","action":"buy","order_type":"market",'
-                '"quantity":"0.01","reduce_only":"false"},"rationale":"ETHUSDT shows mixed signals and '
+                '"quantity":"0.01","reduce_only":"false","entry_style":"immediate"},'
+                '"rationale":"ETHUSDT shows mixed signals and '
                 'recent losses warrant caution.","rationale_items":[{"summary":"Action list leaked into '
                 'evidence","why_it_matters":"Schema drift should not force a HOLD fallback.",'
                 '"trade_implication":"Prefer hold while keeping the payload machine-readable.","evidence":'
@@ -508,13 +509,13 @@ class TestDecisionEngine(unittest.TestCase):
         engine = DecisionEngine.__new__(DecisionEngine)
         engine.provider_name = "gemini"
 
-        default_model, trigger_model = engine._resolve_models(
+        default_model, guarded_attention_model = engine._resolve_models(
             default_model="gemini-2.5-flash",
-            trigger_model="gemini-2.5-pro",
+            guarded_attention_model="gemini-2.5-pro",
         )
 
         self.assertEqual(default_model, "gemini-2.5-flash")
-        self.assertEqual(trigger_model, "gemini-2.5-pro")
+        self.assertEqual(guarded_attention_model, "gemini-2.5-pro")
 
     def test_resolve_models_uses_environment_and_legacy_fallback(self):
         engine = DecisionEngine.__new__(DecisionEngine)
@@ -524,31 +525,31 @@ class TestDecisionEngine(unittest.TestCase):
             "os.environ",
             {
                 "AI_DEFAULT_MODEL": "",
-                "AI_TRIGGER_MODEL": "",
+                "AI_GUARDED_ATTENTION_MODEL": "",
                 "GEMINI_DEFAULT_MODEL": "gemini-2.5-flash",
-                "GEMINI_TRIGGER_MODEL": "gemini-2.5-pro",
+                "GEMINI_GUARDED_ATTENTION_MODEL": "gemini-2.5-pro",
                 "GEMINI_MODEL": "gemini-legacy-model",
             },
             clear=False,
         ):
-            default_model, trigger_model = engine._resolve_models()
+            default_model, guarded_attention_model = engine._resolve_models()
             self.assertEqual(default_model, "gemini-2.5-flash")
-            self.assertEqual(trigger_model, "gemini-2.5-pro")
+            self.assertEqual(guarded_attention_model, "gemini-2.5-pro")
 
         with patch.dict(
             "os.environ",
             {
                 "AI_DEFAULT_MODEL": "",
-                "AI_TRIGGER_MODEL": "",
+                "AI_GUARDED_ATTENTION_MODEL": "",
                 "GEMINI_DEFAULT_MODEL": "",
-                "GEMINI_TRIGGER_MODEL": "",
+                "GEMINI_GUARDED_ATTENTION_MODEL": "",
                 "GEMINI_MODEL": "gemini-legacy-model",
             },
             clear=False,
         ):
-            default_model, trigger_model = engine._resolve_models()
+            default_model, guarded_attention_model = engine._resolve_models()
             self.assertEqual(default_model, "gemini-legacy-model")
-            self.assertEqual(trigger_model, "gemini-legacy-model")
+            self.assertEqual(guarded_attention_model, "gemini-legacy-model")
 
     def test_resolve_models_supports_openai_style_envs(self):
         engine = DecisionEngine.__new__(DecisionEngine)
@@ -558,15 +559,15 @@ class TestDecisionEngine(unittest.TestCase):
             "os.environ",
             {
                 "AI_DEFAULT_MODEL": "",
-                "AI_TRIGGER_MODEL": "",
+                "AI_GUARDED_ATTENTION_MODEL": "",
                 "OPENAI_DEFAULT_MODEL": "gpt-4.1-mini",
-                "OPENAI_TRIGGER_MODEL": "gpt-4.1",
+                "OPENAI_GUARDED_ATTENTION_MODEL": "gpt-4.1",
             },
             clear=False,
         ):
-            default_model, trigger_model = engine._resolve_models()
+            default_model, guarded_attention_model = engine._resolve_models()
             self.assertEqual(default_model, "gpt-4.1-mini")
-            self.assertEqual(trigger_model, "gpt-4.1")
+            self.assertEqual(guarded_attention_model, "gpt-4.1")
 
     def test_extract_usage_metadata_from_response_object(self):
         class Usage:
@@ -602,7 +603,7 @@ class TestDecisionEngine(unittest.TestCase):
                 recent_volume_surge=True,
                 volume_ratio_15m=2.1,
                 volume_surge_15m_now=True,
-                volume_surge_trigger_active=True,
+                volume_surge_signal_active=True,
                 oi_change_15m=3.4,
                 spread_percentile_1h=42.0,
                 distance_to_invalid_level=0.9,
@@ -614,6 +615,7 @@ class TestDecisionEngine(unittest.TestCase):
                 consecutive_losses=0,
                 cooldown_active=False,
             ),
+            loop_mode="15m",
             long_term_memory=[],
         )
 
@@ -621,16 +623,89 @@ class TestDecisionEngine(unittest.TestCase):
 
         self.assertIn("market_snapshots:", prompt)
         self.assertNotIn("market_context:", prompt)
-        self.assertIn("Prefer derived fields such as change, percentile, distance, and trigger-state", prompt)
+        self.assertIn("Prefer derived fields such as change, percentile, distance, and stabilized trigger state", prompt)
         self.assertIn("volume_surge_15m_now is the immediate current-bar condition", prompt)
         self.assertIn('"volume_surge_15m_now":true', prompt)
         self.assertIn('"spread_percentile_1h":42.0', prompt)
         self.assertIn("market_snapshots.BTCUSDT.oi_change_15m", prompt)
 
+    def test_prompt_omits_short_horizon_signal_triggers_in_1h_loop(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        request = DecisionRequest(
+            policy_summary="risk: normal",
+            account_state=AccountState(total_balance=1000.0, available_balance=900.0),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+                volume_ratio_15m=2.1,
+                volume_surge_15m_now=True,
+                fast_move_signal_active=True,
+                volume_surge_signal_active=True,
+                range_break_signal_active=True,
+                distance_to_1h_breakout_level=0.5,
+                oi_change_15m=3.4,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            loop_mode="1h",
+            long_term_memory=[],
+        )
+
+        prompt = engine._create_prompt(request)
+
+        self.assertNotIn('"fast_move_signal_active":true', prompt)
+        self.assertNotIn('"volume_surge_signal_active":true', prompt)
+        self.assertNotIn('"range_break_signal_active":true', prompt)
+        self.assertIn('"distance_to_1h_breakout_level":0.5', prompt)
+
+    def test_prompt_includes_compact_entry_headroom(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+        request = DecisionRequest(
+            policy_summary="risk: guarded",
+            account_state=AccountState(total_balance=1000.0, available_balance=900.0),
+            market_snapshot=MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=-0.8,
+                drawdown_active=False,
+                consecutive_losses=1,
+                cooldown_active=False,
+            ),
+            entry_headroom={
+                "entries_allowed": False,
+                "blocked_reasons": ["mode_cap_zero"],
+                "entry_cap_remaining_notional": 0.0,
+                "leverage_remaining_notional": 1200.0,
+            },
+            long_term_memory=[],
+        )
+
+        prompt = engine._create_prompt(request)
+
+        self.assertIn("entry_headroom:", prompt)
+        self.assertIn('"entries_allowed":false', prompt)
+        self.assertIn('"blocked_reasons":["mode_cap_zero"]', prompt)
+
     def test_prompt_uses_compact_market_and_memory_payloads(self):
         engine = DecisionEngine.__new__(DecisionEngine)
         request = DecisionRequest(
-            policy_summary="risk: trigger",
+            policy_summary="risk: guarded",
             account_state=AccountState(
                 total_balance=1000.0,
                 available_balance=900.0,
@@ -644,9 +719,9 @@ class TestDecisionEngine(unittest.TestCase):
                 recent_volume_surge=True,
                 volume_ratio_15m=2.1,
                 volume_surge_15m_now=True,
-                fast_move_trigger_active=True,
-                volume_surge_trigger_active=True,
-                range_break_trigger_active=True,
+                fast_move_signal_active=True,
+                volume_surge_signal_active=True,
+                range_break_signal_active=True,
                 oi_change_15m=3.4,
                 spread_percentile_1h=42.0,
                 distance_to_invalid_level=0.9,
@@ -724,9 +799,66 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn('"entry_size_cap":{"adjusted":true,"effective_cap_pct":20.0,"base_cap_pct":30.0}', prompt)
         self.assertIn('"ignore_when":["Ignore when retest holds with strong follow-through.","Ignore when trend is flat."]', prompt)
         self.assertIn("Do not follow their majority vote mechanically", prompt)
+        self.assertIn("Use retest only when there is explicit structure evidence", prompt)
+        self.assertIn("Use value only for a passive retrace inside an already acceptable directional context", prompt)
         self.assertNotIn("previous_values", prompt)
         self.assertNotIn("candidate_lessons", prompt)
         self.assertNotIn("long detail", prompt)
+
+    def test_normalize_trade_intent_payload_rejects_invalid_semantics(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+
+        payload, issues = engine._normalize_trade_intent_payload(
+            {
+                "decision": "ENTER_NOW",
+                "orders": [
+                    {
+                        "symbol": "",
+                        "action": "LONG",
+                        "order_type": "PASSIVE",
+                        "entry_style": "pullback",
+                        "quantity": 0.1,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(payload["orders"], [])
+        self.assertIn("decision is invalid", issues)
+        self.assertIn("orders[0].action is invalid", issues)
+
+    def test_normalize_trade_intent_payload_drops_ai_supplied_execution_fields(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+
+        payload, issues = engine._normalize_trade_intent_payload(
+            {
+                "decision": "BUY",
+                "orders": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "action": "BUY",
+                        "order_type": "LIMIT",
+                        "entry_style": "value",
+                        "quantity": 0.1,
+                        "execution_profile": "limit_passive",
+                        "urgency_score": 0.9,
+                        "max_slippage_bps": 99,
+                        "time_in_force": "IOC",
+                        "post_only": True,
+                        "limit_offset_bps": 12,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(payload["orders"][0]["symbol"], "BTCUSDT")
+        self.assertNotIn("execution_profile", payload["orders"][0])
+        self.assertNotIn("urgency_score", payload["orders"][0])
+        self.assertNotIn("max_slippage_bps", payload["orders"][0])
+        self.assertNotIn("time_in_force", payload["orders"][0])
+        self.assertNotIn("post_only", payload["orders"][0])
+        self.assertNotIn("limit_offset_bps", payload["orders"][0])
 
 
 if __name__ == "__main__":

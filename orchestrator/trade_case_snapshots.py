@@ -52,9 +52,6 @@ class TradingTradeCaseSnapshotMixin:
                     "payload": {
                         "case_status": case_entry.get("case_status") or "active",
                         "holding_minutes": case_entry.get("holding_minutes"),
-                        "opportunity_trigger_reasons": (
-                            getattr(snapshot, "opportunity_trigger_reasons", []) if snapshot is not None else []
-                        ),
                         "risk_trigger_reasons": (
                             getattr(snapshot, "risk_trigger_reasons", []) if snapshot is not None else []
                         ),

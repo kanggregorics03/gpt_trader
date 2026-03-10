@@ -25,7 +25,8 @@ class TradingCycleExecutionMixin(
             log.warning(f"Skipping {loop_type}: loop lock is already held by another worker.")
             return {
                 "loop_type": loop_type,
-                "trigger_active": self.active_loop_mode == "5m",
+                "guarded_attention_active": self.active_loop_mode == "5m",
+                "safety_trigger_active": self.active_loop_mode == "5m",
                 "has_positions": False,
                 "has_open_orders": False,
                 "has_unknown_orders": False,

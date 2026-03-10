@@ -9,16 +9,6 @@ class AlphaPolicyEngine:
         self.state_store = state_store
 
     def get_active_policy(self, regime_key: Optional[str] = None) -> Dict[str, Any]:
-        if self.state_store is None or not hasattr(self.state_store, "get_policy_registry_entry"):
-            return {"config": dict(self.policy)} if self.policy else {}
-        registry = {}
-        scoped_fetch = getattr(self.state_store, "get_policy_registry_entry_for_regime", None)
-        if callable(scoped_fetch):
-            registry = scoped_fetch("alpha_1h", regime_key=regime_key)
-        if not registry:
-            registry = self.state_store.get_policy_registry_entry("champion:alpha_1h")
-        if registry:
-            return registry
         return {"config": dict(self.policy)} if self.policy else {}
 
     def filter_market_snapshots(

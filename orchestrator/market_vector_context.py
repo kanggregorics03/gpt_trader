@@ -5,8 +5,12 @@ class TradingMarketVectorContextMixin:
         risk_trigger_reasons = set()
         regime_tags = set()
         for symbol, snapshot in (market_snapshots or {}).items():
-            for reason in getattr(snapshot, "opportunity_trigger_reasons", []) or []:
-                trigger_reasons.add(f"{symbol}:{reason}")
+            if bool(getattr(snapshot, "fast_move_signal_active", False)):
+                trigger_reasons.add(f"{symbol}:fast_price_move_15m")
+            if bool(getattr(snapshot, "volume_surge_signal_active", False)):
+                trigger_reasons.add(f"{symbol}:volume_surge_15m")
+            if bool(getattr(snapshot, "range_break_signal_active", False)):
+                trigger_reasons.add(f"{symbol}:range_break_1h")
             for reason in getattr(snapshot, "risk_trigger_reasons", []) or []:
                 risk_trigger_reasons.add(f"{symbol}:{reason}")
             trend_alignment = str(getattr(snapshot.regime, "trend_alignment", "") or "").strip()
@@ -36,31 +40,6 @@ class TradingMarketVectorContextMixin:
         trend = max(trend_counts.items(), key=lambda item: (item[1], item[0]))[0] if trend_counts else "mixed"
         volatility = max(volatility_counts.items(), key=lambda item: (item[1], item[0]))[0] if volatility_counts else "unknown"
         return f"{trend}|{volatility}"
-
-    def _build_active_policy_bundle_summary(self, regime_key: str) -> dict:
-        if not hasattr(self.state_store, "get_active_policy_bundle"):
-            return {}
-        bundle = self.state_store.get_active_policy_bundle(regime_key=regime_key)
-        if not bundle:
-            return {}
-        return {
-            "bundle_key": bundle.get("bundle_key"),
-            "regime_key": bundle.get("regime_key"),
-            "alpha_policy_key": bundle.get("alpha_policy_key"),
-            "position_policy_key": bundle.get("position_policy_key"),
-            "safety_policy_key": bundle.get("safety_policy_key"),
-            "execution_policy_key": bundle.get("execution_policy_key"),
-            "metrics": bundle.get("metrics") or {},
-        }
-
-    def _build_regime_drift_summary(self, regime_key: str, bundle_summary: dict) -> dict:
-        bundle_regime_key = str((bundle_summary or {}).get("regime_key") or "").strip()
-        drift_detected = bool(bundle_regime_key and regime_key and bundle_regime_key != regime_key)
-        return {
-            "current_regime_key": regime_key,
-            "bundle_regime_key": bundle_regime_key,
-            "drift_detected": drift_detected,
-        }
 
     def _serialize_market_snapshots(self, market_snapshots) -> dict[str, dict]:
         serialized = {}

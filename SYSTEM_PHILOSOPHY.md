@@ -8,7 +8,7 @@
 
 - 리스크 제약 안에서 행동하는 단일 심볼 트레이딩 시스템이다.
 - LLM은 주문 실행 권한을 가진 주체가 아니라, 구조화된 추천을 만드는 decision layer다.
-- 실제 시스템 학습은 모델 파인튜닝보다 `retrieval + memory + replay + promotion` 구조를 통해 이뤄진다.
+- 실제 시스템 학습은 모델 파인튜닝보다 `retrieval + memory + replay + offline candidate evaluation` 구조를 통해 이뤄진다.
 
 즉 목표는 "가장 공격적으로 많이 맞히는 모델"이 아니라, "제약을 지키면서 반복 가능한 의사결정을 개선하는 운영 시스템"이다.
 
@@ -89,14 +89,14 @@
 
 1. `audit_logs`, `journal`, `trade_cases`, `replay_runs`가 운영 사실을 축적한다.
 2. `long_term_memory`와 retrieval artifact가 운영 결과를 바탕으로 갱신된다.
-3. candidate policy / bundle / shadow decision이 실제 champion 옆에서 평가된다.
-4. holdout, replay, liveness 조건을 통과한 경우에만 promotion이 일어난다.
+3. candidate policy와 shadow decision이 offline surface에서 평가된다.
+4. holdout, replay, liveness 조건은 live 자동 반영이 아니라 review 우선순위를 정하는 근거로만 쓴다.
 
 즉 "좋은 답변을 한 번 받는 것"이 아니라 "운영 결과를 반영해 보조 구조를 천천히 진화시키는 것"이 학습이다.
 
 여기서 중요한 구분이 하나 더 있다.
 
-- `candidate policy / promotion`은 실행 규칙을 직접 바꾸는 경로다.
+- `candidate policy / promotion`은 현재 live 실행 규칙을 직접 바꾸지 않는다.
 - `long_term_memory`는 실행 규칙을 직접 바꾸지 않고, 이후 판단과 lesson synthesis의 보조 근거를 천천히 바꾸는 경로다.
 
 따라서 `15m/5m` 규칙을 수정하면 정책 진화 계층은 즉시 영향을 받고,
@@ -104,9 +104,8 @@
 
 운영 계약이 크게 바뀌는 cutover도 같은 원칙으로 다룬다.
 
-- `audit_logs`, `journal`, `trade_cases`, `replay_runs`, `shadow_decisions` 같은 사실 이력은 지우지 않는다.
-- 대신 champion/candidate/memory 같은 학습 표면만 migrate 또는 retire 한다.
-- `2026-03-10` management contract cutover 이후 batch learning은 기본적으로 해당 날짜 이후 case만 promotion 근거로 사용한다.
+- 운영 계약이 크게 바뀌면 기존 학습 표면을 억지로 호환시키지 않는다.
+- 필요하면 `data/gpt_trader.db`와 `data/learning/`을 비우고 새 사례를 다시 쌓는다.
 
 여기서 replay 자동화는 균등 샘플링이 아니라 운영적으로 의미 있는 audit를 더 자주 본다는 원칙을 따른다.
 
@@ -122,7 +121,7 @@
 - 먼저 high-quality dataset을 만든다.
 - shadow dataset과 holdout 요약을 저장한다.
 - retrieval reranker, calibrator, shadow policy 같은 주변부부터 학습시킨다.
-- 실전 champion을 교체하기 전에 shadow와 replay에서 먼저 본다.
+- live contract를 바꾸기 전에 shadow와 replay에서 먼저 본다.
 
 이 원칙은 drift와 설명 불가능성을 줄이기 위한 것이다.
 
@@ -142,7 +141,7 @@
 좋은 liveness는 단순 "replay run 개수"가 아니라, 중요한 후보군을 계속 커버하고 있는 상태를 뜻한다.
 그래서 replay batch는 후보량이 많아지면 처리 수를 가변적으로 늘리고, `HOLD`도 별도 quota로 보장한다.
 
-이 값이 stale이면 자동 승격은 멈춰야 한다. stale 상태에서의 promotion은 "학습된 시스템"이 아니라 "학습이 멈춘 시스템의 착시"다.
+이 값이 stale이면 자동 반영은 멈춰야 한다. stale 상태의 candidate score는 "학습된 시스템"이 아니라 "학습이 멈춘 시스템의 착시"에 가깝다.
 
 ## 8. 좋은 상태의 정의
 
@@ -152,7 +151,7 @@
 - retrieval이 최근성만이 아니라 반례와 hold 품질을 함께 본다.
 - memory가 lifecycle 기준으로 살아 있고 recent cap에 묻히지 않는다.
 - replay와 batch가 꾸준히 돈다.
-- stale learning이면 promotion이 자동 차단된다.
+- stale learning이면 live 자동 반영은 차단된다.
 - 성과 평가는 단순 PnL이 아니라 `hold_opportunity_cost`, `false_entry_cost`, `confidence_alignment`, `retrieval_counterfactual`까지 같이 본다.
 
 ## 9. 관련 파일

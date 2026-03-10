@@ -19,7 +19,7 @@ class DummyStore:
 
 class TestAlphaPolicyEngine(unittest.TestCase):
     def test_filter_market_snapshots_blocks_symbols_outside_thresholds(self):
-        engine = AlphaPolicyEngine(state_store=DummyStore({"min_volume_ratio_15m": 1.3}))
+        engine = AlphaPolicyEngine(policy={"alpha_policy": {"min_volume_ratio_15m": 1.3}}, state_store=DummyStore({"min_volume_ratio_15m": 1.3}))
         snapshots = {
             "BTCUSDT": MarketSnapshot(
                 symbol="BTCUSDT",

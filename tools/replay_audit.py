@@ -138,9 +138,9 @@ def _extract_trigger_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     active_flags = [
         flag
         for flag, enabled in (
-            ("volume_surge", bool(snapshot.get("volume_surge_trigger_active"))),
-            ("fast_move", bool(snapshot.get("fast_move_trigger_active"))),
-            ("range_break", bool(snapshot.get("range_break_trigger_active"))),
+            ("volume_surge", bool(snapshot.get("volume_surge_signal_active"))),
+            ("fast_move", bool(snapshot.get("fast_move_signal_active"))),
+            ("range_break", bool(snapshot.get("range_break_signal_active"))),
             ("opportunity", bool(snapshot.get("is_opportunity_trigger"))),
             ("risk", bool(snapshot.get("is_risk_trigger"))),
         )
@@ -260,7 +260,7 @@ def _infer_baseline_side(snapshot: Dict[str, Any]) -> str:
         long_score += 1.0
     if "DOWN" in trend_1h:
         short_score += 1.0
-    if bool(snapshot.get("range_break_trigger_active")):
+    if bool(snapshot.get("range_break_signal_active")):
         if "UP" in trend_1h:
             long_score += 0.8
         elif "DOWN" in trend_1h:
@@ -321,9 +321,9 @@ def build_hold_baseline_intent(audit: Dict[str, Any]) -> Dict[str, Any]:
         bool(snapshot.get(flag))
         for flag in (
             "is_opportunity_trigger",
-            "volume_surge_trigger_active",
-            "fast_move_trigger_active",
-            "range_break_trigger_active",
+            "volume_surge_signal_active",
+            "fast_move_signal_active",
+            "range_break_signal_active",
         )
     )
     if not trigger_active:
@@ -839,7 +839,7 @@ def build_replay_engine() -> DecisionEngine:
         provider=provider,
         base_url=base_url,
         default_model=replay_model or None,
-        trigger_model=replay_model or None,
+        guarded_attention_model=replay_model or None,
     )
 
 

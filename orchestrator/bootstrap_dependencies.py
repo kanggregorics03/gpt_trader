@@ -129,10 +129,10 @@ class BootstrapDependencyBuilder:
             provider=runtime_config.ai_provider,
             base_url=runtime_config.ai_base_url,
             default_model=runtime_config.ai_default_model,
-            trigger_model=runtime_config.ai_trigger_model,
+            guarded_attention_model=runtime_config.ai_guarded_attention_model,
         )
         log.info(
-            "AI routing: provider={} default={} trigger={}",
+            "AI routing: provider={} default={} guarded_attention={}",
             getattr(ai_engine, "provider_name", "unknown"),
             ai_engine.flash_model,
             ai_engine.pro_model,

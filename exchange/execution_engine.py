@@ -619,7 +619,7 @@ class ExecutionEngine:
             if abs(filled_quantity) + 1e-9 < abs(float(order.quantity)):
                 return "partial_filled"
             return "completed"
-        if status in ("open", "partially_filled", "partiallyfilled"):
+        if status in ("open", "new", "created", "partially_filled", "partiallyfilled"):
             return "partial_filled" if float(receipt.get("filled") or 0.0) > 0 else "submitted"
         return "submitted"
 

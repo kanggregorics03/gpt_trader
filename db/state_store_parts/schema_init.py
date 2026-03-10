@@ -143,7 +143,10 @@ class StateStoreSchemaInitMixin:
                     trade_case_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    loop_mode TEXT,
                     risk_mode TEXT,
+                    guarded_attention BOOLEAN DEFAULT 0,
+                    safety_mode BOOLEAN DEFAULT 0,
                     opened_at DATETIME,
                     closed_at DATETIME,
                     entry_audit_log_id INTEGER,
@@ -200,9 +203,9 @@ class StateStoreSchemaInitMixin:
                     distance_to_invalid_level REAL,
                     trigger_active BOOLEAN DEFAULT 0,
                     risk_trigger_active BOOLEAN DEFAULT 0,
-                    volume_surge_trigger_active BOOLEAN DEFAULT 0,
-                    fast_move_trigger_active BOOLEAN DEFAULT 0,
-                    range_break_trigger_active BOOLEAN DEFAULT 0,
+                    volume_surge_signal_active BOOLEAN DEFAULT 0,
+                    fast_move_signal_active BOOLEAN DEFAULT 0,
+                    range_break_signal_active BOOLEAN DEFAULT 0,
                     trend_1h TEXT,
                     payload JSON
                 );
@@ -211,7 +214,10 @@ class StateStoreSchemaInitMixin:
                     trade_case_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
                     status TEXT,
+                    loop_mode TEXT,
                     risk_mode TEXT,
+                    guarded_attention BOOLEAN DEFAULT 0,
+                    safety_mode BOOLEAN DEFAULT 0,
                     opened_at DATETIME,
                     closed_at DATETIME,
                     estimated_pnl_pct REAL,
@@ -293,6 +299,7 @@ class StateStoreSchemaInitMixin:
                     loop_mode TEXT,
                     risk_mode TEXT,
                     action_type TEXT,
+                    entry_style TEXT,
                     urgency_bucket TEXT,
                     liquidity_bucket TEXT,
                     decision TEXT,
@@ -300,7 +307,8 @@ class StateStoreSchemaInitMixin:
                     order_type TEXT,
                     execution_profile TEXT,
                     reduce_only BOOLEAN DEFAULT 0,
-                    trigger_mode BOOLEAN DEFAULT 0,
+                    guarded_attention BOOLEAN DEFAULT 0,
+                    safety_mode BOOLEAN DEFAULT 0,
                     spread_bps REAL,
                     spread_percentile_1h REAL,
                     depth_percentile_1h REAL,
@@ -316,21 +324,8 @@ class StateStoreSchemaInitMixin:
                     outcome_trade_case_id TEXT,
                     outcome_estimated_pnl_pct REAL,
                     outcome_realized_pnl REAL,
+                    outcome_label TEXT,
                     payload JSON
-                );
-
-                CREATE TABLE IF NOT EXISTS execution_policy_profiles (
-                    context_key TEXT PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    loop_mode TEXT,
-                    risk_mode TEXT,
-                    action_type TEXT,
-                    urgency_bucket TEXT,
-                    liquidity_bucket TEXT,
-                    recommended_order_type TEXT,
-                    recommended_execution_profile TEXT,
-                    metrics JSON,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS policy_registry (
@@ -383,38 +378,6 @@ class StateStoreSchemaInitMixin:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
-                CREATE TABLE IF NOT EXISTS policy_bundles (
-                    bundle_key TEXT PRIMARY KEY,
-                    regime_key TEXT,
-                    status TEXT DEFAULT 'candidate',
-                    alpha_policy_key TEXT,
-                    position_policy_key TEXT,
-                    safety_policy_key TEXT,
-                    execution_policy_key TEXT,
-                    metrics JSON,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS bundle_evaluations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    bundle_key TEXT NOT NULL,
-                    evaluation_scope TEXT NOT NULL,
-                    sample_count INTEGER DEFAULT 0,
-                    score REAL DEFAULT 0,
-                    metrics JSON,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS bundle_promotions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    regime_key TEXT,
-                    previous_bundle_key TEXT,
-                    new_bundle_key TEXT NOT NULL,
-                    reason TEXT,
-                    metrics JSON,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-
                 CREATE TABLE IF NOT EXISTS shadow_decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     audit_log_id INTEGER NOT NULL,
@@ -422,6 +385,8 @@ class StateStoreSchemaInitMixin:
                     domain TEXT NOT NULL,
                     symbol TEXT,
                     loop_mode TEXT,
+                    guarded_attention BOOLEAN DEFAULT 0,
+                    safety_mode BOOLEAN DEFAULT 0,
                     trade_case_id TEXT,
                     divergence_type TEXT,
                     outcome_status TEXT,
@@ -570,9 +535,6 @@ class StateStoreSchemaInitMixin:
                 CREATE INDEX IF NOT EXISTS idx_execution_policy_eval_context
                 ON execution_policy_evaluations(symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, id);
 
-                CREATE INDEX IF NOT EXISTS idx_execution_policy_profiles_lookup
-                ON execution_policy_profiles(symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, updated_at);
-
                 CREATE INDEX IF NOT EXISTS idx_candidate_policy_domain_status
                 ON candidate_policy_versions(domain, status, created_at);
 
@@ -588,12 +550,6 @@ class StateStoreSchemaInitMixin:
                 CREATE INDEX IF NOT EXISTS idx_shadow_decisions_candidate
                 ON shadow_decisions(candidate_policy_id, created_at);
 
-                CREATE INDEX IF NOT EXISTS idx_policy_bundles_regime_status
-                ON policy_bundles(regime_key, status, updated_at);
-
-                CREATE INDEX IF NOT EXISTS idx_bundle_evaluations_bundle
-                ON bundle_evaluations(bundle_key, created_at);
-
                 CREATE INDEX IF NOT EXISTS idx_decision_fingerprint_lookup
                 ON decision_fingerprints(symbol, action, size_band, id);
 
@@ -608,7 +564,6 @@ class StateStoreSchemaInitMixin:
         self._ensure_column("audit_logs", "ai_raw_response", "TEXT")
         self._ensure_column("audit_logs", "execution_summary", "JSON")
         self._ensure_column("audit_logs", "market_vectors", "JSON")
-        self._ensure_column("policy_bundles", "safety_policy_key", "TEXT")
         self._ensure_column("journal", "audit_log_id", "INTEGER")
         self._ensure_column("journal", "rationale_json", "JSON")
         self._ensure_column("journal", "risk_reason", "TEXT")
@@ -622,7 +577,10 @@ class StateStoreSchemaInitMixin:
         self._ensure_column("symbol_journal", "case_opened_at", "DATETIME")
         self._ensure_column("symbol_journal", "case_closed_at", "DATETIME")
         self._ensure_column("symbol_journal", "holding_minutes", "REAL")
+        self._ensure_column("trade_cases", "loop_mode", "TEXT")
         self._ensure_column("trade_cases", "risk_mode", "TEXT")
+        self._ensure_column("trade_cases", "guarded_attention", "BOOLEAN DEFAULT 0")
+        self._ensure_column("trade_cases", "safety_mode", "BOOLEAN DEFAULT 0")
         self._ensure_column("trade_cases", "opened_at", "DATETIME")
         self._ensure_column("trade_cases", "closed_at", "DATETIME")
         self._ensure_column("trade_cases", "entry_audit_log_id", "INTEGER")
@@ -652,7 +610,10 @@ class StateStoreSchemaInitMixin:
         self._ensure_column("active_trade_cases", "thesis_id", "TEXT")
         self._ensure_column("active_trade_cases", "management_template_id", "TEXT")
         self._ensure_column("trade_case_vector_index", "status", "TEXT")
+        self._ensure_column("trade_case_vector_index", "loop_mode", "TEXT")
         self._ensure_column("trade_case_vector_index", "risk_mode", "TEXT")
+        self._ensure_column("trade_case_vector_index", "guarded_attention", "BOOLEAN DEFAULT 0")
+        self._ensure_column("trade_case_vector_index", "safety_mode", "BOOLEAN DEFAULT 0")
         self._ensure_column("trade_case_vector_index", "opened_at", "DATETIME")
         self._ensure_column("trade_case_vector_index", "closed_at", "DATETIME")
         self._ensure_column("trade_case_vector_index", "estimated_pnl_pct", "REAL")
@@ -696,8 +657,12 @@ class StateStoreSchemaInitMixin:
         self._ensure_column("order_runtime_state", "lineage_parent_client_order_id", "TEXT")
         self._ensure_column("market_snapshot_history", "depth_notional_top5", "REAL")
         self._ensure_column("market_snapshot_history", "spread_vs_1h_avg", "REAL")
-        self._ensure_column("market_snapshot_history", "volume_surge_trigger_active", "BOOLEAN DEFAULT 0")
-        self._ensure_column("market_snapshot_history", "fast_move_trigger_active", "BOOLEAN DEFAULT 0")
-        self._ensure_column("market_snapshot_history", "range_break_trigger_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "volume_surge_signal_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "fast_move_signal_active", "BOOLEAN DEFAULT 0")
+        self._ensure_column("market_snapshot_history", "range_break_signal_active", "BOOLEAN DEFAULT 0")
         self._ensure_column("market_snapshot_history", "trend_1h", "TEXT")
-
+        self._ensure_column("execution_policy_evaluations", "safety_mode", "BOOLEAN DEFAULT 0")
+        self._ensure_column("execution_policy_evaluations", "entry_style", "TEXT")
+        self._ensure_column("execution_policy_evaluations", "outcome_label", "TEXT")
+        self._ensure_column("shadow_decisions", "guarded_attention", "BOOLEAN DEFAULT 0")
+        self._ensure_column("shadow_decisions", "safety_mode", "BOOLEAN DEFAULT 0")

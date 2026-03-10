@@ -118,8 +118,6 @@ class TradingTradeCaseAnnotationMixin:
         )
         if negative_outcome and failure_mode:
             return failure_mode
-        if negative_outcome and symbol_snapshot is not None and getattr(symbol_snapshot, "opportunity_trigger_reasons", None):
-            return "setup_invalidated:" + ",".join(symbol_snapshot.opportunity_trigger_reasons[:3])
         if negative_outcome:
             return "adverse_price_follow_through"
         return None
@@ -135,6 +133,9 @@ class TradingTradeCaseAnnotationMixin:
         market_snapshots,
         fills: list[dict],
         risk_mode: str,
+        loop_mode: str = "",
+        is_guarded_attention: bool = False,
+        is_safety_mode: bool = False,
         risk_state=None,
         observed_at: str | None = None,
     ) -> list[dict]:
@@ -317,7 +318,10 @@ class TradingTradeCaseAnnotationMixin:
                     "trade_case_id": trade_case_id,
                     "symbol": symbol,
                     "status": "closed" if case_status == "closed" else ("open" if case_status == "opened" else (case_status or "active")),
+                    "loop_mode": loop_mode,
                     "risk_mode": risk_mode,
+                    "guarded_attention": bool(is_guarded_attention),
+                    "safety_mode": bool(is_safety_mode),
                     "opened_at": case_opened_at,
                     "closed_at": case_closed_at,
                     "entry_audit_log_id": entry_audit_log_id,

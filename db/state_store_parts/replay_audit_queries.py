@@ -37,10 +37,9 @@ class StateStoreReplayAuditQueryMixin:
         retrieval_comparison = retrieval_counterfactual.get("with_vs_without_comparison") or {}
         hold_counterfactual = latest_replay_payload.get("hold_opportunity_counterfactual") or {}
         snapshot = self._extract_replay_candidate_snapshot(item)
-        opportunity_reasons = list(snapshot.get("opportunity_trigger_reasons") or [])
         trigger_flags = sum(
             1
-            for key in ("is_opportunity_trigger", "volume_surge_trigger_active", "range_break_trigger_active")
+            for key in ("fast_move_signal_active", "volume_surge_signal_active", "range_break_signal_active")
             if bool(snapshot.get(key))
         )
         is_trade = decision in ("BUY", "SELL", "REDUCE", "EXIT")
@@ -77,7 +76,7 @@ class StateStoreReplayAuditQueryMixin:
                 score += 4.0
             score += min(8.0, self._coerce_replay_float(hold_counterfactual.get("hold_opportunity_cost")) * 2.0)
             score += min(4.0, float(int(hold_counterfactual.get("missed_breakout_count") or 0)) * 1.5)
-            score += min(4.0, float(len(opportunity_reasons)) + float(trigger_flags))
+            score += min(4.0, float(trigger_flags))
 
         return round(score, 6)
 

@@ -256,4 +256,3 @@ class StateStoreDecodingMixin:
             return json.loads(value)
         except Exception:
             return default
-

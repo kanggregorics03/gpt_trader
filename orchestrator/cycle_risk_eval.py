@@ -9,7 +9,7 @@ class TradingCycleRiskEvaluationMixin:
             market_snapshots=cycle_context["market_snapshots"],
             market_prices=cycle_context["market_prices"],
             risk_state=cycle_context["risk_state"],
-            is_trigger_mode=cycle_context["is_trigger_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
             unresolved_timeout_count=unresolved_timeout_count,
             active_profile_override=cycle_context["effective_risk_profile"],
         )
@@ -31,11 +31,6 @@ class TradingCycleRiskEvaluationMixin:
         }
 
     def _build_execution_summary(self, cycle_context: dict, decision_result, risk_outcome: dict, loop_type: str):
-        trigger_symbols = [
-            symbol
-            for symbol, snapshot in cycle_context["market_snapshots"].items()
-            if snapshot.is_opportunity_trigger
-        ]
         risk_trigger_symbols = [
             symbol
             for symbol, snapshot in cycle_context["market_snapshots"].items()
@@ -44,8 +39,8 @@ class TradingCycleRiskEvaluationMixin:
         execution_summary = {
             "loop_type": loop_type,
             "symbols": list(cycle_context["market_snapshots"].keys()),
-            "trigger_mode": cycle_context["is_trigger_mode"],
-            "trigger_symbols": trigger_symbols,
+            "guarded_attention": cycle_context["is_guarded_attention"],
+            "safety_mode": cycle_context["is_safety_mode"],
             "risk_trigger_symbols": risk_trigger_symbols,
             "risk_mode": cycle_context["risk_mode"],
             "risk_profile": cycle_context["risk_profile"],
@@ -55,8 +50,6 @@ class TradingCycleRiskEvaluationMixin:
             "decision_input_hash": decision_result.input_hash,
             "ai_usage": decision_result.usage_metadata or {},
             "regime_key": cycle_context["regime_key"],
-            "policy_bundle": cycle_context["active_bundle_summary"],
-            "regime_drift": cycle_context["regime_drift_summary"],
             "alpha_policy": cycle_context["alpha_policy_summary"],
             "evidence_quality": risk_outcome["evidence_quality_summary"],
             "entry_size_cap": risk_outcome["entry_size_cap_summary"],
@@ -66,4 +59,4 @@ class TradingCycleRiskEvaluationMixin:
             "executed_order_count": 0,
             "unknown_order_states_before_execution": risk_outcome["unresolved_timeout_count"],
         }
-        return execution_summary, trigger_symbols, risk_trigger_symbols
+        return execution_summary, [], risk_trigger_symbols

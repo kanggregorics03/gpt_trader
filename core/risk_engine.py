@@ -27,23 +27,13 @@ class RiskEngine:
         {"summary_path": "risk_limits.max_consecutive_losses", "source_path": "risk_limits.max_consecutive_losses", "required": True},
         {"summary_path": "risk_limits.max_open_positions", "source_path": "risk_limits.max_open_positions", "required": True},
         {"summary_path": "risk_limits.mode_profiles.normal.allowed_actions", "source_path": "risk_limits.mode_profiles.normal.allowed_actions", "required": True},
-        {"summary_path": "risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", "source_path": "risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", "required": True},
+        {"summary_path": "risk_limits.mode_profiles.guarded.max_order_notional_pct_balance", "source_path": "risk_limits.mode_profiles.guarded.max_order_notional_pct_balance", "required": True},
         {"summary_path": "risk_limits.mode_profiles.cooldown.allowed_actions", "source_path": "risk_limits.mode_profiles.cooldown.allowed_actions", "required": True},
         {"summary_path": "execution_guards.symbol_reentry_close_cooldown_minutes", "source_path": "execution_guards.symbol_reentry_close_cooldown_minutes", "required": True},
         {"summary_path": "execution_guards.symbol_reentry_loss_cooldown_minutes", "source_path": "execution_guards.symbol_reentry_loss_cooldown_minutes", "required": True},
         {"summary_path": "execution_guards.symbol_reentry_loss_threshold_pct", "source_path": "execution_guards.symbol_reentry_loss_threshold_pct", "required": True},
         {"summary_path": "stale_order_controls.position_policy.stale_order_minutes", "source_path": "position_policy.stale_order_minutes", "required_if_source_present": True},
-        {
-            "summary_path": "stale_order_controls.position_policy.stale_order_reprice_spread_percentile_max",
-            "source_path": "position_policy.stale_order_reprice_spread_percentile_max",
-            "required_if_source_present": True,
-        },
         {"summary_path": "stale_order_controls.safety_policy.stale_order_minutes", "source_path": "safety_policy.stale_order_minutes", "required_if_source_present": True},
-        {
-            "summary_path": "stale_order_controls.safety_policy.stale_order_reprice_spread_percentile_max",
-            "source_path": "safety_policy.stale_order_reprice_spread_percentile_max",
-            "required_if_source_present": True,
-        },
     ]
 
     def __init__(self, config_path: str = "policy.yaml"):
@@ -95,27 +85,11 @@ class RiskEngine:
             "stale_order_controls": {
                 "position_policy": {
                     "stale_order_minutes": (self.policy.get("position_policy") or {}).get("stale_order_minutes"),
-                    "stale_order_reprice_spread_percentile_max": (
-                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_spread_percentile_max")
-                    ),
-                    "stale_order_reprice_depth_percentile_min": (
-                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_depth_percentile_min")
-                    ),
-                    "stale_order_reprice_limit_offset_bps": (
-                        (self.policy.get("position_policy") or {}).get("stale_order_reprice_limit_offset_bps")
-                    ),
+                    "stale_order_action": "cancel_only",
                 },
                 "safety_policy": {
                     "stale_order_minutes": (self.policy.get("safety_policy") or {}).get("stale_order_minutes"),
-                    "stale_order_reprice_spread_percentile_max": (
-                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_spread_percentile_max")
-                    ),
-                    "stale_order_reprice_depth_percentile_min": (
-                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_depth_percentile_min")
-                    ),
-                    "stale_order_reprice_limit_offset_bps": (
-                        (self.policy.get("safety_policy") or {}).get("stale_order_reprice_limit_offset_bps")
-                    ),
+                    "stale_order_action": "cancel_only",
                 },
             },
             "execution_policy": {
@@ -125,6 +99,8 @@ class RiskEngine:
             },
         }
         for mode_name, profile in self.get_risk_profiles().items():
+            if mode_name == "trigger":
+                continue
             summary["risk_limits"]["mode_profiles"][mode_name] = {
                 "max_open_positions": profile.get("max_open_positions"),
                 "max_order_notional_pct_balance": profile.get("max_order_notional_pct_balance"),
@@ -229,16 +205,7 @@ class RiskEngine:
             section = dict(policy.get(section_name) or {})
             if not section:
                 continue
-            spread_limit = section.get("stale_order_reprice_spread_percentile_max")
-            depth_floor = section.get("stale_order_reprice_depth_percentile_min")
-            limit_offset = section.get("stale_order_reprice_limit_offset_bps")
             stale_minutes = section.get("stale_order_minutes")
-            if spread_limit is not None and not (0 <= float(spread_limit) <= 100):
-                raise ValueError(f"{section_name}.stale_order_reprice_spread_percentile_max must be between 0 and 100.")
-            if depth_floor is not None and not (0 <= float(depth_floor) <= 100):
-                raise ValueError(f"{section_name}.stale_order_reprice_depth_percentile_min must be between 0 and 100.")
-            if limit_offset is not None and float(limit_offset) < 0:
-                raise ValueError(f"{section_name}.stale_order_reprice_limit_offset_bps must be >= 0.")
             if stale_minutes is not None and float(stale_minutes) <= 0:
                 raise ValueError(f"{section_name}.stale_order_minutes must be > 0.")
 
@@ -287,10 +254,10 @@ class RiskEngine:
                 "max_order_notional_pct_balance": 100.0,
                 "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
             },
-            "trigger": {
+            "guarded": {
                 "max_open_positions": max(1, min(base_max_positions, 1)),
-                "max_order_notional_pct_balance": 35.0,
-                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
+                "max_order_notional_pct_balance": 0.0,
+                "allowed_actions": ["HOLD", "REDUCE", "EXIT", "CANCEL"],
                 "block_additional_entries_when_position_exists": True,
             },
             "cooldown": {
@@ -323,25 +290,25 @@ class RiskEngine:
     def get_active_risk_mode(
         self,
         risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
-        is_trigger_mode: bool = False,
+        is_guarded_attention: bool = False,
     ) -> str:
         risk_state = coerce_risk_state_snapshot(risk_state)
         if bool(risk_state.cooldown_active):
             return "cooldown"
         if bool(risk_state.drawdown_active):
             return "drawdown"
-        if is_trigger_mode:
-            return "trigger"
+        if is_guarded_attention:
+            return "guarded"
         return "normal"
 
     def get_active_risk_profile(
         self,
         risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
-        is_trigger_mode: bool = False,
+        is_guarded_attention: bool = False,
     ) -> Dict:
         profiles = self.get_risk_profiles()
         return profiles.get(
-            self.get_active_risk_mode(risk_state=risk_state, is_trigger_mode=is_trigger_mode),
+            self.get_active_risk_mode(risk_state=risk_state, is_guarded_attention=is_guarded_attention),
             profiles["normal"],
         )
 
@@ -389,6 +356,100 @@ class RiskEngine:
             "covered_symbols": sorted(covered_symbols),
         }
 
+    def get_setup_quality_summary(
+        self,
+        intent: TradeIntent,
+        market_snapshots: Optional[Dict[str, MarketSnapshot]] = None,
+    ) -> Dict[str, object]:
+        config = dict(((self.policy.get("risk_limits") or {}).get("setup_quality") or {}))
+        retest_max_breakout_distance_pct = float(config.get("retest_max_breakout_distance_pct", 0.6) or 0.6)
+        retest_max_invalid_distance_atr = float(config.get("retest_max_invalid_distance_atr", 1.6) or 1.6)
+        value_max_invalid_distance_atr = float(config.get("value_max_invalid_distance_atr", 1.8) or 1.8)
+        value_spread_percentile_penalty = float(config.get("value_spread_percentile_penalty", 85.0) or 85.0)
+        value_depth_percentile_penalty = float(config.get("value_depth_percentile_penalty", 15.0) or 15.0)
+        market_snapshots = market_snapshots or {}
+
+        factor = 1.0
+        issues: List[str] = []
+        reviewed_styles: List[str] = []
+        reviewed_symbols: List[str] = []
+
+        for order in intent.orders:
+            if bool(getattr(order, "reduce_only", False)):
+                continue
+            action = str(getattr(order, "action", "") or "").upper()
+            if action not in {"BUY", "SELL"}:
+                continue
+            entry_style = str(getattr(order, "entry_style", "") or "").strip().lower()
+            if not entry_style or entry_style == "immediate":
+                continue
+            symbol = normalize_symbol(getattr(order, "symbol", "") or "")
+            snapshot = market_snapshots.get(symbol)
+            if symbol:
+                reviewed_symbols.append(symbol)
+            if entry_style:
+                reviewed_styles.append(entry_style)
+            if snapshot is None:
+                factor = min(factor, 0.85)
+                issues.append(f"{entry_style}_missing_snapshot:{symbol or 'unknown'}")
+                continue
+
+            if entry_style == "retest":
+                structure_distances = [
+                    float(value)
+                    for value in (
+                        getattr(snapshot, "distance_to_15m_breakout_level", None),
+                        getattr(snapshot, "distance_to_1h_breakout_level", None),
+                    )
+                    if value is not None
+                ]
+                nearest_structure = min(structure_distances) if structure_distances else None
+                if nearest_structure is None:
+                    factor = min(factor, 0.8)
+                    issues.append(f"retest_missing_structure:{symbol}")
+                elif nearest_structure > retest_max_breakout_distance_pct:
+                    factor = min(factor, 0.75)
+                    issues.append(f"retest_far_from_structure:{symbol}")
+
+                invalid_distance = getattr(snapshot, "distance_to_invalid_level", None)
+                if invalid_distance is None:
+                    factor = min(factor, 0.9)
+                    issues.append(f"retest_missing_invalidation:{symbol}")
+                elif float(invalid_distance) > retest_max_invalid_distance_atr:
+                    factor = min(factor, 0.85)
+                    issues.append(f"retest_wide_invalidation:{symbol}")
+
+            elif entry_style == "value":
+                trend = str(getattr(snapshot, "trend_1h", "") or "").upper()
+                if trend not in {"UP", "DOWN"}:
+                    factor = min(factor, 0.8)
+                    issues.append(f"value_trend_unclear:{symbol}")
+
+                invalid_distance = getattr(snapshot, "distance_to_invalid_level", None)
+                if invalid_distance is None:
+                    factor = min(factor, 0.9)
+                    issues.append(f"value_missing_invalidation:{symbol}")
+                elif float(invalid_distance) > value_max_invalid_distance_atr:
+                    factor = min(factor, 0.85)
+                    issues.append(f"value_wide_invalidation:{symbol}")
+
+                spread_percentile = getattr(snapshot, "spread_percentile_1h", None)
+                if spread_percentile is not None and float(spread_percentile) >= value_spread_percentile_penalty:
+                    factor = min(factor, 0.9)
+                    issues.append(f"value_wide_spread:{symbol}")
+
+                depth_percentile = getattr(snapshot, "depth_percentile_1h", None)
+                if depth_percentile is not None and float(depth_percentile) <= value_depth_percentile_penalty:
+                    factor = min(factor, 0.9)
+                    issues.append(f"value_thin_depth:{symbol}")
+
+        return {
+            "factor": factor,
+            "issues": issues,
+            "reviewed_styles": sorted(set(reviewed_styles)),
+            "reviewed_symbols": sorted(set(reviewed_symbols)),
+        }
+
     def get_effective_max_order_notional_pct_balance(
         self,
         intent: TradeIntent,
@@ -402,6 +463,8 @@ class RiskEngine:
         base_cap_pct = float(active_profile.get("max_order_notional_pct_balance", 100.0) or 0.0)
         evidence_quality = self.get_evidence_quality_summary(intent)
         evidence_factor = float(evidence_quality.get("factor") or 1.0)
+        setup_quality = self.get_setup_quality_summary(intent, market_snapshots=market_snapshots)
+        setup_factor = float(setup_quality.get("factor") or 1.0)
         profile_factor = 1.0
         profile_issues: List[str] = []
         profile_adjustments: Dict[str, float] = {}
@@ -456,16 +519,21 @@ class RiskEngine:
             profile_adjustments["risk_trigger_factor"] = risk_trigger_size_multiplier
             profile_issues.append("risk_trigger_size_penalty")
 
-        factor = evidence_factor * profile_factor
+        if setup_factor < 1.0:
+            profile_adjustments["setup_quality_factor"] = setup_factor
+            profile_issues.append("setup_quality_penalty")
+
+        factor = evidence_factor * setup_factor * profile_factor
         effective_cap_pct = base_cap_pct
         if intent.rationale_items:
             effective_cap_pct *= factor
-        elif profile_factor != 1.0:
-            effective_cap_pct *= profile_factor
+        elif setup_factor != 1.0 or profile_factor != 1.0:
+            effective_cap_pct *= setup_factor * profile_factor
         return {
             "base_cap_pct": base_cap_pct,
             "effective_cap_pct": effective_cap_pct,
             "evidence_quality": evidence_quality,
+            "setup_quality": setup_quality,
             "profile_adjustments": profile_adjustments,
             "profile_issues": profile_issues,
             "failure_pattern_score": failure_pattern_score,
@@ -480,7 +548,7 @@ class RiskEngine:
         market_snapshots: Optional[Dict[str, MarketSnapshot]] = None,
         market_prices: Optional[Dict[str, float]] = None,
         risk_state: Optional[Dict[str, Any] | RiskStateSnapshot] = None,
-        is_trigger_mode: bool = False,
+        is_guarded_attention: bool = False,
         unresolved_timeout_count: int = 0,
         active_profile_override: Optional[Dict] = None,
     ) -> Tuple[bool, str]:
@@ -497,10 +565,10 @@ class RiskEngine:
         market_prices = market_prices or {}
         market_snapshots = market_snapshots or {}
         risk_state = coerce_risk_state_snapshot(risk_state)
-        active_mode = self.get_active_risk_mode(risk_state=risk_state, is_trigger_mode=is_trigger_mode)
+        active_mode = self.get_active_risk_mode(risk_state=risk_state, is_guarded_attention=is_guarded_attention)
         active_profile = active_profile_override or self.get_active_risk_profile(
             risk_state=risk_state,
-            is_trigger_mode=is_trigger_mode,
+            is_guarded_attention=is_guarded_attention,
         )
         allowed_symbols = normalize_symbol_list(trading_policy.get('symbols', []))
         allowed_symbol_set = set(allowed_symbols)
@@ -639,9 +707,9 @@ class RiskEngine:
                 abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
                 for position in account_state.positions
             )
-            if active_mode == "trigger" and block_additional_entries and has_live_positions:
+            if active_mode == "guarded" and block_additional_entries and has_live_positions:
                 return False, (
-                    "Trigger mode blocks additional entry while a live position already exists. "
+                    "Guarded mode blocks additional entry while a live position already exists. "
                     "Manage the position with HOLD/REDUCE/EXIT instead."
                 )
             if int(unresolved_timeout_count or 0) > 0:
@@ -790,6 +858,7 @@ class RiskEngine:
                 market_snapshots=market_snapshots,
             )
             evidence_quality = cap_summary["evidence_quality"]
+            setup_quality = cap_summary["setup_quality"]
             adjusted_notional_pct_balance = float(cap_summary["effective_cap_pct"])
             candidate_notional = 0.0
             pending_notional = 0.0
@@ -818,6 +887,8 @@ class RiskEngine:
                 detail_parts: List[str] = []
                 if intent.rationale_items and evidence_quality.get("issues"):
                     detail_parts.append(f"evidence_quality={','.join(evidence_quality['issues'])}")
+                if setup_quality.get("issues"):
+                    detail_parts.append(f"setup_quality={','.join(setup_quality['issues'])}")
                 if cap_summary.get("profile_issues"):
                     detail_parts.append(f"profile_adjustments={','.join(cap_summary['profile_issues'])}")
                 if detail_parts:

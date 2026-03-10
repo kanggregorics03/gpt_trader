@@ -13,7 +13,8 @@ class SnapshotBundle:
     policy_summary: str
     market_snapshots: Dict[str, MarketSnapshot]
     market_prices: Dict[str, float]
-    is_trigger_mode: bool
+    is_guarded_attention: bool
+    is_safety_mode: bool
     risk_mode: str
     risk_profile: Dict[str, Any]
     materialized_at_epoch: float
@@ -23,7 +24,6 @@ class SnapshotBundle:
 class SnapshotService:
     DEFAULT_TIMEFRAME_LIMITS = {"5m": 80, "15m": 80, "1h": 80, "4h": 80}
     TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
-    STRONG_TRIGGER_REASONS = {"volume_surge_15m", "range_break_1h"}
 
     def __init__(
         self,
@@ -94,14 +94,11 @@ class SnapshotService:
             )
         )
 
-    def _should_enable_trigger_mode(self, market_snapshots: Dict[str, MarketSnapshot]) -> bool:
-        for snapshot in (market_snapshots or {}).values():
-            reasons = list(snapshot.opportunity_trigger_reasons or [])
-            if len(reasons) < 2:
-                continue
-            if any(reason in self.STRONG_TRIGGER_REASONS for reason in reasons):
-                return True
-        return False
+    def _should_enable_guarded_attention(self, market_snapshots: Dict[str, MarketSnapshot]) -> bool:
+        return any(bool(getattr(snapshot, "is_risk_trigger", False)) for snapshot in (market_snapshots or {}).values())
+
+    def _should_enable_safety_mode(self, market_snapshots: Dict[str, MarketSnapshot]) -> bool:
+        return any(bool(getattr(snapshot, "is_risk_trigger", False)) for snapshot in (market_snapshots or {}).values())
 
     def _build_market_snapshot_history_entries(
         self,
@@ -127,11 +124,11 @@ class SnapshotService:
                     "spread_vs_1h_avg": getattr(snapshot, "spread_vs_1h_avg", None),
                     "volume_ratio_15m": getattr(snapshot, "volume_ratio_15m", None),
                     "distance_to_invalid_level": getattr(snapshot, "distance_to_invalid_level", None),
-                    "trigger_active": bool(getattr(snapshot, "is_opportunity_trigger", False)),
+                    "trigger_active": bool(getattr(snapshot, "is_risk_trigger", False)),
                     "risk_trigger_active": bool(getattr(snapshot, "is_risk_trigger", False)),
-                    "volume_surge_trigger_active": bool(getattr(snapshot, "volume_surge_trigger_active", False)),
-                    "fast_move_trigger_active": bool(getattr(snapshot, "fast_move_trigger_active", False)),
-                    "range_break_trigger_active": bool(getattr(snapshot, "range_break_trigger_active", False)),
+                    "volume_surge_signal_active": bool(getattr(snapshot, "volume_surge_signal_active", False)),
+                    "fast_move_signal_active": bool(getattr(snapshot, "fast_move_signal_active", False)),
+                    "range_break_signal_active": bool(getattr(snapshot, "range_break_signal_active", False)),
                     "trend_1h": getattr(snapshot, "trend_1h", None),
                     "payload": snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else {},
                 }
@@ -183,14 +180,15 @@ class SnapshotService:
                 )
             )
 
-        is_trigger_mode = self._should_enable_trigger_mode(market_snapshots)
+        is_safety_mode = self._should_enable_safety_mode(market_snapshots)
+        is_guarded_attention = is_safety_mode
         risk_mode = self.risk_engine.get_active_risk_mode(
             risk_state=risk_state,
-            is_trigger_mode=is_trigger_mode,
+            is_guarded_attention=is_guarded_attention,
         )
         risk_profile = self.risk_engine.get_active_risk_profile(
             risk_state=risk_state,
-            is_trigger_mode=is_trigger_mode,
+            is_guarded_attention=is_guarded_attention,
         )
         bundle = SnapshotBundle(
             account_state=account_state,
@@ -198,7 +196,8 @@ class SnapshotService:
             policy_summary=self.risk_engine.get_summary(),
             market_snapshots=market_snapshots,
             market_prices=market_prices,
-            is_trigger_mode=is_trigger_mode,
+            is_guarded_attention=is_guarded_attention,
+            is_safety_mode=is_safety_mode,
             risk_mode=risk_mode,
             risk_profile=risk_profile,
             materialized_at_epoch=now_epoch,

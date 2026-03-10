@@ -66,7 +66,10 @@ class TradingCadencePolicyMixin:
             self.adaptive_loop_config["recent_close_window_minutes"],
         )
         active_management_target = has_positions or has_open_orders or has_unknown_orders
-        if bool(cycle_result.get("trigger_active")) and active_management_target:
+        safety_trigger_active = cycle_result.get("safety_trigger_active")
+        if safety_trigger_active is None:
+            safety_trigger_active = cycle_result.get("guarded_attention_active")
+        if (bool(safety_trigger_active) or has_unknown_orders) and active_management_target:
             return "5m"
         if active_management_target or recent_execution or recent_close:
             return "15m"

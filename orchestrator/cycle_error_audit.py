@@ -26,7 +26,8 @@ class TradingCycleErrorAuditMixin:
         )
         return {
             "loop_type": loop_type,
-            "trigger_active": self.active_loop_mode == "5m",
+            "guarded_attention_active": self.active_loop_mode == "5m",
+            "safety_trigger_active": self.active_loop_mode == "5m",
             "has_positions": True,
             "has_open_orders": True,
             "has_unknown_orders": True,

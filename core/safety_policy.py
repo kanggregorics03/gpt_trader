@@ -16,10 +16,6 @@ class SafetyPolicyEngine:
         "microstructure_exit_confirmations": 2,
         "stale_order_minutes": 12.0,
         "stale_order_risk_trigger_count": 1,
-        "stale_order_reprice_enabled": True,
-        "stale_order_reprice_spread_percentile_max": 70.0,
-        "stale_order_reprice_depth_percentile_min": 30.0,
-        "stale_order_reprice_limit_offset_bps": 3.0,
     }
 
     def __init__(self, policy: Optional[Dict[str, Any]] = None, state_store=None):
@@ -27,6 +23,64 @@ class SafetyPolicyEngine:
         self.config = dict(self.DEFAULT_CONFIG)
         self.config.update(configured)
         self.state_store = state_store
+
+    def _resolve_config(
+        self,
+        *,
+        regime_key: Optional[str] = None,
+        policy_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        config = dict(self.config)
+        if policy_override:
+            config.update(policy_override)
+        return config
+
+    def get_emergency_state(
+        self,
+        *,
+        account_state: AccountState,
+        market_snapshots: Dict[str, Any],
+        regime_key: Optional[str] = None,
+        policy_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        config = self._resolve_config(regime_key=regime_key, policy_override=policy_override)
+        positions = [
+            position
+            for position in (getattr(account_state, "positions", []) or [])
+            if abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
+        ]
+        open_orders = list(getattr(account_state, "open_orders", []) or [])
+        reasons: list[str] = []
+
+        for position in positions:
+            symbol = str(getattr(position, "symbol", "") or "")
+            if not symbol:
+                continue
+            snapshot = (market_snapshots or {}).get(symbol)
+            symbol_orders = [order for order in open_orders if str(getattr(order, "symbol", "") or "") == symbol]
+            state = self._evaluate_symbol_state(
+                position=position,
+                snapshot=snapshot,
+                open_orders=symbol_orders,
+                config=config,
+            )
+            if state["action"] == "EXIT" and self._is_critical_emergency_state(state["state"]):
+                reasons.append(f"{state['state']}:{symbol}")
+
+        deduped_reasons = []
+        seen = set()
+        for reason in reasons:
+            if reason in seen:
+                continue
+            seen.add(reason)
+            deduped_reasons.append(reason)
+        return {"active": bool(deduped_reasons), "reasons": deduped_reasons}
+
+    def _is_critical_emergency_state(self, state: str) -> bool:
+        return str(state or "").strip().lower() in {
+            "liquidity_risk",
+            "stale_order_risk",
+        }
 
     def evaluate(
         self,
@@ -37,18 +91,7 @@ class SafetyPolicyEngine:
         regime_key: Optional[str] = None,
         policy_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        config = dict(self.config)
-        if self.state_store is not None and hasattr(self.state_store, "get_policy_registry_entry"):
-            registry = {}
-            scoped_fetch = getattr(self.state_store, "get_policy_registry_entry_for_regime", None)
-            if callable(scoped_fetch):
-                registry = scoped_fetch("safety_5m", regime_key=regime_key)
-            if not registry:
-                registry = self.state_store.get_policy_registry_entry("champion:safety_5m")
-            if registry:
-                config.update(registry.get("config") or {})
-        if policy_override:
-            config.update(policy_override)
+        config = self._resolve_config(regime_key=regime_key, policy_override=policy_override)
 
         positions = [
             position
@@ -79,30 +122,6 @@ class SafetyPolicyEngine:
                 threshold_minutes=float(config["stale_order_minutes"]),
             )
             if stale_orders:
-                replacement_order = self._build_replacement_order(
-                    stale_orders[0],
-                    snapshot=(market_snapshots or {}).get(str(getattr(stale_orders[0], "symbol", "") or "")),
-                    config=config,
-                ) if len(stale_orders) == 1 else None
-                if replacement_order is not None:
-                    return {
-                        "escalate_to_ai": False,
-                        "decision_result": {
-                            "decision": "REPLACE_ENTRY",
-                            "orders": [self._build_cancel_order(stale_orders[0]), replacement_order],
-                            "rationale": [
-                                f"5m safety loop reprices a stale working order for {replacement_order.symbol}."
-                            ],
-                            "risk_notes": ["safety_policy:stale_order_reprice", f"risk_mode:{risk_mode}"],
-                            "confidence": 0.88,
-                            "exit_reason": "order_reprice",
-                            "metadata": {
-                                "policy_source": "safety_fsm",
-                                "loop_mode": loop_mode,
-                                "state": "working_order_reprice",
-                            },
-                        },
-                    }
                 return {
                     "escalate_to_ai": False,
                     "decision_result": {
@@ -320,58 +339,6 @@ class SafetyPolicyEngine:
             execution_context={"action_type": "cancel", "policy_source": "safety_fsm", "replace_group_id": replace_group_id},
         )
 
-    def _build_replacement_order(self, open_order, snapshot, config: Dict[str, Any]):
-        if not bool(config.get("stale_order_reprice_enabled", True)):
-            return None
-        if bool(getattr(open_order, "reduce_only", False)):
-            return None
-        side = str(getattr(open_order, "side", "") or "").upper()
-        if side not in ("BUY", "SELL"):
-            return None
-        quantity = abs(float(getattr(open_order, "quantity", 0.0) or 0.0))
-        if quantity <= 0.0 or snapshot is None:
-            return None
-        risk_trigger_reasons = list(getattr(snapshot, "risk_trigger_reasons", []) or [])
-        if risk_trigger_reasons:
-            return None
-        spread_percentile = self._safe_float(getattr(snapshot, "spread_percentile_1h", None))
-        depth_percentile = self._safe_float(getattr(snapshot, "depth_percentile_1h", None))
-        if spread_percentile is not None and spread_percentile > float(config["stale_order_reprice_spread_percentile_max"]):
-            return None
-        if depth_percentile is not None and depth_percentile < float(config["stale_order_reprice_depth_percentile_min"]):
-            return None
-        price = self._build_replacement_price(
-            side=side,
-            snapshot=snapshot,
-            limit_offset_bps=float(config["stale_order_reprice_limit_offset_bps"]),
-        )
-        if price is None:
-            return None
-        replace_group_id = self._build_replace_group_id(open_order)
-        return OrderIntent(
-            symbol=str(getattr(open_order, "symbol", "") or ""),
-            action=side,
-            order_type="LIMIT",
-            quantity=quantity,
-            price=price,
-            reduce_only=False,
-            take_profit=getattr(open_order, "take_profit", None),
-            stop_loss=getattr(open_order, "stop_loss", None),
-            replace_group_id=replace_group_id,
-            lineage_role="replacement",
-            lineage_parent_order_id=getattr(open_order, "order_id", None),
-            lineage_parent_client_order_id=getattr(open_order, "client_order_id", None),
-            wait_for_cancel_confirmation=True,
-            execution_context={
-                "action_type": "replace_entry",
-                "policy_source": "safety_fsm",
-                "requested_reprice": True,
-                "replace_group_id": replace_group_id,
-                "reprice_origin_order_id": getattr(open_order, "order_id", None),
-                "reprice_origin_client_order_id": getattr(open_order, "client_order_id", None),
-            },
-        )
-
     def _select_stale_open_orders(self, open_orders, threshold_minutes: float):
         stale_orders = []
         for open_order in open_orders or []:
@@ -380,24 +347,6 @@ class SafetyPolicyEngine:
                 continue
             stale_orders.append(open_order)
         return stale_orders
-
-    def _build_replacement_price(self, side: str, snapshot, limit_offset_bps: float) -> Optional[float]:
-        reference_price = self._safe_float(getattr(snapshot, "current_price", None))
-        order_book = getattr(snapshot, "order_book", None)
-        best_bid = self._safe_float(getattr(order_book, "best_bid", None))
-        best_ask = self._safe_float(getattr(order_book, "best_ask", None))
-        if reference_price is None or reference_price <= 0:
-            return None
-        offset_ratio = float(limit_offset_bps) / 10000.0
-        if side == "BUY":
-            candidate = reference_price * (1.0 - offset_ratio)
-            if best_bid is not None:
-                candidate = min(candidate, best_bid)
-        else:
-            candidate = reference_price * (1.0 + offset_ratio)
-            if best_ask is not None:
-                candidate = max(candidate, best_ask)
-        return round(candidate, 8)
 
     def _build_replace_group_id(self, open_order) -> str:
         basis = "|".join(

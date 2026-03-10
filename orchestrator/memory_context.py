@@ -50,14 +50,12 @@ class TradingMemoryContextMixin:
         trend_contexts: set[str] = set()
         for snapshot in (market_snapshots or {}).values():
             active_flags = []
-            if bool(getattr(snapshot, "volume_surge_trigger_active", False)):
+            if bool(getattr(snapshot, "volume_surge_signal_active", False)):
                 active_flags.append("volume_surge")
-            if bool(getattr(snapshot, "fast_move_trigger_active", False)):
+            if bool(getattr(snapshot, "fast_move_signal_active", False)):
                 active_flags.append("fast_move")
-            if bool(getattr(snapshot, "range_break_trigger_active", False)):
+            if bool(getattr(snapshot, "range_break_signal_active", False)):
                 active_flags.append("range_break")
-            if bool(getattr(snapshot, "is_opportunity_trigger", False)):
-                active_flags.append("opportunity")
             if bool(getattr(snapshot, "is_risk_trigger", False)):
                 active_flags.append("risk")
             trigger_contexts.add("+".join(active_flags) if active_flags else "none")

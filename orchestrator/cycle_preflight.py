@@ -83,7 +83,7 @@ class TradingCyclePreflightMixin:
             market_snapshots=cycle_context["market_snapshots"],
             market_prices=cycle_context["market_prices"],
             risk_state=cycle_context["risk_state"],
-            is_trigger_mode=cycle_context["is_trigger_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
             unresolved_timeout_count=unresolved_after_reconcile,
             active_profile_override=cycle_context["effective_risk_profile"],
         )

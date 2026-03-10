@@ -70,9 +70,9 @@ class StateStoreTradeCaseSnapshotMixin:
                         distance_to_invalid_level,
                         trigger_active,
                         risk_trigger_active,
-                        volume_surge_trigger_active,
-                        fast_move_trigger_active,
-                        range_break_trigger_active,
+                        volume_surge_signal_active,
+                        fast_move_signal_active,
+                        range_break_signal_active,
                         trend_1h,
                         payload
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -93,9 +93,9 @@ class StateStoreTradeCaseSnapshotMixin:
                             entry.get("distance_to_invalid_level"),
                             int(bool(entry.get("trigger_active"))),
                             int(bool(entry.get("risk_trigger_active"))),
-                            int(bool(entry.get("volume_surge_trigger_active"))),
-                            int(bool(entry.get("fast_move_trigger_active"))),
-                            int(bool(entry.get("range_break_trigger_active"))),
+                            int(bool(entry.get("volume_surge_signal_active"))),
+                            int(bool(entry.get("fast_move_signal_active"))),
+                            int(bool(entry.get("range_break_signal_active"))),
                             entry.get("trend_1h"),
                             json.dumps(entry.get("payload") or {}),
                         )
@@ -130,9 +130,9 @@ class StateStoreTradeCaseSnapshotMixin:
                 distance_to_invalid_level,
                 trigger_active,
                 risk_trigger_active,
-                volume_surge_trigger_active,
-                fast_move_trigger_active,
-                range_break_trigger_active,
+                volume_surge_signal_active,
+                fast_move_signal_active,
+                range_break_signal_active,
                 trend_1h,
                 payload
             FROM market_snapshot_history

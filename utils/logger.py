@@ -29,6 +29,65 @@ def _resolve_file_sink(file_sink: str | None) -> str:
     return str(path)
 
 
+def _fallback_file_sink(original_sink: str) -> str:
+    original_path = Path(str(original_sink))
+    fallback_root = Path(os.getenv("LOG_FALLBACK_DIR", "/tmp"))
+    fallback_root.mkdir(parents=True, exist_ok=True)
+    fallback_name = original_path.name or "gpt_trader.log"
+    return str(fallback_root / fallback_name)
+
+
+def _add_file_sink(target_sink: str, *, log_level: str, log_format: str) -> str:
+    try:
+        if log_format == "json":
+            logger.add(
+                target_sink,
+                rotation="20 MB",
+                retention="10 days",
+                level=log_level,
+                colorize=False,
+                serialize=True,
+                encoding="utf-8",
+            )
+        else:
+            logger.add(
+                target_sink,
+                rotation="20 MB",
+                retention="10 days",
+                level=log_level,
+                colorize=False,
+                format=TEXT_LOG_FORMAT,
+                encoding="utf-8",
+            )
+        return target_sink
+    except OSError:
+        fallback_sink = _fallback_file_sink(target_sink)
+        if fallback_sink == target_sink:
+            raise
+        if log_format == "json":
+            logger.add(
+                fallback_sink,
+                rotation="20 MB",
+                retention="10 days",
+                level=log_level,
+                colorize=False,
+                serialize=True,
+                encoding="utf-8",
+            )
+        else:
+            logger.add(
+                fallback_sink,
+                rotation="20 MB",
+                retention="10 days",
+                level=log_level,
+                colorize=False,
+                format=TEXT_LOG_FORMAT,
+                encoding="utf-8",
+            )
+        logger.warning("File log sink {} is not writable; falling back to {}.", target_sink, fallback_sink)
+        return fallback_sink
+
+
 def setup_logger(
     log_level: str | None = None,
     log_format: str | None = None,
@@ -42,26 +101,13 @@ def setup_logger(
     logger.remove()
     if log_format == "json":
         logger.add(stdout_sink, level=log_level, colorize=False, serialize=True)
-        logger.add(
-            file_sink,
-            rotation="20 MB",
-            retention="10 days",
-            level=log_level,
-            colorize=False,
-            serialize=True,
-            encoding="utf-8",
-        )
     else:
         logger.add(stdout_sink, level=log_level, colorize=True, format=TEXT_LOG_FORMAT)
-        logger.add(
-            file_sink,
-            rotation="20 MB",
-            retention="10 days",
-            level=log_level,
-            colorize=False,
-            format=TEXT_LOG_FORMAT,
-            encoding="utf-8",
-        )
+    _add_file_sink(
+        file_sink,
+        log_level=log_level,
+        log_format=log_format,
+    )
     return logger
 
 

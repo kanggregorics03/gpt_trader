@@ -159,17 +159,12 @@ class TestRefactorStructure(unittest.TestCase):
         )
         self.assertTrue(
             StateStore.save_execution_policy_evaluations.__qualname__.startswith(
-                "StateStoreExecutionPolicyRuntimeMixin."
+                "StateStoreExecutionEvaluationRuntimeMixin."
             )
         )
         self.assertTrue(
             StateStore.save_candidate_policy_version.__qualname__.startswith(
                 "StateStorePolicyRegistryRuntimeMixin."
-            )
-        )
-        self.assertTrue(
-            StateStore.get_policy_bundle.__qualname__.startswith(
-                "StateStorePolicyBundleRuntimeMixin."
             )
         )
         self.assertTrue(

@@ -254,9 +254,9 @@ class MarketCollector:
         metrics = {
             "volume_ratio_15m": tf_15m.volume_ratio if tf_15m else None,
             "volume_surge_15m_now": bool(tf_15m.volume_surge) if tf_15m else False,
-            "fast_move_trigger_active": bool(regime.fast_move_trigger_active),
-            "volume_surge_trigger_active": bool(regime.volume_surge_trigger_active),
-            "range_break_trigger_active": bool(regime.range_break_trigger_active),
+            "fast_move_signal_active": bool(regime.fast_move_signal_active),
+            "volume_surge_signal_active": bool(regime.volume_surge_signal_active),
+            "range_break_signal_active": bool(regime.range_break_signal_active),
             "oi_change_15m": oi_change_15m,
             "oi_change_1h": oi_change_1h,
             "funding_rate_change_1h": funding_rate_change_1h,
@@ -727,7 +727,6 @@ class MarketCollector:
         elif order_book.imbalance_top5 <= 0.4:
             liquidity_regime = "ask_dominant"
 
-        opportunity_trigger_reasons = []
         risk_trigger_reasons = []
         fast_move_threshold_pct = max(0.5, (tf_15m.atr_pct * 0.8) if tf_15m else 0.5)
         fast_move_off_threshold_pct = max(0.3, fast_move_threshold_pct * 0.6)
@@ -737,10 +736,8 @@ class MarketCollector:
                 current_value=abs(tf_15m.change_1bar_pct),
                 on_threshold=fast_move_threshold_pct,
                 off_threshold=fast_move_off_threshold_pct,
-                was_active=bool(trigger_state.get("fast_price_move_15m_active")),
+                was_active=bool(trigger_state.get("fast_move_signal_15m_active")),
             )
-        if fast_move_active:
-            opportunity_trigger_reasons.append("fast_price_move_15m")
         volume_surge_on_threshold = 1.8
         volume_surge_off_threshold = 1.35
         volume_surge_active = False
@@ -749,16 +746,12 @@ class MarketCollector:
                 current_value=tf_15m.volume_ratio,
                 on_threshold=volume_surge_on_threshold,
                 off_threshold=volume_surge_off_threshold,
-                was_active=bool(trigger_state.get("volume_surge_15m_active")),
+                was_active=bool(trigger_state.get("volume_surge_signal_15m_active")),
             )
-        if volume_surge_active:
-            opportunity_trigger_reasons.append("volume_surge_15m")
         range_break_active = self._breakout_trigger_active(
             tf_snapshot=tf_1h,
-            was_active=bool(trigger_state.get("range_break_1h_active")),
+            was_active=bool(trigger_state.get("range_break_signal_1h_active")),
         )
-        if range_break_active:
-            opportunity_trigger_reasons.append("range_break_1h")
         if derivatives.funding_rate is not None and abs(derivatives.funding_rate) >= 0.0005:
             risk_trigger_reasons.append("elevated_funding")
         if order_book.spread_bps is not None and order_book.spread_bps >= 10:
@@ -769,18 +762,17 @@ class MarketCollector:
             volatility_regime=volatility_regime,
             momentum_regime=momentum_regime,
             liquidity_regime=liquidity_regime,
-            fast_move_trigger_active=fast_move_active,
-            volume_surge_trigger_active=volume_surge_active,
-            range_break_trigger_active=range_break_active,
-            opportunity_trigger_reasons=opportunity_trigger_reasons,
+            fast_move_signal_active=fast_move_active,
+            volume_surge_signal_active=volume_surge_active,
+            range_break_signal_active=range_break_active,
             risk_trigger_reasons=risk_trigger_reasons,
         )
 
     def build_next_trigger_state(self, snapshot: MarketSnapshot) -> Dict[str, Any]:
         return {
-            "fast_price_move_15m_active": "fast_price_move_15m" in snapshot.opportunity_trigger_reasons,
-            "volume_surge_15m_active": "volume_surge_15m" in snapshot.opportunity_trigger_reasons,
-            "range_break_1h_active": "range_break_1h" in snapshot.opportunity_trigger_reasons,
+            "fast_move_signal_15m_active": bool(snapshot.fast_move_signal_active),
+            "volume_surge_signal_15m_active": bool(snapshot.volume_surge_signal_active),
+            "range_break_signal_1h_active": bool(snapshot.range_break_signal_active),
         }
 
     def get_market_snapshot(
@@ -858,10 +850,8 @@ class MarketCollector:
                 derivatives,
                 trigger_state=trigger_state,
             )
-            opportunity_trigger_reasons = list(regime.opportunity_trigger_reasons)
             risk_trigger_reasons = list(regime.risk_trigger_reasons)
-            trigger_reasons = opportunity_trigger_reasons + risk_trigger_reasons
-            is_opportunity_trigger = bool(opportunity_trigger_reasons)
+            trigger_reasons = list(risk_trigger_reasons)
             is_risk_trigger = bool(risk_trigger_reasons)
 
             tf_15m = timeframe_snapshots.get("15m", TimeframeSnapshot(timeframe="15m"))
@@ -885,9 +875,9 @@ class MarketCollector:
                 recent_volume_surge=tf_15m.volume_surge,
                 volume_ratio_15m=derived_metrics["volume_ratio_15m"],
                 volume_surge_15m_now=derived_metrics["volume_surge_15m_now"],
-                fast_move_trigger_active=derived_metrics["fast_move_trigger_active"],
-                volume_surge_trigger_active=derived_metrics["volume_surge_trigger_active"],
-                range_break_trigger_active=derived_metrics["range_break_trigger_active"],
+                fast_move_signal_active=derived_metrics["fast_move_signal_active"],
+                volume_surge_signal_active=derived_metrics["volume_surge_signal_active"],
+                range_break_signal_active=derived_metrics["range_break_signal_active"],
                 oi_change_15m=derived_metrics["oi_change_15m"],
                 oi_change_1h=derived_metrics["oi_change_1h"],
                 funding_rate_change_1h=derived_metrics["funding_rate_change_1h"],
@@ -898,7 +888,6 @@ class MarketCollector:
                 distance_to_15m_breakout_level=derived_metrics["distance_to_15m_breakout_level"],
                 distance_to_1h_breakout_level=derived_metrics["distance_to_1h_breakout_level"],
                 distance_to_invalid_level=derived_metrics["distance_to_invalid_level"],
-                is_trigger_event=is_opportunity_trigger,
                 price_change_24h_pct=price_change_24h_pct,
                 high_24h=high_24h,
                 low_24h=low_24h,
@@ -910,9 +899,7 @@ class MarketCollector:
                 order_book=order_book,
                 derivatives=derivatives,
                 regime=regime,
-                is_opportunity_trigger=is_opportunity_trigger,
                 is_risk_trigger=is_risk_trigger,
-                opportunity_trigger_reasons=opportunity_trigger_reasons,
                 risk_trigger_reasons=risk_trigger_reasons,
                 trigger_reasons=trigger_reasons,
             )

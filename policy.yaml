@@ -6,8 +6,8 @@ trading:
   order_type: "market" # legacy fallback; execution_policy.allowed_order_types now controls runtime choice
   
 risk_limits:
-  daily_max_loss_pct: 3.0    # Daily kill-switch: stop new entries if realized daily loss exceeds 3% of account balance
-  drawdown_activate_pct: 1.5 # Enter drawdown mode before the hard daily kill-switch is hit
+  daily_max_loss_pct: 10.0   # Daily kill-switch: stop new entries if realized daily loss exceeds 10% of account balance
+  drawdown_activate_pct: 5.0 # Enter drawdown mode before the hard daily kill-switch is hit
   max_consecutive_losses: 3  # Pause trading after 3 consecutive losing closes within the current UTC day
   cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
   dynamic_cooldown:
@@ -26,15 +26,21 @@ risk_limits:
     repeated_failure_add_minutes: 15
     max_minutes: 90
   max_open_positions: 1      # Single-symbol project: only one concurrent position is allowed
+  setup_quality:
+    retest_max_breakout_distance_pct: 0.6
+    retest_max_invalid_distance_atr: 1.6
+    value_max_invalid_distance_atr: 1.8
+    value_spread_percentile_penalty: 85
+    value_depth_percentile_penalty: 15
   mode_profiles:
     normal:
       max_open_positions: 1
       max_order_notional_pct_balance: 100
       allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
-    trigger:
+    guarded:
       max_open_positions: 1
-      max_order_notional_pct_balance: 35
-      allowed_actions: [HOLD, BUY, SELL, REDUCE, EXIT]
+      max_order_notional_pct_balance: 0
+      allowed_actions: [HOLD, REDUCE, EXIT]
       block_additional_entries_when_position_exists: true
     cooldown:
       max_open_positions: 1
@@ -79,24 +85,25 @@ daily_batch:
   run_minute_local: 0
   replay_timeout_seconds: 1800
   memory_timeout_seconds: 1800
+  deepseek_memory_timeout_seconds: 5400
 
 execution_policy:
   allowed_order_types: [market, limit]
   default_entry_order_type: limit
   default_reduce_order_type: market
   default_exit_order_type: market
-  prefer_market_when_trigger_mode: true
-  prefer_market_spread_percentile_lte: 35
-  prefer_limit_spread_percentile_gte: 80
-  prefer_limit_depth_percentile_lte: 20
+  preserve_market_entry_semantics: true # Live execution is deterministic: EXIT/REDUCE stay market_urgent and entry meaning is preserved
   aggressive_limit_offset_bps: 3
   passive_limit_offset_bps: 8
+  value_limit_min_offset_bps: 8
+  value_limit_max_offset_bps: 24
+  value_limit_spread_multiplier: 1.5
+  value_limit_atr_fraction: 0.12
   market_max_slippage_bps: 18
   limit_max_slippage_bps: 10
-  profile_min_support: 4
 
 position_policy:
-  losing_exit_pct: -1.25     # 15m deterministic stop based on unrealized pnl as % of total account balance
+  losing_exit_pct: -3.0      # 15m deterministic per-trade loss cap based on unrealized pnl as % of total account balance
   stalled_minutes: 45
   stalled_max_pnl_pct: 0.2
   weakened_minutes: 30       # thesis weaken exit only after the trade has had time to play out
@@ -106,23 +113,15 @@ position_policy:
   microstructure_exit_confirmations: 2   # require consecutive degraded snapshots before a 15m liquidity exit
   invalidation_reduce_distance_atr: 0.75 # 15m thesis weaken exit only near the invalidation level
   stale_order_minutes: 30
-  stale_order_reprice_enabled: true
-  stale_order_reprice_spread_percentile_max: 75
-  stale_order_reprice_depth_percentile_min: 25
-  stale_order_reprice_limit_offset_bps: 4
 
 safety_policy:
-  loss_exit_pct: -0.9        # 5m deterministic stop based on unrealized pnl as % of total account balance
+  loss_exit_pct: -3.0        # 5m internal acute-loss threshold; aligns with the per-trade loss cap but does not by itself promote the cadence into 5m
   risk_trigger_exit_count: 1
   microstructure_exit_spread_percentile: 85
   microstructure_exit_depth_percentile: 15
   microstructure_exit_confirmations: 2   # 5m is emergency-only: one noisy snapshot is not enough to force exit
   stale_order_minutes: 12
   stale_order_risk_trigger_count: 1
-  stale_order_reprice_enabled: true
-  stale_order_reprice_spread_percentile_max: 70
-  stale_order_reprice_depth_percentile_min: 30
-  stale_order_reprice_limit_offset_bps: 3
 
 alpha_policy: {}
 

@@ -40,6 +40,23 @@ from exchange.execution_engine import ExecutionEngine
 from utils.logger import log
 
 class TradingMaintenanceMixin:
+    def _resolve_memory_batch_timeout_seconds(self, configured_timeout_seconds: int) -> int:
+        timeout_seconds = max(60, int(configured_timeout_seconds or 0))
+        memory_provider = normalize_provider_name(os.getenv("MEMORY_PROVIDER"))
+        if memory_provider != "deepseek":
+            return timeout_seconds
+        deepseek_floor = max(
+            60,
+            int(
+                (self.risk_engine.policy.get("daily_batch", {}) or {}).get(
+                    "deepseek_memory_timeout_seconds",
+                    self.DEFAULT_DAILY_BATCH.get("deepseek_memory_timeout_seconds", timeout_seconds),
+                )
+                or timeout_seconds
+            ),
+        )
+        return max(timeout_seconds, deepseek_floor)
+
     def _build_daily_batch_config(self):
         configured = self.risk_engine.policy.get("daily_batch", {})
         config = dict(self.DEFAULT_DAILY_BATCH)
@@ -72,6 +89,19 @@ class TradingMaintenanceMixin:
                 )
                 or 0
             ),
+        )
+        config["deepseek_memory_timeout_seconds"] = max(
+            60,
+            int(
+                config.get(
+                    "deepseek_memory_timeout_seconds",
+                    self.DEFAULT_DAILY_BATCH["deepseek_memory_timeout_seconds"],
+                )
+                or 0
+            ),
+        )
+        config["memory_timeout_seconds"] = self._resolve_memory_batch_timeout_seconds(
+            config["memory_timeout_seconds"]
         )
         return config
 

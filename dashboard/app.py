@@ -113,10 +113,182 @@ def _build_memory_summary(rows):
     }
 
 
+def _build_execution_contract_summary(rows):
+    adjustment_counts = {}
+    audits_affected = set()
+    total_adjustments = 0
+    governed_orders = 0
+    immediate_entry_orders = 0
+    reduce_exit_orders = 0
+    for row in rows or []:
+        execution_summary = row.get("execution_summary") or {}
+        execution_policy = execution_summary.get("execution_policy") or {}
+        orders = execution_policy.get("orders") or []
+        for order in orders:
+            action_type = str((order or {}).get("action_type") or "").strip().lower()
+            if action_type in {"entry", "reduce", "exit"}:
+                governed_orders += 1
+            if action_type == "entry" and str((order or {}).get("entry_style") or "").strip().lower() == "immediate":
+                immediate_entry_orders += 1
+            if action_type in {"reduce", "exit"}:
+                reduce_exit_orders += 1
+            adjustment = str((order or {}).get("contract_adjustment") or "").strip()
+            if not adjustment:
+                continue
+            total_adjustments += 1
+            audit_id = row.get("id") or row.get("audit_log_id")
+            if audit_id is not None:
+                audits_affected.add(int(audit_id))
+            adjustment_counts[adjustment] = adjustment_counts.get(adjustment, 0) + 1
+    top_adjustment = ""
+    top_count = 0
+    if adjustment_counts:
+        top_adjustment, top_count = max(adjustment_counts.items(), key=lambda item: item[1])
+    return {
+        "total_adjustments": total_adjustments,
+        "audits_affected": len(audits_affected),
+        "governed_orders": governed_orders,
+        "immediate_entry_orders": immediate_entry_orders,
+        "reduce_exit_orders": reduce_exit_orders,
+        "adjustment_rate": round(total_adjustments / governed_orders, 4) if governed_orders else 0.0,
+        "top_adjustment": top_adjustment,
+        "top_adjustment_count": top_count,
+        "adjustment_counts": dict(sorted(adjustment_counts.items())),
+    }
+
+
+def _enrich_execution_evaluation_rows(rows, store):
+    enriched = []
+    trade_case_cache = {}
+    for row in rows or []:
+        item = dict(row)
+        payload = item.get("payload") or {}
+        trade_case_id = str(item.get("outcome_trade_case_id") or "").strip()
+        trade_case = {}
+        if trade_case_id and hasattr(store, "get_trade_case"):
+            trade_case = trade_case_cache.get(trade_case_id)
+            if trade_case is None:
+                trade_case = store.get_trade_case(trade_case_id) or {}
+                trade_case_cache[trade_case_id] = trade_case
+        resolved_pnl_pct = trade_case.get("estimated_pnl_pct")
+        if resolved_pnl_pct is None:
+            resolved_pnl_pct = item.get("outcome_estimated_pnl_pct")
+        resolved_label = str(item.get("outcome_label") or payload.get("outcome_label") or "").strip().lower()
+        resolved_status = str(trade_case.get("status") or payload.get("case_status") or "").strip().lower()
+        item["entry_style"] = str(item.get("entry_style") or payload.get("entry_style") or "").strip().lower() or None
+        item["resolved_outcome_pnl_pct"] = resolved_pnl_pct
+        item["resolved_outcome_label"] = resolved_label or None
+        item["resolved_outcome_status"] = resolved_status or None
+        item["resolved_thesis_failure_reason"] = trade_case.get("thesis_failure_reason")
+        enriched.append(item)
+    return enriched
+
+
+def _build_entry_style_summary(rows):
+    styles = {
+        "immediate": {
+            "style": "immediate",
+            "entry_count": 0,
+            "settled_count": 0,
+            "win_count": 0,
+            "avg_pnl_pct": 0.0,
+            "no_fill_count": 0,
+            "no_fill_rate": 0.0,
+            "missed_move_count": 0,
+            "missed_move_rate": 0.0,
+        },
+        "retest": {
+            "style": "retest",
+            "entry_count": 0,
+            "settled_count": 0,
+            "win_count": 0,
+            "avg_pnl_pct": 0.0,
+            "no_fill_count": 0,
+            "no_fill_rate": 0.0,
+            "missed_move_count": 0,
+            "missed_move_rate": 0.0,
+        },
+        "value": {
+            "style": "value",
+            "entry_count": 0,
+            "settled_count": 0,
+            "win_count": 0,
+            "avg_pnl_pct": 0.0,
+            "no_fill_count": 0,
+            "no_fill_rate": 0.0,
+            "missed_move_count": 0,
+            "missed_move_rate": 0.0,
+        },
+    }
+    pnl_buckets = {key: [] for key in styles}
+    for row in rows or []:
+        style = str(row.get("entry_style") or "").strip().lower()
+        if style not in styles:
+            continue
+        bucket = styles[style]
+        bucket["entry_count"] += 1
+        if _safe_float(row.get("filled_quantity"), default=0.0) <= 0:
+            bucket["no_fill_count"] += 1
+        if row.get("resolved_outcome_label") == "missed_due_to_no_fill":
+            bucket["missed_move_count"] += 1
+        pnl_pct = row.get("resolved_outcome_pnl_pct")
+        if pnl_pct is not None:
+            pnl_value = _safe_float(pnl_pct, default=None)
+            if pnl_value is not None:
+                bucket["settled_count"] += 1
+                pnl_buckets[style].append(pnl_value)
+                if pnl_value > 0:
+                    bucket["win_count"] += 1
+    for style, bucket in styles.items():
+        entry_count = bucket["entry_count"]
+        settled_count = bucket["settled_count"]
+        bucket["win_rate"] = round((bucket["win_count"] / settled_count) * 100, 2) if settled_count else 0.0
+        bucket["avg_pnl_pct"] = round(sum(pnl_buckets[style]) / len(pnl_buckets[style]), 4) if pnl_buckets[style] else 0.0
+        bucket["no_fill_rate"] = round(bucket["no_fill_count"] / entry_count, 4) if entry_count else 0.0
+        bucket["missed_move_rate"] = round(bucket["missed_move_count"] / entry_count, 4) if entry_count else 0.0
+    active_styles = [bucket for bucket in styles.values() if bucket["entry_count"] > 0]
+    top_style = max(active_styles, key=lambda item: item["entry_count"])["style"] if active_styles else ""
+    return {
+        "total_entries": sum(bucket["entry_count"] for bucket in styles.values()),
+        "settled_entries": sum(bucket["settled_count"] for bucket in styles.values()),
+        "styles": [styles["immediate"], styles["retest"], styles["value"]],
+        "top_style": top_style,
+    }
+
+
+def _build_post_trade_outcome_summary(rows):
+    label_counts = {
+        "edge_failed": 0,
+        "missed_due_to_no_fill": 0,
+        "risk_exit": 0,
+        "stale_entry_cancelled": 0,
+    }
+    for row in rows or []:
+        label = str(row.get("resolved_outcome_label") or "").strip().lower()
+        if label in label_counts:
+            label_counts[label] += 1
+    total_labeled = sum(label_counts.values())
+    top_label = ""
+    top_count = 0
+    if total_labeled:
+        top_label, top_count = max(label_counts.items(), key=lambda item: item[1])
+    return {
+        "total_labeled": total_labeled,
+        "top_label": top_label,
+        "top_count": top_count,
+        "label_counts": label_counts,
+    }
+
+
 def _build_dashboard_snapshot():
     now = datetime.now(UTC).replace(tzinfo=None)
     store = _get_state_store()
     snapshot = store.get_monitoring_snapshot(now=now)
+    audit_rows_24h = store.get_recent_audits(limit=400, since=now - timedelta(hours=24))
+    execution_eval_rows_24h = _enrich_execution_evaluation_rows(
+        store.get_execution_policy_evaluations_since(now - timedelta(hours=24)),
+        store,
+    )
     snapshot["symbol_report"] = store.get_symbol_performance_report(hours=24, now=now)
     snapshot["daily_report"] = store.get_daily_ledger_report(days=7, now=now)
     snapshot["recent_trade_cases"] = store.get_recent_trade_cases(limit=10)
@@ -131,6 +303,9 @@ def _build_dashboard_snapshot():
     snapshot["trade_case_summary"] = _build_trade_case_summary(
         store.get_trade_cases_since(now - timedelta(hours=24), limit=500)
     )
+    snapshot["execution_contract_summary"] = _build_execution_contract_summary(audit_rows_24h)
+    snapshot["entry_style_summary"] = _build_entry_style_summary(execution_eval_rows_24h)
+    snapshot["post_trade_outcome_summary"] = _build_post_trade_outcome_summary(execution_eval_rows_24h)
     snapshot["retrieval_summary"] = _build_retrieval_summary(retrieval_rows)
     snapshot["memory_summary"] = _build_memory_summary(recent_memory)
     return snapshot
@@ -151,7 +326,7 @@ def _resolve_replay_model_name(replay_provider: str) -> str:
 
 def _build_model_routing() -> dict[str, str]:
     provider = normalize_provider_name(os.getenv("AI_PROVIDER"))
-    default_model, trigger_model = resolve_decision_models(provider)
+    default_model, guarded_attention_model = resolve_decision_models(provider)
     memory_provider = normalize_provider_name(os.getenv("MEMORY_PROVIDER") or provider)
     memory_model = resolve_memory_model_name(
         memory_provider,
@@ -162,7 +337,7 @@ def _build_model_routing() -> dict[str, str]:
     return {
         "provider": provider,
         "default_model": default_model,
-        "trigger_model": trigger_model,
+        "guarded_attention_model": guarded_attention_model,
         "memory_provider": memory_provider,
         "memory_model": memory_model,
         "replay_provider": replay_provider,
@@ -347,6 +522,24 @@ HTML_TEMPLATE = """
                 <p class="sub" id="val-learning-liveness-meta">replay coverage -</p>
                 <p class="sub" id="val-learning-liveness-extra">promotion gate -</p>
             </article>
+            <article class="card">
+                <p class="eyebrow">Execution Contract</p>
+                <p class="value" id="val-exec-contract">-</p>
+                <p class="sub" id="val-exec-contract-meta">affected audits - • governed orders -</p>
+                <p class="sub" id="val-exec-contract-extra">top adjustment - • immediate -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Entry Styles 24h</p>
+                <p class="value" id="val-entry-styles">-</p>
+                <p class="sub" id="val-entry-styles-meta">settled - • top style -</p>
+                <p class="sub" id="val-entry-styles-extra">retest - • value -</p>
+            </article>
+            <article class="card">
+                <p class="eyebrow">Outcome Labels 24h</p>
+                <p class="value" id="val-outcome-labels">-</p>
+                <p class="sub" id="val-outcome-labels-meta">top label -</p>
+                <p class="sub" id="val-outcome-labels-extra">edge - • missed - • risk - • stale -</p>
+            </article>
         </section>
 
         <section class="layout">
@@ -411,6 +604,14 @@ HTML_TEMPLATE = """
                     <p class="eyebrow">Daily Report</p>
                     <div id="daily-report-list">Loading...</div>
                 </article>
+                <article class="panel">
+                    <p class="eyebrow">Entry Style Performance</p>
+                    <div id="entry-style-list">Loading...</div>
+                </article>
+                <article class="panel">
+                    <p class="eyebrow">Post-Trade Labels</p>
+                    <div id="outcome-label-list">Loading...</div>
+                </article>
             </div>
         </section>
 
@@ -436,12 +637,12 @@ HTML_TEMPLATE = """
             const value = models || {};
             const provider = value.provider || 'unset';
             const defaultModel = value.default_model || 'unset';
-            const triggerModel = value.trigger_model || defaultModel;
+            const triggerModel = value.guarded_attention_model || defaultModel;
             const memoryProvider = value.memory_provider || provider;
             const memoryModel = value.memory_model || triggerModel || defaultModel;
             const replayProvider = value.replay_provider || provider;
             const replayModel = value.replay_model || memoryModel;
-            return `decision ${provider}:${defaultModel} | trigger ${triggerModel} | memory ${memoryProvider}:${memoryModel} | replay ${replayProvider}:${replayModel}`;
+            return `decision ${provider}:${defaultModel} | guarded ${triggerModel} | memory ${memoryProvider}:${memoryModel} | replay ${replayProvider}:${replayModel}`;
         }
 
         function parseJson(raw, fallback = {}) {
@@ -566,6 +767,7 @@ HTML_TEMPLATE = """
         function renderEvidenceQuality(executionSummary) {
             const evidenceQuality = executionSummary.evidence_quality || {};
             const entrySizeCap = executionSummary.entry_size_cap || {};
+            const setupQuality = entrySizeCap.setup_quality || {};
             if (!Object.keys(evidenceQuality).length && !Object.keys(entrySizeCap).length) {
                 return '<p class="sub">No evidence quality summary stored.</p>';
             }
@@ -582,6 +784,9 @@ HTML_TEMPLATE = """
                     <div class="memory-meta">
                         entry cap ${(entrySizeCap.base_cap_pct ?? 0)}% -> ${(entrySizeCap.effective_cap_pct ?? 0)}%
                         • adjusted ${entrySizeCap.adjusted ? 'yes' : 'no'}
+                    </div>
+                    <div class="memory-meta">
+                        setup quality ${(setupQuality.factor ?? 1.0)} • issues ${(setupQuality.issues || []).join(', ') || 'none'}
                     </div>
                 </div>
             `;
@@ -960,6 +1165,11 @@ HTML_TEMPLATE = """
                 const memorySummary = data.memory_summary || {};
                 const contextBiasSummary = (((data.context_bias_summary || {}).last_24h || {}).journal_selected || {});
                 const learningLiveness = data.learning_liveness || {};
+                const executionContractSummary = data.execution_contract_summary || {};
+                const entryStyleSummary = data.entry_style_summary || {};
+                const outcomeSummary = data.post_trade_outcome_summary || {};
+                const styleRows = entryStyleSummary.styles || [];
+                const labelCounts = outcomeSummary.label_counts || {};
                 const contextGroupCounts = contextBiasSummary.group_counts || {};
                 const contextGroupRatios = contextBiasSummary.group_ratios || {};
                 document.getElementById('val-trade-cases').innerText = tradeCaseSummary.total_count || 0;
@@ -983,6 +1193,27 @@ HTML_TEMPLATE = """
                     `replay ${(Number(learningLiveness.replay_processed_rate_24h || 0) * 100).toFixed(0)}% ??runs ${learningLiveness.replay_run_count_24h || 0}/${learningLiveness.replay_candidate_count_24h || 0}`;
                 document.getElementById('val-learning-liveness-extra').innerText =
                     `promotion gate ${learningLiveness.promotion_blocked ? 'blocked' : 'open'} ??${(learningLiveness.stale_reasons || []).join(', ') || 'healthy'}`;
+                document.getElementById('val-exec-contract').innerText = executionContractSummary.total_adjustments || 0;
+                document.getElementById('val-exec-contract-meta').innerText =
+                    `affected audits ${executionContractSummary.audits_affected || 0} • governed orders ${executionContractSummary.governed_orders || 0}`;
+                document.getElementById('val-exec-contract-extra').innerText =
+                    executionContractSummary.top_adjustment
+                        ? `top adjustment ${executionContractSummary.top_adjustment} (${executionContractSummary.top_adjustment_count || 0}) • immediate ${executionContractSummary.immediate_entry_orders || 0} • reduce/exit ${executionContractSummary.reduce_exit_orders || 0}`
+                        : `top adjustment none • immediate ${executionContractSummary.immediate_entry_orders || 0} • reduce/exit ${executionContractSummary.reduce_exit_orders || 0}`;
+                document.getElementById('val-entry-styles').innerText = entryStyleSummary.total_entries || 0;
+                document.getElementById('val-entry-styles-meta').innerText =
+                    `settled ${entryStyleSummary.settled_entries || 0} • top style ${entryStyleSummary.top_style || 'none'}`;
+                const retestSummary = styleRows.find(item => item.style === 'retest') || {};
+                const valueSummary = styleRows.find(item => item.style === 'value') || {};
+                document.getElementById('val-entry-styles-extra').innerText =
+                    `retest ${(Number(retestSummary.win_rate || 0)).toFixed(1)}% win • value ${((Number(valueSummary.no_fill_rate || 0)) * 100).toFixed(1)}% no-fill`;
+                document.getElementById('val-outcome-labels').innerText = outcomeSummary.total_labeled || 0;
+                document.getElementById('val-outcome-labels-meta').innerText =
+                    outcomeSummary.top_label
+                        ? `top label ${outcomeSummary.top_label} (${outcomeSummary.top_count || 0})`
+                        : 'top label none';
+                document.getElementById('val-outcome-labels-extra').innerText =
+                    `edge ${labelCounts.edge_failed || 0} • missed ${labelCounts.missed_due_to_no_fill || 0} • risk ${labelCounts.risk_exit || 0} • stale ${labelCounts.stale_entry_cancelled || 0}`;
                 const rejectRate = data.total_audits_24h > 0
                     ? ((data.rejected_24h / data.total_audits_24h) * 100).toFixed(1) + '%'
                     : '0%';
@@ -1127,6 +1358,23 @@ HTML_TEMPLATE = """
                         <div class="fill-meta">
                             gross ${row.gross_realized_pnl} • fee ${row.fee_cost} • rows ${row.row_count}
                         </div>
+                    </div>
+                `);
+
+                renderList('entry-style-list', 'No entry-style evaluations yet.', styleRows, row => `
+                    <div class="fill-item">
+                        <strong>${row.style || 'unknown'} • entries ${row.entry_count || 0} • settled ${row.settled_count || 0}</strong>
+                        <div class="fill-meta">
+                            win ${(Number(row.win_rate || 0)).toFixed(1)}% • avg pnl ${(Number(row.avg_pnl_pct || 0)).toFixed(3)}%
+                            <br>no-fill ${((Number(row.no_fill_rate || 0)) * 100).toFixed(1)}% (${row.no_fill_count || 0}) • missed on no-fill ${((Number(row.missed_move_rate || 0)) * 100).toFixed(1)}% (${row.missed_move_count || 0})
+                        </div>
+                    </div>
+                `);
+
+                renderList('outcome-label-list', 'No post-trade labels yet.', Object.entries(labelCounts).map(([label, count]) => ({ label, count })), row => `
+                    <div class="fill-item">
+                        <strong>${row.label}</strong>
+                        <div class="fill-meta">count ${row.count || 0}</div>
                     </div>
                 `);
             });

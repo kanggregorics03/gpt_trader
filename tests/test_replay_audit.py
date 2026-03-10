@@ -145,9 +145,9 @@ class TestReplayAudit(unittest.TestCase):
                         "spread_percentile_1h": 40.0,
                         "depth_percentile_1h": 70.0,
                         "distance_to_invalid_level": 1.0,
-                        "is_opportunity_trigger": True,
-                        "volume_surge_trigger_active": True,
-                        "range_break_trigger_active": True,
+                        "fast_move_signal_active": True,
+                        "volume_surge_signal_active": True,
+                        "range_break_signal_active": True,
                         "timeframes": {
                             "15m": {"trend": "UP", "change_3bar_pct": 1.2, "rsi_14": 62.0},
                             "1h": {"trend": "UP", "change_3bar_pct": 2.1, "rsi_14": 58.0},
@@ -201,7 +201,7 @@ class TestReplayAudit(unittest.TestCase):
         self.assertGreater(summary["hold_opportunity_cost"], 0.0)
         self.assertTrue(summary["windows"]["30m"]["breakout_hit"])
         self.assertEqual(summary["hold_quality"], "missed_opportunity_hold")
-        self.assertEqual(summary["trigger_context"]["signature"], "volume_surge+range_break+opportunity")
+        self.assertEqual(summary["trigger_context"]["signature"], "volume_surge+fast_move+range_break")
         self.assertIn("tight_spread", summary["execution_context"]["signature"])
         self.assertIn("UP", summary["trend_context"]["signature"])
         self.assertGreater(summary["windows"]["30m"]["realized_move_pct"], 0.0)

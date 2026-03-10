@@ -18,18 +18,10 @@ class TradingCycleDecisionMixin:
             execution_guards=execution_guards,
         )
         policy_summary = snapshot_bundle.policy_summary
-        is_trigger_mode = snapshot_bundle.is_trigger_mode
+        is_guarded_attention = snapshot_bundle.is_guarded_attention
         risk_mode = snapshot_bundle.risk_mode
         risk_profile = snapshot_bundle.risk_profile
         regime_key = self._derive_regime_key(market_snapshots)
-        active_bundle_summary = self._build_active_policy_bundle_summary(regime_key=regime_key)
-        regime_drift_summary = self._build_regime_drift_summary(
-            regime_key=regime_key,
-            bundle_summary=active_bundle_summary,
-        )
-        alpha_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "alpha_1h")
-        position_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "position_15m")
-        safety_bundle_override = self._resolve_bundle_policy_config(active_bundle_summary, "safety_5m")
         risk_state_payload = self._serialize_risk_state(risk_state)
         self._maybe_alert_risk_state_transitions(risk_state)
         self._maybe_alert_websocket_transitions()
@@ -45,7 +37,11 @@ class TradingCycleDecisionMixin:
             market_snapshots=market_snapshots,
             loop_mode=loop_mode,
             regime_key=regime_key,
-            alpha_policy_override=alpha_bundle_override,
+        )
+        safety_state = self.safety_policy_engine.get_emergency_state(
+            account_state=account_state,
+            market_snapshots=market_snapshots,
+            regime_key=regime_key,
         )
         return {
             "account_state": account_state,
@@ -53,17 +49,19 @@ class TradingCycleDecisionMixin:
             "market_prices": market_prices,
             "risk_state": risk_state,
             "policy_summary": policy_summary,
-            "is_trigger_mode": is_trigger_mode,
+            "is_guarded_attention": is_guarded_attention,
+            "is_safety_mode": bool(safety_state.get("active")),
+            "safety_state": safety_state,
             "risk_mode": risk_mode,
             "risk_profile": risk_profile,
             "regime_key": regime_key,
-            "active_bundle_summary": active_bundle_summary,
-            "regime_drift_summary": regime_drift_summary,
-            "alpha_bundle_override": alpha_bundle_override,
-            "position_bundle_override": position_bundle_override,
-            "safety_bundle_override": safety_bundle_override,
             "risk_state_payload": risk_state_payload,
             "effective_risk_profile": effective_risk_profile,
+            "entry_headroom": self._build_entry_headroom_summary(
+                account_state=account_state,
+                market_prices=market_prices,
+                risk_profile=effective_risk_profile,
+            ),
             "decision_market_snapshots": decision_market_snapshots,
             "alpha_policy_summary": alpha_policy_summary,
             "loop_mode": loop_mode,
@@ -89,10 +87,11 @@ class TradingCycleDecisionMixin:
             ),
             market_snapshots=decision_market_snapshots,
             risk_state=risk_state_override,
+            entry_headroom=cycle_context["entry_headroom"],
             recent_journal_context=recent_journal_context,
             long_term_memory=long_term_memory,
             similar_past_cases=similar_past_cases,
-            is_trigger_mode=cycle_context["is_trigger_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
             risk_mode=cycle_context["risk_mode"],
             risk_profile=cycle_context["effective_risk_profile"],
             loop_mode=cycle_context["loop_mode"],
@@ -142,7 +141,6 @@ class TradingCycleDecisionMixin:
                 risk_mode=risk_mode,
                 loop_mode=loop_mode,
                 regime_key=cycle_context["regime_key"],
-                policy_override=cycle_context["position_bundle_override"] or None,
             )
         if loop_mode == "5m":
             safety_policy_result = self.safety_policy_engine.evaluate(
@@ -151,7 +149,6 @@ class TradingCycleDecisionMixin:
                 risk_mode=risk_mode,
                 loop_mode=loop_mode,
                 regime_key=cycle_context["regime_key"],
-                policy_override=cycle_context["safety_bundle_override"] or None,
             )
 
         if safety_policy_result and not safety_policy_result.get("escalate_to_ai"):
@@ -256,10 +253,10 @@ class TradingCycleDecisionMixin:
                 cycle_context["decision_market_snapshots"],
                 account_state=account_state,
                 risk_state=risk_state,
-                is_trigger_mode=cycle_context["is_trigger_mode"],
+                is_guarded_attention=cycle_context["is_guarded_attention"],
                 limit=(
                     context_budget["similar_case_keep_limit"]
-                    if cycle_context["is_trigger_mode"]
+                    if cycle_context["is_guarded_attention"]
                     else context_budget.get("similar_case_normal_keep_limit", 2)
                 ),
             )
@@ -294,7 +291,7 @@ class TradingCycleDecisionMixin:
             account_state=account_state,
             loop_mode=loop_mode,
             risk_mode=risk_mode,
-            is_trigger_mode=cycle_context["is_trigger_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
         )
         return {
             "request": request,

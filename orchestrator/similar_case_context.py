@@ -2,7 +2,7 @@ from collections import defaultdict
 
 
 class TradingSimilarCaseContextMixin:
-    def _score_similar_past_case_candidate(self, trade_case, match, is_trigger_mode: bool) -> float:
+    def _score_similar_past_case_candidate(self, trade_case, match, is_guarded_attention: bool) -> float:
         similarity = float((match or {}).get("similarity") or 0.0)
         final_score = float((match or {}).get("final_score") or 0.0)
         retrieval_source = str((match or {}).get("retrieval_source") or "full_scan").strip().lower() or "full_scan"
@@ -20,11 +20,11 @@ class TradingSimilarCaseContextMixin:
         if status == "closed":
             score += 2.0
         if pnl_value < 0:
-            score += 3.5 if is_trigger_mode else 5.0
+            score += 3.5 if is_guarded_attention else 5.0
         elif pnl_value > 0:
-            score += 1.0 if is_trigger_mode else 0.25
+            score += 1.0 if is_guarded_attention else 0.25
         if failure_reason and failure_reason != "none":
-            score += 2.5 if is_trigger_mode else 4.0
+            score += 2.5 if is_guarded_attention else 4.0
         if retrieval_source == "band_index":
             score += 0.75
         profile = self._get_learning_artifact_payload("similar_case_reranker_profile")
@@ -44,11 +44,11 @@ class TradingSimilarCaseContextMixin:
         market_snapshots,
         account_state,
         risk_state,
-        is_trigger_mode: bool,
+        is_guarded_attention: bool,
         limit: int = 5,
     ):
         self.last_similar_case_matches = []
-        selection_mode = "trigger" if is_trigger_mode else "background_support"
+        selection_mode = "guarded_focus" if is_guarded_attention else "background_support"
         target_limit = max(1, int(limit or 1))
         current_feature_vectors = self._build_current_market_vectors(
             market_snapshots,
@@ -57,7 +57,7 @@ class TradingSimilarCaseContextMixin:
         )
         vector_matches = self._search_trade_case_vector_matches(
             current_feature_vectors=current_feature_vectors,
-            risk_mode="trigger" if is_trigger_mode else "",
+            risk_mode="guarded" if is_guarded_attention else "",
             limit=max(target_limit * 4, 12),
         )
         cases = []
@@ -73,7 +73,7 @@ class TradingSimilarCaseContextMixin:
                     self._score_similar_past_case_candidate(
                         trade_case,
                         match,
-                        is_trigger_mode=is_trigger_mode,
+                        is_guarded_attention=is_guarded_attention,
                     ),
                     trade_case_id,
                     match,
@@ -82,10 +82,6 @@ class TradingSimilarCaseContextMixin:
             )
         for _, trade_case_id, match, trade_case in sorted(ranked_matches, key=lambda item: item[0], reverse=True):
             symbol = str(trade_case.get("symbol") or match.get("matched_symbol") or "UNKNOWN")
-            if symbol in market_snapshots and not market_snapshots[symbol].is_opportunity_trigger and any(
-                snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
-            ):
-                continue
             pnl = trade_case.get("realized_pnl")
             if pnl is None:
                 pnl = trade_case.get("estimated_pnl_pct")
@@ -122,7 +118,7 @@ class TradingSimilarCaseContextMixin:
             cases.append(case_text)
             if len(cases) >= target_limit:
                 self.last_context_selection_summary["similar_past_cases"] = {
-                    "trigger_mode": bool(is_trigger_mode),
+                    "guarded_attention": bool(is_guarded_attention),
                     "selection_mode": selection_mode,
                     "available_total": len(vector_matches),
                     "selected_total": len(cases),
@@ -132,7 +128,7 @@ class TradingSimilarCaseContextMixin:
 
         if cases:
             self.last_context_selection_summary["similar_past_cases"] = {
-                "trigger_mode": bool(is_trigger_mode),
+                "guarded_attention": bool(is_guarded_attention),
                 "selection_mode": selection_mode,
                 "available_total": len(vector_matches),
                 "selected_total": len(cases),
@@ -158,10 +154,6 @@ class TradingSimilarCaseContextMixin:
         )
 
         for symbol, raw_cases in batch_cases.items():
-            if not market_snapshots[symbol].is_opportunity_trigger and any(
-                snapshot.is_opportunity_trigger for snapshot in market_snapshots.values()
-            ):
-                continue
             for case in raw_cases:
                 tagged_case = f"{symbol}: {case}"
                 if tagged_case in seen:
@@ -185,7 +177,7 @@ class TradingSimilarCaseContextMixin:
                 cases.append(tagged_case)
                 if len(cases) >= target_limit:
                     self.last_context_selection_summary["similar_past_cases"] = {
-                        "trigger_mode": bool(is_trigger_mode),
+                        "guarded_attention": bool(is_guarded_attention),
                         "selection_mode": selection_mode,
                         "available_total": max(len(vector_matches), len(cases)),
                         "selected_total": len(cases),
@@ -193,7 +185,7 @@ class TradingSimilarCaseContextMixin:
                     }
                     return cases[:target_limit]
         self.last_context_selection_summary["similar_past_cases"] = {
-            "trigger_mode": bool(is_trigger_mode),
+            "guarded_attention": bool(is_guarded_attention),
             "selection_mode": selection_mode,
             "available_total": max(len(vector_matches), len(cases)),
             "selected_total": len(cases),

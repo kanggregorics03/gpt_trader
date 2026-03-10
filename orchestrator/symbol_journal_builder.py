@@ -9,6 +9,8 @@ class TradingSymbolJournalBuilderMixin:
         risk_reason: str,
         risk_mode: str,
         risk_approved: bool,
+        is_guarded_attention: bool,
+        is_safety_mode: bool,
         estimated_pnl_pct,
         ledger_entries,
     ):
@@ -76,13 +78,10 @@ class TradingSymbolJournalBuilderMixin:
                         "invalidation_reason": getattr(intent, "invalidation_reason", None),
                         "management_template_id": getattr(intent, "management_template_id", None),
                         "exit_reason": getattr(intent, "exit_reason", None),
+                        "guarded_attention": bool(is_guarded_attention),
+                        "safety_mode": bool(is_safety_mode),
                         "trigger_reasons": (
                             market_snapshots[symbol].trigger_reasons
-                            if symbol in market_snapshots
-                            else []
-                        ),
-                        "opportunity_trigger_reasons": (
-                            market_snapshots[symbol].opportunity_trigger_reasons
                             if symbol in market_snapshots
                             else []
                         ),

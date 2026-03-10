@@ -13,6 +13,10 @@ class StateStoreTradeCaseRepositoryMixin:
         if not trade_case_id or not symbol:
             return
         try:
+            payload = record.get("payload") or {}
+            loop_mode = record.get("loop_mode")
+            guarded_attention = record.get("guarded_attention")
+            safety_mode = record.get("safety_mode")
             with self.conn:
                 self.conn.execute(
                     """
@@ -20,7 +24,10 @@ class StateStoreTradeCaseRepositoryMixin:
                         trade_case_id,
                         symbol,
                         status,
+                        loop_mode,
                         risk_mode,
+                        guarded_attention,
+                        safety_mode,
                         opened_at,
                         closed_at,
                         entry_audit_log_id,
@@ -47,11 +54,14 @@ class StateStoreTradeCaseRepositoryMixin:
                         risk_trigger_reasons,
                         feature_vector,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(trade_case_id) DO UPDATE SET
                         symbol = excluded.symbol,
                         status = excluded.status,
+                        loop_mode = excluded.loop_mode,
                         risk_mode = excluded.risk_mode,
+                        guarded_attention = excluded.guarded_attention,
+                        safety_mode = excluded.safety_mode,
                         opened_at = excluded.opened_at,
                         closed_at = excluded.closed_at,
                         entry_audit_log_id = excluded.entry_audit_log_id,
@@ -83,7 +93,10 @@ class StateStoreTradeCaseRepositoryMixin:
                         trade_case_id,
                         symbol,
                         status,
+                        loop_mode,
                         record.get("risk_mode"),
+                        int(bool(guarded_attention)),
+                        int(bool(safety_mode)),
                         record.get("opened_at"),
                         record.get("closed_at"),
                         record.get("entry_audit_log_id"),
@@ -109,7 +122,7 @@ class StateStoreTradeCaseRepositoryMixin:
                         json.dumps(record.get("trigger_reasons") or []),
                         json.dumps(record.get("risk_trigger_reasons") or []),
                         json.dumps(record.get("feature_vector") or []),
-                        json.dumps(record.get("payload") or {}),
+                        json.dumps(payload),
                     ),
                 )
                 feature_vector = record.get("feature_vector") or []
@@ -119,7 +132,10 @@ class StateStoreTradeCaseRepositoryMixin:
                         trade_case_id,
                         symbol,
                         status,
+                        loop_mode,
                         risk_mode,
+                        guarded_attention,
+                        safety_mode,
                         opened_at,
                         closed_at,
                         estimated_pnl_pct,
@@ -129,11 +145,14 @@ class StateStoreTradeCaseRepositoryMixin:
                         vector_norm,
                         feature_vector,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(trade_case_id) DO UPDATE SET
                         symbol = excluded.symbol,
                         status = excluded.status,
+                        loop_mode = excluded.loop_mode,
                         risk_mode = excluded.risk_mode,
+                        guarded_attention = excluded.guarded_attention,
+                        safety_mode = excluded.safety_mode,
                         opened_at = excluded.opened_at,
                         closed_at = excluded.closed_at,
                         estimated_pnl_pct = excluded.estimated_pnl_pct,
@@ -148,7 +167,10 @@ class StateStoreTradeCaseRepositoryMixin:
                         trade_case_id,
                         symbol,
                         status,
+                        loop_mode,
                         record.get("risk_mode"),
+                        int(bool(guarded_attention)),
+                        int(bool(safety_mode)),
                         record.get("opened_at"),
                         record.get("closed_at"),
                         record.get("estimated_pnl_pct"),
@@ -162,7 +184,7 @@ class StateStoreTradeCaseRepositoryMixin:
                                 "trigger_reasons": record.get("trigger_reasons") or [],
                                 "risk_trigger_reasons": record.get("risk_trigger_reasons") or [],
                                 "evidence_signals": record.get("evidence_signals") or [],
-                                "payload": record.get("payload") or {},
+                                "payload": payload,
                             }
                         ),
                     ),

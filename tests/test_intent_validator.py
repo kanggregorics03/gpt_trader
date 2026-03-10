@@ -170,12 +170,12 @@ class TestStructuredIntentValidator(unittest.TestCase):
     def test_validator_accepts_boolean_sources_and_trigger_mode_alias(self):
         request = self.request.model_copy(
             update={
-                "is_trigger_mode": True,
+                "is_guarded_attention": True,
                 "market_snapshots": {
                     "BTCUSDT": self.request.market_snapshots["BTCUSDT"].model_copy(
                         update={
-                            "volume_surge_trigger_active": True,
-                            "fast_move_trigger_active": False,
+                            "volume_surge_signal_active": True,
+                            "fast_move_signal_active": False,
                         }
                     )
                 },
@@ -196,24 +196,24 @@ class TestStructuredIntentValidator(unittest.TestCase):
                     failure_mode="Disable the setup if trigger participation fades or cooldown activates.",
                     evidence=[
                         EvidenceItem(
-                            signal="trigger_mode_active",
+                            signal="guarded_attention_active",
                             symbol="BTCUSDT",
                             timeframe="risk",
                             operator="eq",
                             observed_value=1.0,
                             threshold=1.0,
                             units="flag",
-                            source="trigger_mode_active",
+                            source="guarded_attention_active",
                         ),
                         EvidenceItem(
-                            signal="volume_surge_trigger_active",
+                            signal="volume_surge_signal_active",
                             symbol="BTCUSDT",
                             timeframe="15m",
                             operator="eq",
                             observed_value=1.0,
                             threshold=1.0,
                             units="flag",
-                            source="market_snapshots.BTCUSDT.volume_surge_trigger_active",
+                            source="market_snapshots.BTCUSDT.volume_surge_signal_active",
                         ),
                         EvidenceItem(
                             signal="cooldown_active",

@@ -14,7 +14,7 @@ class RuntimeConfig:
     ai_api_key: str | None
     ai_base_url: str | None
     ai_default_model: str | None
-    ai_trigger_model: str | None
+    ai_guarded_attention_model: str | None
     db_path: str
 
     @classmethod
@@ -32,7 +32,10 @@ class RuntimeConfig:
                 or os.getenv("GEMINI_DEFAULT_MODEL")
                 or os.getenv("GEMINI_MODEL")
             ),
-            ai_trigger_model=os.getenv("AI_TRIGGER_MODEL") or os.getenv("GEMINI_TRIGGER_MODEL"),
+            ai_guarded_attention_model=(
+                os.getenv("AI_GUARDED_ATTENTION_MODEL")
+                or os.getenv("GEMINI_GUARDED_ATTENTION_MODEL")
+            ),
             db_path=os.getenv("DB_PATH", "data/gpt_trader.db"),
         )
 

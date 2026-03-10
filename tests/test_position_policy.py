@@ -111,7 +111,7 @@ class TestPositionPolicyEngine(unittest.TestCase):
 
     def test_stale_open_orders_without_positions_are_cancelled(self):
         engine = PositionPolicyEngine(
-            policy={"position_policy": {"stale_order_minutes": 1, "stale_order_reprice_enabled": False}},
+            policy={"position_policy": {"stale_order_minutes": 1}},
             state_store=DummyStore(),
         )
         account_state = AccountState(
@@ -143,7 +143,7 @@ class TestPositionPolicyEngine(unittest.TestCase):
         self.assertEqual(result["decision_result"]["orders"][0].action, "CANCEL")
         self.assertEqual(result["decision_result"]["orders"][0].target_client_order_id, "client-1")
 
-    def test_stale_open_order_can_be_repriced(self):
+    def test_stale_open_order_is_cancelled_not_repriced(self):
         engine = PositionPolicyEngine(
             policy={"position_policy": {"stale_order_minutes": 1}},
             state_store=DummyStore(),
@@ -183,12 +183,8 @@ class TestPositionPolicyEngine(unittest.TestCase):
         )
 
         self.assertFalse(result["escalate_to_ai"])
-        self.assertEqual(result["decision_result"]["decision"], "REPLACE_ENTRY")
-        self.assertEqual([order.action for order in result["decision_result"]["orders"]], ["CANCEL", "BUY"])
-        self.assertEqual(result["decision_result"]["orders"][0].lineage_role, "cancel")
-        self.assertEqual(result["decision_result"]["orders"][1].lineage_role, "replacement")
-        self.assertTrue(result["decision_result"]["orders"][1].wait_for_cancel_confirmation)
-        self.assertEqual(result["decision_result"]["orders"][1].order_type, "LIMIT")
+        self.assertEqual(result["decision_result"]["decision"], "CANCEL")
+        self.assertEqual([order.action for order in result["decision_result"]["orders"]], ["CANCEL"])
 
     def test_negative_pnl_without_invalidation_proximity_holds(self):
         engine = PositionPolicyEngine(

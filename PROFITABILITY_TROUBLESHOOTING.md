@@ -55,13 +55,12 @@
 2. `1h alpha` 신규 진입 기준과 `5m safety` 민감도를 더 보수적으로 둔다.
 3. 심볼 수를 줄인다.
 4. 문제 구간의 실거래를 멈추고 demo 또는 축소 size로 재관찰한다.
-5. `policy_bundle`이 최근 승격 직후인지 확인한다.
-6. `regime_drift`가 감지된 상태에서 현재 champion이 계속 유지되고 있지 않은지 본다.
-7. `execution_policy_evaluations`, `shadow_decisions`, `bundle_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
-8. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
-9. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
+5. `regime_drift`가 감지된 상태에서 현재 champion이 계속 유지되고 있지 않은지 본다.
+6. `execution_policy_evaluations`, `shadow_decisions`, `policy_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
+7. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
+8. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
    - 현재 철학상 `safety_5m`는 emergency exit 품질을 보는 계층이지, profit protect 감축 빈도를 높이는 계층이 아니다.
-10. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, promotion blocked 상태를 확인한다.
+9. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, promotion blocked 상태를 확인한다.
 
 ## 4. 원인별 해석 가이드
 
@@ -136,7 +135,7 @@
 1. spread/depth filter를 강화한다.
 2. size를 줄인다.
 3. fast move 직후 추격 진입을 줄인다.
-4. `safety_5m`와 `execution_5m`의 spread/depth 민감도를 더 보수적으로 만든다.
+4. `safety_5m`와 execution observability 결과를 기준으로 spread/depth 가드를 더 보수적으로 만든다.
 5. limit entry가 가능한 정책인지 별도로 검토한다.
 
 실험 아이디어:
@@ -228,7 +227,7 @@
 1. HOLD 기준을 더 명확히 한다.
 2. repeated fingerprint block을 강화한다.
 3. decision cooldown을 늘린다.
-4. `range_break_trigger_active=false`인 상태의 추격 진입을 줄인다.
+4. `range_break_signal_active=false`인 상태의 추격 진입을 줄인다.
 5. trigger는 감시 신호로 쓰고 진입은 별도 확인 조건을 요구한다.
 
 실험 아이디어:
@@ -300,16 +299,14 @@
 - `replay_runs`
 - `retrieval_evaluations`
 - `long_term_memory`
-  - contract cutover 직후에는 legacy `scale out` / `profit protect` lesson이 retire 되었는지 본다
-  - 필요하면 `python -m tools.migrate_contract_cutover_20260310 --db-path data/gpt_trader.db`를 한 번 실행해 learning surface를 정리한다
+  - 운영 계약을 크게 바꿨다면 legacy lesson을 보존하려 하지 말고 `data/gpt_trader.db`와 `data/learning/`을 비운 뒤 새 사례를 다시 쌓는다
   - runtime retrieval과 batch reconciliation이 같은 lifecycle pool을 읽는지 본다. 오래된 active rule이 recent cap 때문에 사라지면 해석이 틀어진다.
   - 다만 최근 15m/5m 규칙 수정은 long-term memory보다 candidate policy / promotion에 먼저 직접 반영된다.
 - `learning_artifacts`
   - `journal_reranker_profile`, `similar_case_reranker_profile`, `shadow_model_dataset`, `learning_liveness`가 최근 배치에서 갱신됐는지 본다.
 - `candidate_lessons`
 - `policy_evaluations`
-- `bundle_evaluations`
-- `bundle_promotions`
+- `policy_promotions`
 - 최근 `24h / 7d / latest 50` semantic fallback
 - in-sample vs recent out-of-sample 비교
 

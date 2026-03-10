@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from dashboard import app as dashboard_app
@@ -119,6 +120,110 @@ class FakeStateStore:
             {"trade_case_id": "case-2", "symbol": "ETHUSDT", "status": "active", "estimated_pnl_pct": 0.4, "holding_minutes": 10.0},
         ]
 
+    def get_recent_audits(self, limit=20, since=None):
+        return [
+            {
+                "id": 101,
+                "execution_summary": {
+                    "execution_policy": {
+                        "orders": [
+                            {
+                                "action_type": "entry",
+                                "intent_order_type": "MARKET",
+                                "entry_style": "immediate",
+                                "order_type": "MARKET",
+                                "execution_profile": "market_urgent",
+                                "contract_adjustment": "market_entry_kept_immediate",
+                            }
+                        ]
+                    }
+                },
+            },
+            {
+                "id": 102,
+                "execution_summary": {
+                    "execution_policy": {
+                        "orders": [
+                            {
+                                "action_type": "reduce",
+                                "intent_order_type": "LIMIT",
+                                "entry_style": None,
+                                "order_type": "MARKET",
+                                "execution_profile": "market_urgent",
+                                "contract_adjustment": "reduce_market_only",
+                            }
+                        ]
+                    }
+                },
+            },
+        ]
+
+    def get_execution_policy_evaluations_since(self, since: datetime):
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "action_type": "entry",
+                "entry_style": "immediate",
+                "filled_quantity": 0.01,
+                "outcome_trade_case_id": "case-1",
+                "outcome_estimated_pnl_pct": None,
+                "outcome_realized_pnl": None,
+                "outcome_label": None,
+                "payload": {},
+            },
+            {
+                "symbol": "ETHUSDT",
+                "action_type": "entry",
+                "entry_style": "value",
+                "filled_quantity": 0.0,
+                "outcome_trade_case_id": None,
+                "outcome_estimated_pnl_pct": None,
+                "outcome_realized_pnl": None,
+                "outcome_label": "missed_due_to_no_fill",
+                "payload": {},
+            },
+            {
+                "symbol": "BTCUSDT",
+                "action_type": "entry",
+                "entry_style": "retest",
+                "filled_quantity": 0.01,
+                "outcome_trade_case_id": "case-2",
+                "outcome_estimated_pnl_pct": -0.6,
+                "outcome_realized_pnl": None,
+                "outcome_label": "edge_failed",
+                "payload": {},
+            },
+            {
+                "symbol": "BTCUSDT",
+                "action_type": "cancel",
+                "entry_style": None,
+                "filled_quantity": 0.0,
+                "outcome_trade_case_id": None,
+                "outcome_estimated_pnl_pct": None,
+                "outcome_realized_pnl": None,
+                "outcome_label": "stale_entry_cancelled",
+                "payload": {},
+            },
+            {
+                "symbol": "BTCUSDT",
+                "action_type": "exit",
+                "entry_style": None,
+                "filled_quantity": 0.1,
+                "outcome_trade_case_id": "case-1",
+                "outcome_estimated_pnl_pct": None,
+                "outcome_realized_pnl": 9.5,
+                "outcome_label": "risk_exit",
+                "payload": {},
+            },
+        ]
+
+    def get_trade_case(self, trade_case_id):
+        if trade_case_id == "case-1":
+            return {"trade_case_id": "case-1", "status": "closed", "estimated_pnl_pct": 1.25, "thesis_failure_reason": None}
+        if trade_case_id == "case-2":
+            return {"trade_case_id": "case-2", "status": "closed", "estimated_pnl_pct": -0.6, "thesis_failure_reason": "edge_failed"}
+        return {}
+
     def get_audit_log(self, audit_id):
         if audit_id != 101:
             return None
@@ -156,7 +261,7 @@ class TestDashboardApp(unittest.TestCase):
             {
                 "AI_PROVIDER": "openai",
                 "AI_DEFAULT_MODEL": "gpt-4.1-mini",
-                "AI_TRIGGER_MODEL": "gpt-4.1",
+                "AI_GUARDED_ATTENTION_MODEL": "gpt-4.1",
                 "MEMORY_PROVIDER": "anthropic",
                 "MEMORY_MODEL": "claude-3.7-sonnet",
                 "REPLAY_PROVIDER": "deepseek",
@@ -171,13 +276,16 @@ class TestDashboardApp(unittest.TestCase):
         self.assertIn("trade_case_summary", payload)
         self.assertIn("retrieval_summary", payload)
         self.assertIn("memory_summary", payload)
+        self.assertIn("execution_contract_summary", payload)
+        self.assertIn("entry_style_summary", payload)
+        self.assertIn("post_trade_outcome_summary", payload)
         self.assertIn("context_bias_summary", payload)
         self.assertIn("learning_liveness", payload)
         self.assertIn("recent_trade_cases", payload)
         self.assertIn("recent_retrieval_evaluations", payload)
         self.assertEqual(payload["models"]["provider"], "openai")
         self.assertEqual(payload["models"]["default_model"], "gpt-4.1-mini")
-        self.assertEqual(payload["models"]["trigger_model"], "gpt-4.1")
+        self.assertEqual(payload["models"]["guarded_attention_model"], "gpt-4.1")
         self.assertEqual(payload["models"]["memory_provider"], "anthropic")
         self.assertEqual(payload["models"]["memory_model"], "claude-3.7-sonnet")
         self.assertEqual(payload["models"]["replay_provider"], "deepseek")
@@ -185,6 +293,18 @@ class TestDashboardApp(unittest.TestCase):
         self.assertEqual(payload["trade_case_summary"]["total_count"], 2)
         self.assertEqual(payload["retrieval_summary"]["settled_count"], 1)
         self.assertEqual(payload["memory_summary"]["active_count"], 1)
+        self.assertEqual(payload["execution_contract_summary"]["total_adjustments"], 2)
+        self.assertEqual(payload["execution_contract_summary"]["governed_orders"], 2)
+        self.assertEqual(payload["execution_contract_summary"]["immediate_entry_orders"], 1)
+        self.assertEqual(payload["execution_contract_summary"]["reduce_exit_orders"], 1)
+        self.assertEqual(payload["execution_contract_summary"]["top_adjustment"], "market_entry_kept_immediate")
+        self.assertEqual(payload["entry_style_summary"]["total_entries"], 3)
+        self.assertEqual(payload["entry_style_summary"]["styles"][0]["style"], "immediate")
+        self.assertEqual(payload["entry_style_summary"]["styles"][0]["win_count"], 1)
+        self.assertEqual(payload["entry_style_summary"]["styles"][1]["entry_count"], 1)
+        self.assertEqual(payload["entry_style_summary"]["styles"][2]["missed_move_count"], 1)
+        self.assertEqual(payload["post_trade_outcome_summary"]["label_counts"]["edge_failed"], 1)
+        self.assertEqual(payload["post_trade_outcome_summary"]["label_counts"]["missed_due_to_no_fill"], 1)
         self.assertEqual(payload["context_bias_summary"]["last_24h"]["journal_selected"]["group_counts"]["action"], 6)
 
     def test_audit_detail_endpoint_includes_linked_trade_case_and_retrieval_data(self):

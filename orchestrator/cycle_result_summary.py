@@ -76,6 +76,12 @@ class TradingCycleResultSummaryMixin:
             case_statuses=case_statuses,
             case_summary=case_summary,
         )
+        self._alert_cycle_decision_summary(
+            cycle_context=cycle_context,
+            decision_outcome=decision_outcome,
+            execution_outcome=execution_outcome,
+            execution_summary=execution_summary,
+        )
         final_account_state = (
             execution_outcome["post_account_state"]
             or execution_outcome["effective_pre_execution_state"]
@@ -84,9 +90,15 @@ class TradingCycleResultSummaryMixin:
         final_unknown_order_count = self.state_store.count_recent_unknown_orders(
             minutes=execution_guards["unknown_order_block_minutes"]
         )
+        final_safety_state = self.safety_policy_engine.get_emergency_state(
+            account_state=final_account_state,
+            market_snapshots=cycle_context["market_snapshots"],
+            regime_key=cycle_context["regime_key"],
+        )
         return {
             "loop_type": execution_summary["loop_type"],
-            "trigger_active": cycle_context["is_trigger_mode"],
+            "guarded_attention_active": cycle_context["is_guarded_attention"],
+            "safety_trigger_active": bool(final_safety_state.get("active")) or final_unknown_order_count > 0,
             "has_positions": self._has_live_positions(final_account_state),
             "has_open_orders": self._has_live_open_orders(final_account_state),
             "has_unknown_orders": final_unknown_order_count > 0,

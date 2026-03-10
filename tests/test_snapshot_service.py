@@ -152,8 +152,7 @@ class TestSnapshotService(unittest.TestCase):
                 atr_1h=2.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=True,
-                opportunity_trigger_reasons=["fast_price_move_15m"],
+                is_risk_trigger=False,
             )
         }
         mixed_strong = {
@@ -164,8 +163,7 @@ class TestSnapshotService(unittest.TestCase):
                 atr_1h=2.0,
                 trend_1h="UP",
                 recent_volume_surge=True,
-                is_opportunity_trigger=True,
-                opportunity_trigger_reasons=["fast_price_move_15m", "volume_surge_15m"],
+                is_risk_trigger=True,
             )
         }
         split_across_symbols = {
@@ -176,8 +174,7 @@ class TestSnapshotService(unittest.TestCase):
                 atr_1h=2.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=True,
-                opportunity_trigger_reasons=["fast_price_move_15m"],
+                is_risk_trigger=False,
             ),
             "ETHUSDT": MarketSnapshot(
                 symbol="ETHUSDT",
@@ -186,11 +183,10 @@ class TestSnapshotService(unittest.TestCase):
                 atr_1h=4.0,
                 trend_1h="UP",
                 recent_volume_surge=True,
-                is_opportunity_trigger=True,
-                opportunity_trigger_reasons=["volume_surge_15m"],
+                is_risk_trigger=True,
             ),
         }
 
-        self.assertFalse(service._should_enable_trigger_mode(fast_only))
-        self.assertTrue(service._should_enable_trigger_mode(mixed_strong))
-        self.assertFalse(service._should_enable_trigger_mode(split_across_symbols))
+        self.assertFalse(service._should_enable_guarded_attention(fast_only))
+        self.assertTrue(service._should_enable_guarded_attention(mixed_strong))
+        self.assertTrue(service._should_enable_guarded_attention(split_across_symbols))

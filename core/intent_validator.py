@@ -111,8 +111,8 @@ class StructuredIntentValidator:
         return None
 
     def _request_alias_paths(self, evidence: EvidenceItem) -> List[str]:
-        if str(evidence.source or "") == "trigger_mode_active":
-            return ["is_trigger_mode"]
+        if str(evidence.source or "") == "guarded_attention_active":
+            return ["is_guarded_attention"]
         return []
 
     def _market_context_alias_paths(

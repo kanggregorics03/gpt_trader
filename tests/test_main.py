@@ -57,6 +57,7 @@ class DummyRiskEngine:
             "run_minute_local": 0,
             "replay_timeout_seconds": 900,
             "memory_timeout_seconds": 1200,
+            "deepseek_memory_timeout_seconds": 3600,
         },
     }
 
@@ -95,12 +96,9 @@ class TestTradingOrchestrator(unittest.TestCase):
             self.execution_fills_by_audit = {}
             self.retrieval_evaluations = []
             self.execution_policy_evaluations = []
-            self.execution_policy_profiles = {}
             self.policy_registry = {}
             self.candidate_policy_versions = []
             self.shadow_decisions = []
-            self.policy_bundles = {}
-            self.bundle_promotions = []
             self.learning_artifacts = {}
 
         def get_active_trade_case(self, symbol):
@@ -219,18 +217,6 @@ class TestTradingOrchestrator(unittest.TestCase):
                     }
                 )
 
-        def get_execution_policy_profile(
-            self,
-            symbol,
-            loop_mode,
-            action_type,
-            urgency_bucket,
-            liquidity_bucket,
-            risk_mode,
-        ):
-            key = (symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, risk_mode)
-            return dict(self.execution_policy_profiles.get(key, {}))
-
         def upsert_policy_registry(self, record):
             policy_key = str(record.get("policy_key") or "")
             if policy_key:
@@ -255,41 +241,6 @@ class TestTradingOrchestrator(unittest.TestCase):
 
         def save_shadow_decisions(self, entries):
             self.shadow_decisions.extend(dict(entry) for entry in (entries or []))
-
-        def upsert_policy_bundle(self, record):
-            bundle_key = str(record.get("bundle_key") or "")
-            if bundle_key:
-                self.policy_bundles[bundle_key] = dict(record)
-
-        def get_active_policy_bundle(self, regime_key=None):
-            regime_text = str(regime_key or "")
-            for bundle in self.policy_bundles.values():
-                if str(bundle.get("status") or "") != "active":
-                    continue
-                if str(bundle.get("regime_key") or "") == regime_text:
-                    return dict(bundle)
-            return {}
-
-        def get_policy_bundle(self, bundle_key):
-            return dict(self.policy_bundles.get(bundle_key, {}))
-
-        def get_policy_bundles(self, regime_key=None, statuses=None, limit=50):
-            rows = [dict(row) for row in self.policy_bundles.values()]
-            if regime_key is not None:
-                rows = [row for row in rows if str(row.get("regime_key") or "") == str(regime_key or "")]
-            clean_statuses = set(statuses or [])
-            if clean_statuses:
-                rows = [row for row in rows if row.get("status") in clean_statuses]
-            return rows[:limit]
-
-        def save_bundle_promotion(self, record):
-            self.bundle_promotions.append(dict(record))
-
-        def get_recent_bundle_promotions(self, regime_key=None, limit=20):
-            rows = [dict(row) for row in self.bundle_promotions]
-            if regime_key is not None:
-                rows = [row for row in rows if str(row.get("regime_key") or "") == str(regime_key or "")]
-            return rows[:limit]
 
         def get_learning_artifact(self, artifact_key):
             payload = self.learning_artifacts.get(artifact_key)
@@ -426,13 +377,24 @@ class TestTradingOrchestrator(unittest.TestCase):
     def test_build_daily_batch_config_reads_policy_overrides(self):
         orchestrator = self._make_orchestrator()
 
-        config = orchestrator._build_daily_batch_config()
+        with patch.dict("os.environ", {"MEMORY_PROVIDER": "", "AI_PROVIDER": ""}, clear=False):
+            config = orchestrator._build_daily_batch_config()
 
         self.assertTrue(config["enabled"])
         self.assertEqual(config["run_hour_local"], 4)
         self.assertEqual(config["run_minute_local"], 0)
         self.assertEqual(config["replay_timeout_seconds"], 900)
         self.assertEqual(config["memory_timeout_seconds"], 1200)
+        self.assertEqual(config["deepseek_memory_timeout_seconds"], 3600)
+
+    def test_build_daily_batch_config_expands_memory_timeout_for_deepseek(self):
+        orchestrator = self._make_orchestrator()
+
+        with patch.dict("os.environ", {"MEMORY_PROVIDER": "deepseek"}, clear=False):
+            config = orchestrator._build_daily_batch_config()
+
+        self.assertEqual(config["memory_timeout_seconds"], 3600)
+        self.assertEqual(config["deepseek_memory_timeout_seconds"], 3600)
 
     def test_run_daily_batch_launches_background_worker_without_blocking(self):
         orchestrator = self._make_orchestrator()
@@ -516,7 +478,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         orchestrator.ai_provider = "gemini"
         orchestrator.ai_api_key = None
         orchestrator.ai_default_model = "gemini-2.5-flash"
-        orchestrator.ai_trigger_model = "gemini-2.5-pro"
+        orchestrator.ai_guarded_attention_model = "gemini-2.5-pro"
 
         with patch.dict("os.environ", {"GEMINI_API_KEY": "gemini-key"}, clear=False):
             orchestrator._validate_ai_configuration()
@@ -524,6 +486,68 @@ class TestTradingOrchestrator(unittest.TestCase):
         with patch.dict("os.environ", {"GEMINI_API_KEY": "", "AI_API_KEY": ""}, clear=False):
             with self.assertRaises(ValueError):
                 orchestrator._validate_ai_configuration()
+
+    def test_recovered_open_order_without_fill_stays_submitted(self):
+        orchestrator = self._make_orchestrator()
+
+        state = orchestrator._resolve_runtime_state_from_recovered_order(
+            {
+                "status": "open",
+                "filled": 0,
+                "fill_count": 0,
+                "info": {"orderStatus": "New", "cumExecQty": "0"},
+            }
+        )
+
+        self.assertEqual(state, "submitted")
+
+    def test_cycle_decision_alert_sends_compact_summary(self):
+        orchestrator = self._make_orchestrator()
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    entry_style="retest",
+                    quantity=0.01,
+                )
+            ],
+            rationale=["Breakout retest has volume support."],
+            risk_notes=[],
+            confidence=0.7,
+        )
+        execution_summary = {
+            "execution_policy": {
+                "orders": [
+                    {
+                        "action": "BUY",
+                        "order_type": "LIMIT",
+                        "entry_style": "retest",
+                        "action_type": "entry",
+                    }
+                ]
+            }
+        }
+
+        orchestrator._alert_cycle_decision_summary(
+            cycle_context={
+                "loop_mode": "1h",
+                "risk_mode": "guarded",
+                "effective_risk_profile": {"cycle_role": "strategy"},
+            },
+            decision_outcome={
+                "intent": intent,
+                "decision_result": type("DecisionResultStub", (), {"model_name": "gemini-2.5-pro"})(),
+            },
+            execution_outcome={"is_approved": True, "reason": "Approved"},
+            execution_summary=execution_summary,
+        )
+
+        self.assertEqual(orchestrator.alert_manager.calls[-1]["title"], "Cycle Decision")
+        self.assertIn("decision=BUY", orchestrator.alert_manager.calls[-1]["message"])
+        self.assertIn("orders=BUY LIMIT retest x1", orchestrator.alert_manager.calls[-1]["message"])
 
     def test_select_recent_journal_context_prioritizes_relevant_rows_and_compacts(self):
         orchestrator = self._make_orchestrator()
@@ -585,7 +609,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                     }
                 ],
                 "risk_reason": "Approved",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "loss_signal": True,
                 "estimated_pnl_pct": -0.7,
                 "trigger_symbols": ["BTCUSDT"],
@@ -598,7 +622,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             {
                 "trade_case_id": "BTCUSDT-case-2",
                 "symbol": "BTCUSDT",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "status": "closed",
                 "estimated_pnl_pct": -0.7,
                 "feature_vector": [30000.0, 120.0, 240.0],
@@ -612,7 +636,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_recent_journal_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=1,
             max_rationale_items=1,
             max_evidence_per_item=1,
@@ -661,7 +685,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "rationale": ["Momentum long"],
                 "rationale_items": [],
                 "risk_reason": "Approved",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "loss_signal": False,
                 "trigger_symbols": ["BTCUSDT"],
                 "risk_trigger_symbols": [],
@@ -685,7 +709,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_recent_journal_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=2,
             max_rationale_items=1,
             max_evidence_per_item=1,
@@ -719,7 +743,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "rationale": ["Momentum entry."],
                 "rationale_items": [],
                 "risk_reason": "Approved",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "loss_signal": False,
                 "trigger_symbols": ["BTCUSDT"],
                 "risk_trigger_symbols": [],
@@ -731,7 +755,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "rationale": ["Cut exposure on deterioration."],
                 "rationale_items": [],
                 "risk_reason": "Approved with risk advisories",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "loss_signal": True,
                 "trigger_symbols": [],
                 "risk_trigger_symbols": ["BTCUSDT"],
@@ -742,7 +766,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_recent_journal_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=1,
             max_rationale_items=1,
             max_evidence_per_item=1,
@@ -797,7 +821,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "trade_case_id": "BTCUSDT-case-9",
                 "symbol": "BTCUSDT",
                 "status": "closed",
-                "risk_mode": "trigger",
+                "risk_mode": "guarded",
                 "estimated_pnl_pct": -0.8,
                 "slippage_bps": 7.5,
                 "thesis_failure_reason": "execution_quality_degraded:wide_spread",
@@ -813,7 +837,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=True,
+                is_risk_trigger=True,
             )
         }
 
@@ -821,7 +845,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             market_snapshots=market_snapshots,
             account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
             risk_state={"daily_pnl_pct": 0.0},
-            is_trigger_mode=True,
+            is_guarded_attention=True,
             limit=2,
         )
 
@@ -876,7 +900,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=False,
+                is_risk_trigger=False,
             )
         }
 
@@ -884,7 +908,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             market_snapshots=market_snapshots,
             account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
             risk_state={"daily_pnl_pct": 0.0},
-            is_trigger_mode=False,
+            is_guarded_attention=False,
             limit=2,
         )
 
@@ -925,7 +949,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             audit_log_id=501,
             intent=intent,
             estimated_pnl_pct=0.8,
-            risk_mode="trigger",
+            risk_mode="guarded",
         )
 
         self.assertEqual(len(orchestrator.state_store.retrieval_evaluations), 1)
@@ -985,7 +1009,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_long_term_memory_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=1,
             max_ignore_when=1,
         )
@@ -1005,9 +1029,8 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=True,
-                volume_surge_trigger_active=True,
-                range_break_trigger_active=True,
-                is_opportunity_trigger=True,
+                volume_surge_signal_active=True,
+                range_break_signal_active=True,
                 spread_percentile_1h=48.0,
                 depth_percentile_1h=72.0,
                 distance_to_invalid_level=1.1,
@@ -1060,7 +1083,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_long_term_memory_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=1,
             max_ignore_when=1,
         )
@@ -1079,7 +1102,6 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=True,
-                is_opportunity_trigger=True,
             )
         }
         market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
@@ -1129,7 +1151,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_long_term_memory_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=3,
             max_ignore_when=2,
         )
@@ -1151,7 +1173,6 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=True,
-                is_opportunity_trigger=True,
             )
         }
         market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
@@ -1182,7 +1203,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         selected = orchestrator._select_long_term_memory_context(
             rows=rows,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             limit=1,
             max_ignore_when=2,
         )
@@ -1207,7 +1228,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=240.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=True,
+                is_risk_trigger=True,
             ),
             "ETHUSDT": MarketSnapshot(
                 symbol="ETHUSDT",
@@ -1216,7 +1237,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 atr_1h=40.0,
                 trend_1h="UP",
                 recent_volume_surge=False,
-                is_opportunity_trigger=True,
+                is_risk_trigger=True,
             ),
         }
 
@@ -1224,7 +1245,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             market_snapshots=market_snapshots,
             account_state=AccountState(total_balance=1000.0, available_balance=900.0),
             risk_state={},
-            is_trigger_mode=True,
+            is_guarded_attention=True,
             limit=3,
         )
 
@@ -1325,16 +1346,9 @@ class TestTradingOrchestrator(unittest.TestCase):
 
     def test_prepare_decision_market_snapshots_applies_alpha_policy_when_flat(self):
         orchestrator = self._make_orchestrator()
-        orchestrator.state_store.upsert_policy_registry(
-            {
-                "policy_key": "champion:alpha_1h",
-                "domain": "alpha_1h",
-                "policy_type": "entry_filter",
-                "active_candidate_policy_id": 7,
-                "version": 1,
-                "config": {"max_spread_percentile_1h": 70.0},
-                "metrics": {"score": 0.6},
-            }
+        orchestrator.alpha_policy_engine = AlphaPolicyEngine(
+            policy={"alpha_policy": {"max_spread_percentile_1h": 70.0}},
+            state_store=orchestrator.state_store,
         )
         account_state = AccountState(
             total_balance=1000.0,
@@ -1374,7 +1388,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertTrue(summary["applied"])
         self.assertIn("BTCUSDT", summary["blocked_symbols"])
 
-    def test_determine_desired_loop_mode_uses_5m_only_for_active_management(self):
+    def test_determine_desired_loop_mode_uses_5m_only_for_active_management_under_safety_trigger(self):
         orchestrator = self._make_orchestrator()
         account_state = AccountState(
             total_balance=1000.0,
@@ -1393,11 +1407,11 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         desired_trigger = orchestrator._determine_desired_loop_mode(
-            {"trigger_active": True, "final_account_state": account_state, "has_unknown_orders": False}
+            {"safety_trigger_active": True, "final_account_state": account_state, "has_unknown_orders": False}
         )
         desired_flat_trigger = orchestrator._determine_desired_loop_mode(
             {
-                "trigger_active": True,
+                "safety_trigger_active": True,
                 "final_account_state": AccountState(
                     total_balance=1000.0,
                     available_balance=1000.0,
@@ -1409,11 +1423,11 @@ class TestTradingOrchestrator(unittest.TestCase):
             }
         )
         desired_management = orchestrator._determine_desired_loop_mode(
-            {"trigger_active": False, "final_account_state": account_state, "has_unknown_orders": False}
+            {"guarded_attention_active": False, "final_account_state": account_state, "has_unknown_orders": False}
         )
         desired_idle = orchestrator._determine_desired_loop_mode(
             {
-                "trigger_active": False,
+                "guarded_attention_active": False,
                 "final_account_state": AccountState(
                     total_balance=1000.0,
                     available_balance=1000.0,
@@ -1430,6 +1444,35 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(desired_management, "15m")
         self.assertEqual(desired_idle, "1h")
 
+    def test_opportunity_trigger_without_safety_trigger_prefers_15m_for_management(self):
+        orchestrator = self._make_orchestrator()
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=900.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=0.0,
+                )
+            ],
+            open_orders=[],
+            open_orders_count=0,
+        )
+
+        desired_mode = orchestrator._determine_desired_loop_mode(
+            {
+                "guarded_attention_active": True,
+                "safety_trigger_active": False,
+                "final_account_state": account_state,
+                "has_unknown_orders": False,
+            }
+        )
+
+        self.assertEqual(desired_mode, "15m")
+
     def test_determine_desired_loop_mode_preserves_current_mode_when_lock_skipped(self):
         orchestrator = self._make_orchestrator()
         orchestrator.active_loop_mode = "1h"
@@ -1445,13 +1488,73 @@ class TestTradingOrchestrator(unittest.TestCase):
 
         self.assertEqual(desired_mode, "1h")
 
+    def test_prepare_decision_market_snapshots_strips_opportunity_context_in_5m(self):
+        orchestrator = self._make_orchestrator()
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            current_price=30000.0,
+            atr_15m=100.0,
+            atr_1h=200.0,
+            trend_1h="UP",
+            recent_volume_surge=False,
+            fast_move_signal_active=True,
+            volume_surge_signal_active=True,
+            range_break_signal_active=True,
+            is_risk_trigger=True,
+            risk_trigger_reasons=["wide_spread"],
+            trigger_reasons=["wide_spread"],
+        )
+
+        filtered, summary = orchestrator._prepare_decision_market_snapshots(
+            account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
+            market_snapshots={"BTCUSDT": snapshot},
+            loop_mode="5m",
+        )
+
+        sanitized = filtered["BTCUSDT"]
+        self.assertEqual(sanitized.trigger_reasons, ["wide_spread"])
+        self.assertTrue(sanitized.is_risk_trigger)
+        self.assertFalse(summary["applied"])
+
+    def test_prepare_decision_market_snapshots_strips_opportunity_context_in_1h(self):
+        orchestrator = self._make_orchestrator()
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            current_price=30000.0,
+            atr_15m=100.0,
+            atr_1h=200.0,
+            trend_1h="UP",
+            recent_volume_surge=True,
+            volume_ratio_15m=2.0,
+            fast_move_signal_active=True,
+            volume_surge_signal_active=True,
+            range_break_signal_active=True,
+            is_risk_trigger=True,
+            risk_trigger_reasons=["wide_spread"],
+            trigger_reasons=["wide_spread"],
+        )
+
+        filtered, summary = orchestrator._prepare_decision_market_snapshots(
+            account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
+            market_snapshots={"BTCUSDT": snapshot},
+            loop_mode="1h",
+        )
+
+        sanitized = filtered["BTCUSDT"]
+        self.assertEqual(sanitized.trigger_reasons, ["wide_spread"])
+        self.assertTrue(sanitized.is_risk_trigger)
+        self.assertTrue(sanitized.recent_volume_surge)
+        self.assertEqual(sanitized.volume_ratio_15m, 2.0)
+        self.assertFalse(summary["applied"])
+
     def test_trigger_with_recent_close_but_no_management_target_prefers_15m(self):
         orchestrator = self._make_orchestrator()
         orchestrator.last_close_at = time.time()
 
         desired_mode = orchestrator._determine_desired_loop_mode(
             {
-                "trigger_active": True,
+                "guarded_attention_active": True,
+                "safety_trigger_active": False,
                 "final_account_state": AccountState(
                     total_balance=1000.0,
                     available_balance=1000.0,
@@ -1540,7 +1643,10 @@ class TestTradingOrchestrator(unittest.TestCase):
             ),
             market_snapshots={},
             fills=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
+            loop_mode="5m",
+            is_guarded_attention=False,
+            is_safety_mode=True,
             risk_state={"daily_pnl_pct": 0.0},
             observed_at="2026-03-07 10:00:00",
         )
@@ -1624,16 +1730,23 @@ class TestTradingOrchestrator(unittest.TestCase):
             after_state=AccountState(total_balance=1002.0, available_balance=1002.0, positions=[], open_orders=[]),
             market_snapshots={},
             fills=[],
-            risk_mode="trigger",
+            risk_mode="guarded",
+            loop_mode="5m",
+            is_guarded_attention=False,
+            is_safety_mode=True,
             risk_state={"daily_pnl_pct": 0.0},
             observed_at="2026-03-07 10:30:00",
         )
 
+        stored_case = orchestrator.state_store.get_trade_case(trade_case_id)
         self.assertEqual(opened[0]["case_status"], "opened")
         self.assertEqual(opened[0]["case_opened_at"], "2026-03-07 10:00:00")
         self.assertEqual(closed[0]["trade_case_id"], trade_case_id)
         self.assertEqual(closed[0]["case_status"], "closed")
         self.assertEqual(closed[0]["case_closed_at"], "2026-03-07 10:30:00")
+        self.assertEqual(stored_case["loop_mode"], "5m")
+        self.assertEqual(stored_case["guarded_attention"], 0)
+        self.assertEqual(stored_case["safety_mode"], 1)
         self.assertEqual(closed[0]["holding_minutes"], 30.0)
         self.assertEqual(closed[0]["observed_mfe_pct"], 1.8)
         self.assertEqual(closed[0]["observed_mae_pct"], -0.9)
@@ -1740,7 +1853,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "position_management")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL"])
 
     def test_trigger_cycle_profile_blocks_new_entries(self):
         orchestrator = self._make_orchestrator()
@@ -1770,7 +1883,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "execution_safety")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL"])
 
     def test_trigger_cycle_profile_blocks_new_entries_even_when_flat(self):
         orchestrator = self._make_orchestrator()
@@ -1782,7 +1895,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "execution_safety")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL"])
 
     def test_strategy_cycle_locks_to_trade_consistency_when_active_case_exists(self):
         orchestrator = self._make_orchestrator()
@@ -1881,9 +1994,8 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
         self.assertFalse(effective_profile["trade_consistency_lock_active"])
         self.assertEqual(effective_profile["active_trade_case_id"], "BTCUSDT-case-1")
-        self.assertTrue(effective_profile["trade_consistency_lock_active"])
 
-    def test_effective_risk_profile_applies_exposure_policy_override_outside_drawdown(self):
+    def test_effective_risk_profile_ignores_offline_exposure_registry_override(self):
         orchestrator = self._make_orchestrator()
         orchestrator.state_store.upsert_policy_registry(
             {
@@ -1908,9 +2020,9 @@ class TestTradingOrchestrator(unittest.TestCase):
             regime_key="aligned_up|high",
         )
 
-        self.assertEqual(effective_profile["max_order_notional_pct_balance"], 82.0)
-        self.assertEqual(effective_profile["entry_size_multiplier"], 0.9)
-        self.assertEqual(effective_profile["exposure_policy_key"], "champion:exposure_budget:normal|aligned_up|high")
+        self.assertEqual(effective_profile["max_order_notional_pct_balance"], 100.0)
+        self.assertNotIn("entry_size_multiplier", effective_profile)
+        self.assertNotIn("exposure_policy_key", effective_profile)
 
     def test_effective_risk_profile_leaves_drawdown_profile_unchanged(self):
         orchestrator = self._make_orchestrator()
@@ -2149,6 +2261,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                     symbol="BTCUSDT",
                     action="BUY",
                     order_type="LIMIT",
+                    entry_style="retest",
                     quantity=0.01,
                     price=30000.0,
                     replace_group_id="replace-1",
@@ -2174,10 +2287,18 @@ class TestTradingOrchestrator(unittest.TestCase):
             ],
             fills=[],
             market_snapshots={},
-            symbol_journal_entries=[],
+            symbol_journal_entries=[
+                {
+                    "symbol": "BTCUSDT",
+                    "summary": "Cancelling 1 stale working order older than 30.0m.",
+                    "case_status": None,
+                    "payload": {},
+                }
+            ],
             loop_mode="15m",
             risk_mode="normal",
-            is_trigger_mode=False,
+            is_guarded_attention=False,
+            is_safety_mode=False,
         )
 
         self.assertEqual(len(entries), 2)
@@ -2185,6 +2306,11 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(cancel_entry["action_type"], "cancel")
         self.assertEqual(cancel_entry["order_type"], "CANCEL")
         self.assertEqual(cancel_entry["fill_ratio"], 1.0)
+        self.assertEqual(cancel_entry["outcome_label"], "stale_entry_cancelled")
+        self.assertFalse(cancel_entry["guarded_attention"])
+        self.assertFalse(cancel_entry["safety_mode"])
+        replacement_entry = entries[1]
+        self.assertEqual(replacement_entry["entry_style"], "retest")
 
     def test_main_returns_nonzero_on_startup_configuration_error(self):
         with patch("main.TradingOrchestrator", side_effect=StartupConfigurationError("bad config")):

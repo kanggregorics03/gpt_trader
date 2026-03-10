@@ -11,15 +11,15 @@ class ExecutionPolicyEngine:
         "default_entry_order_type": "LIMIT",
         "default_reduce_order_type": "MARKET",
         "default_exit_order_type": "MARKET",
-        "prefer_market_when_trigger_mode": True,
-        "prefer_market_spread_percentile_lte": 35.0,
-        "prefer_limit_spread_percentile_gte": 80.0,
-        "prefer_limit_depth_percentile_lte": 20.0,
+        "preserve_market_entry_semantics": True,
         "aggressive_limit_offset_bps": 3.0,
         "passive_limit_offset_bps": 8.0,
+        "value_limit_min_offset_bps": 8.0,
+        "value_limit_max_offset_bps": 24.0,
+        "value_limit_spread_multiplier": 1.5,
+        "value_limit_atr_fraction": 0.12,
         "market_max_slippage_bps": 18.0,
         "limit_max_slippage_bps": 10.0,
-        "profile_min_support": 4,
     }
 
     def __init__(self, policy: Optional[Dict[str, Any]] = None, state_store=None):
@@ -40,7 +40,7 @@ class ExecutionPolicyEngine:
         account_state: Optional[AccountState],
         loop_mode: str,
         risk_mode: str,
-        is_trigger_mode: bool,
+        is_guarded_attention: bool,
     ) -> tuple[TradeIntent, Dict[str, Any]]:
         if intent.decision == "HOLD" or not intent.orders:
             return intent, {"applied": False, "reason": "no_orders"}
@@ -56,7 +56,9 @@ class ExecutionPolicyEngine:
                     {
                         "symbol": order.symbol,
                         "action": order.action,
+                        "action_type": "cancel",
                         "reduce_only": bool(order.reduce_only),
+                        "entry_style": getattr(order, "entry_style", None),
                         "execution_profile": getattr(order, "execution_profile", None),
                         "order_type": getattr(order, "order_type", None),
                         "price": getattr(order, "price", None),
@@ -74,23 +76,31 @@ class ExecutionPolicyEngine:
                 account_state=account_state,
                 loop_mode=loop_mode,
                 risk_mode=risk_mode,
-                is_trigger_mode=is_trigger_mode,
+                is_guarded_attention=is_guarded_attention,
             )
-            recommendation = self._get_profile_recommendation(order.symbol, context)
-            execution_profile = self._choose_execution_profile(order, context, recommendation)
+            execution_profile = self._choose_execution_profile(context)
+            execution_profile, contract_adjustment = self._enforce_execution_contract(
+                order,
+                context,
+                execution_profile,
+            )
             updated_order = self._apply_execution_profile(order, snapshot, context, execution_profile)
             updated_orders.append(updated_order)
             order_summaries.append(
                 {
                     "symbol": order.symbol,
                     "action": order.action,
+                    "action_type": context["action_type"],
+                    "intent_order_type": getattr(order, "order_type", None),
+                    "entry_style": context.get("entry_style"),
                     "reduce_only": bool(order.reduce_only),
                     "execution_profile": updated_order.execution_profile,
                     "order_type": updated_order.order_type,
                     "price": updated_order.price,
                     "urgency_bucket": context["urgency_bucket"],
                     "liquidity_bucket": context["liquidity_bucket"],
-                    "profile_source": recommendation.get("source") if recommendation else "heuristic",
+                    "profile_source": "deterministic_contract",
+                    "contract_adjustment": contract_adjustment,
                 }
             )
 
@@ -98,7 +108,7 @@ class ExecutionPolicyEngine:
             "applied": True,
             "loop_mode": loop_mode,
             "risk_mode": risk_mode,
-            "trigger_mode": bool(is_trigger_mode),
+            "guarded_attention": bool(is_guarded_attention),
             "orders": order_summaries,
         }
 
@@ -110,35 +120,31 @@ class ExecutionPolicyEngine:
         account_state: Optional[AccountState],
         loop_mode: str,
         risk_mode: str,
-        is_trigger_mode: bool,
+        is_guarded_attention: bool,
     ) -> Dict[str, Any]:
         spread_percentile = self._safe_float(getattr(snapshot, "spread_percentile_1h", None))
         depth_percentile = self._safe_float(getattr(snapshot, "depth_percentile_1h", None))
         spread_bps = self._safe_float(getattr(getattr(snapshot, "order_book", None), "spread_bps", None))
-        opportunity_score = 0.0
-        risk_score = 0.0
-        if snapshot is not None:
-            opportunity_score += min(2.0, float(len(getattr(snapshot, "opportunity_trigger_reasons", []) or [])) * 0.4)
-            risk_score += min(2.0, float(len(getattr(snapshot, "risk_trigger_reasons", []) or [])) * 0.5)
-            if bool(getattr(snapshot, "is_opportunity_trigger", False)):
-                opportunity_score += 0.6
-            if bool(getattr(snapshot, "is_risk_trigger", False)):
-                risk_score += 0.8
-        if bool(order.reduce_only) or intent.decision in ("REDUCE", "EXIT"):
-            urgency_score = 0.9
+        action_type = "entry"
+        if order.reduce_only or intent.decision == "REDUCE":
+            action_type = "reduce"
+        if intent.decision == "EXIT":
+            action_type = "exit"
+        explicit_entry_style = str(getattr(order, "entry_style", "") or "").strip().lower()
+        if explicit_entry_style == "pullback":
+            explicit_entry_style = "value"
+        if explicit_entry_style not in {"immediate", "retest", "value"}:
+            explicit_entry_style = "immediate" if str(getattr(order, "order_type", "") or "").upper() == "MARKET" else "value"
+        intent_order_type = str(getattr(order, "order_type", "") or "").upper()
+
+        if action_type in {"reduce", "exit"}:
+            urgency_score = 0.95
+        elif intent_order_type == "MARKET":
+            urgency_score = 0.85
+        elif explicit_entry_style == "immediate":
+            urgency_score = 0.7
         else:
-            urgency_score = 0.45
-            if loop_mode == "5m":
-                urgency_score += 0.25
-            if is_trigger_mode and self.config.get("prefer_market_when_trigger_mode", True):
-                urgency_score += 0.15
-            urgency_score += min(0.15, opportunity_score * 0.05)
-            urgency_score -= min(0.2, risk_score * 0.05)
-        if spread_percentile is not None and spread_percentile >= float(self.config["prefer_limit_spread_percentile_gte"]):
-            urgency_score -= 0.15
-        if depth_percentile is not None and depth_percentile <= float(self.config["prefer_limit_depth_percentile_lte"]):
-            urgency_score -= 0.1
-        urgency_score = max(0.0, min(1.0, urgency_score))
+            urgency_score = 0.35
 
         if urgency_score >= 0.8:
             urgency_bucket = "high"
@@ -160,12 +166,6 @@ class ExecutionPolicyEngine:
         else:
             liquidity_bucket = "mixed"
 
-        action_type = "entry"
-        if order.reduce_only or intent.decision == "REDUCE":
-            action_type = "reduce"
-        if intent.decision == "EXIT":
-            action_type = "exit"
-
         current_position = None
         for position in getattr(account_state, "positions", []) or []:
             if getattr(position, "symbol", None) == order.symbol:
@@ -178,7 +178,9 @@ class ExecutionPolicyEngine:
         return {
             "loop_mode": loop_mode,
             "risk_mode": risk_mode,
-            "is_trigger_mode": bool(is_trigger_mode),
+            "is_guarded_attention": bool(is_guarded_attention),
+            "intent_order_type": intent_order_type,
+            "entry_style": explicit_entry_style if action_type == "entry" else None,
             "action_type": action_type,
             "urgency_score": round(urgency_score, 4),
             "urgency_bucket": urgency_bucket,
@@ -189,64 +191,49 @@ class ExecutionPolicyEngine:
             "unrealized_pnl_pct": unrealized_pnl_pct,
         }
 
-    def _get_profile_recommendation(self, symbol: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if self.state_store is None or not hasattr(self.state_store, "get_execution_policy_profile"):
-            return None
-        for candidate_symbol, source in ((symbol, "symbol"), ("*", "global")):
-            row = self.state_store.get_execution_policy_profile(
-                symbol=candidate_symbol,
-                loop_mode=context["loop_mode"],
-                action_type=context["action_type"],
-                urgency_bucket=context["urgency_bucket"],
-                liquidity_bucket=context["liquidity_bucket"],
-                risk_mode=context["risk_mode"],
-            )
-            if not row:
-                continue
-            support = int((row.get("metrics") or {}).get("sample_count") or 0)
-            if support < int(self.config["profile_min_support"]):
-                continue
-            recommended_profile = str(row.get("recommended_execution_profile") or "").strip()
-            if not recommended_profile:
-                continue
-            return {
-                **row,
-                "recommended_execution_profile": recommended_profile,
-                "source": source,
-            }
-        return None
-
     def _choose_execution_profile(
         self,
-        order: OrderIntent,
         context: Dict[str, Any],
-        recommendation: Optional[Dict[str, Any]],
     ) -> str:
-        if recommendation is not None:
-            return str(recommendation["recommended_execution_profile"])
-
         action_type = context["action_type"]
-        urgency_score = float(context["urgency_score"])
-        liquidity_bucket = context["liquidity_bucket"]
-        spread_percentile = self._safe_float(context.get("spread_percentile_1h"))
+        entry_style = str(context.get("entry_style") or "").strip().lower()
+        intent_order_type = str(context.get("intent_order_type") or "").upper()
 
         if action_type == "exit":
             return "market_urgent"
         if action_type == "reduce":
-            unrealized_pnl_pct = self._safe_float(context.get("unrealized_pnl_pct"))
-            if liquidity_bucket == "poor" and unrealized_pnl_pct is not None and unrealized_pnl_pct > 0:
-                return "limit_aggressive"
             return "market_urgent"
-
-        if liquidity_bucket == "poor":
-            return "limit_passive"
-        if urgency_score >= 0.8:
+        if intent_order_type == "MARKET":
             return "market_urgent"
-        if context["loop_mode"] == "5m":
-            return "market_urgent"
-        if context["is_trigger_mode"] and spread_percentile is not None and spread_percentile <= 55.0:
+        if intent_order_type == "LIMIT" and entry_style == "immediate":
             return "limit_aggressive"
         return "limit_passive"
+
+    def _enforce_execution_contract(
+        self,
+        order: OrderIntent,
+        context: Dict[str, Any],
+        execution_profile: str,
+    ) -> tuple[str, str | None]:
+        if not bool(self.config.get("preserve_market_entry_semantics", True)):
+            return execution_profile, None
+        action_type = str(context.get("action_type") or "").strip().lower()
+        intent_order_type = str(context.get("intent_order_type") or getattr(order, "order_type", "") or "").upper()
+        entry_style = str(context.get("entry_style") or "").strip().lower()
+        if action_type == "exit" and execution_profile != "market_urgent":
+            return "market_urgent", "exit_market_only"
+        if action_type == "reduce" and execution_profile != "market_urgent":
+            return "market_urgent", "reduce_market_only"
+        if action_type != "entry":
+            return execution_profile, None
+        if entry_style == "immediate":
+            if intent_order_type == "MARKET" and execution_profile != "market_urgent":
+                return "market_urgent", "market_entry_kept_immediate"
+            if intent_order_type == "LIMIT" and execution_profile != "limit_aggressive":
+                return "limit_aggressive", "limit_entry_kept_immediate"
+        if entry_style in {"retest", "value"} and execution_profile != "limit_passive":
+            return "limit_passive", f"{entry_style}_entry_kept_passive"
+        return execution_profile, None
 
     def _apply_execution_profile(
         self,
@@ -283,7 +270,13 @@ class ExecutionPolicyEngine:
                 if execution_profile == "limit_passive"
                 else float(self.config["aggressive_limit_offset_bps"])
             )
-            price = self._build_limit_price(order, reference_price, snapshot, limit_offset_bps, post_only)
+            if post_only and str(context.get("entry_style") or "").strip().lower() == "value":
+                limit_offset_bps = self._resolve_value_limit_offset_bps(
+                    reference_price=reference_price,
+                    snapshot=snapshot,
+                    base_offset_bps=limit_offset_bps,
+                )
+            price = self._build_limit_price(order, reference_price, snapshot, context, limit_offset_bps, post_only)
             max_slippage_bps = float(self.config["limit_max_slippage_bps"])
             time_in_force = "GTC"
 
@@ -306,11 +299,17 @@ class ExecutionPolicyEngine:
         order: OrderIntent,
         reference_price: Optional[float],
         snapshot: Optional[MarketSnapshot],
+        context: Dict[str, Any],
         limit_offset_bps: float,
         post_only: bool,
     ) -> Optional[float]:
         if reference_price is None or reference_price <= 0:
             return order.price
+        entry_style = str(context.get("entry_style") or "").strip().lower()
+        if post_only and entry_style == "retest":
+            anchored = self._build_retest_limit_price(order, reference_price, snapshot)
+            if anchored is not None:
+                return anchored
         order_book = getattr(snapshot, "order_book", None)
         best_bid = self._safe_float(getattr(order_book, "best_bid", None))
         best_ask = self._safe_float(getattr(order_book, "best_ask", None))
@@ -326,6 +325,60 @@ class ExecutionPolicyEngine:
             if not post_only and best_bid is not None:
                 candidate = max(best_bid, reference_price * (1.0 - offset_ratio))
             elif post_only and best_ask is not None:
+                candidate = max(candidate, best_ask)
+        return round(candidate, 8)
+
+    def _resolve_value_limit_offset_bps(
+        self,
+        *,
+        reference_price: Optional[float],
+        snapshot: Optional[MarketSnapshot],
+        base_offset_bps: float,
+    ) -> float:
+        min_offset = max(0.0, float(self.config.get("value_limit_min_offset_bps", base_offset_bps) or base_offset_bps))
+        max_offset = max(min_offset, float(self.config.get("value_limit_max_offset_bps", min_offset) or min_offset))
+        spread_multiplier = max(0.0, float(self.config.get("value_limit_spread_multiplier", 1.5) or 1.5))
+        atr_fraction = max(0.0, float(self.config.get("value_limit_atr_fraction", 0.12) or 0.12))
+        spread_bps = self._safe_float(getattr(getattr(snapshot, "order_book", None), "spread_bps", None)) or 0.0
+        atr_value = self._safe_float(getattr(snapshot, "atr_15m", None))
+        if atr_value is None or atr_value <= 0:
+            atr_value = self._safe_float(getattr(snapshot, "atr_1h", None))
+        atr_component_bps = 0.0
+        if reference_price is not None and reference_price > 0 and atr_value is not None and atr_value > 0:
+            atr_component_bps = (atr_value / reference_price) * 10000.0 * atr_fraction
+        adaptive_offset = max(base_offset_bps, min_offset, spread_bps * spread_multiplier, atr_component_bps)
+        return round(min(max_offset, adaptive_offset), 4)
+
+    def _build_retest_limit_price(
+        self,
+        order: OrderIntent,
+        reference_price: float,
+        snapshot: Optional[MarketSnapshot],
+    ) -> Optional[float]:
+        if snapshot is None:
+            return None
+        order_book = getattr(snapshot, "order_book", None)
+        best_bid = self._safe_float(getattr(order_book, "best_bid", None))
+        best_ask = self._safe_float(getattr(order_book, "best_ask", None))
+        breakout_offsets = []
+        distance_15m = self._safe_float(getattr(snapshot, "distance_to_15m_breakout_level", None))
+        atr_15m = self._safe_float(getattr(snapshot, "atr_15m", None))
+        if distance_15m is not None and atr_15m is not None and distance_15m >= 0 and atr_15m > 0:
+            breakout_offsets.append(distance_15m * atr_15m)
+        distance_1h = self._safe_float(getattr(snapshot, "distance_to_1h_breakout_level", None))
+        atr_1h = self._safe_float(getattr(snapshot, "atr_1h", None))
+        if distance_1h is not None and atr_1h is not None and distance_1h >= 0 and atr_1h > 0:
+            breakout_offsets.append(distance_1h * atr_1h)
+        if not breakout_offsets:
+            return None
+        offset = min(breakout_offsets)
+        if order.action == "BUY":
+            candidate = max(0.0, reference_price - offset)
+            if best_bid is not None:
+                candidate = min(candidate, best_bid)
+        else:
+            candidate = reference_price + offset
+            if best_ask is not None:
                 candidate = max(candidate, best_ask)
         return round(candidate, 8)
 

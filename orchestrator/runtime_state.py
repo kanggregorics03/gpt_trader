@@ -23,7 +23,7 @@ class TradingRuntimeStateMixin:
                 "selected_rules": [],
             },
             "similar_past_cases": {
-                "trigger_mode": False,
+                "guarded_attention": False,
                 "available_total": 0,
                 "selected_total": 0,
                 "selected_sources": {},
@@ -215,19 +215,6 @@ class TradingRuntimeStateMixin:
         for management_action in ("CANCEL", "REPLACE_ENTRY"):
             if management_action not in allowed_actions:
                 allowed_actions.append(management_action)
-        if risk_mode == "normal" and regime_key:
-            exposure_regime_key = f"{risk_mode}|{regime_key}"
-            registry_fetch = getattr(self.state_store, "get_policy_registry_entry_for_regime", None)
-            exposure_registry = {}
-            if callable(registry_fetch):
-                exposure_registry = registry_fetch("exposure_budget", regime_key=exposure_regime_key)
-            if exposure_registry:
-                config = exposure_registry.get("config") or {}
-                for key in ("max_order_notional_pct_balance", "entry_size_multiplier"):
-                    if key in config:
-                        effective_profile[key] = config[key]
-                effective_profile["exposure_policy_key"] = exposure_registry.get("policy_key")
-                effective_profile["exposure_regime_key"] = exposure_regime_key
         if loop_mode == "15m":
             effective_profile["cycle_role"] = "position_management"
             effective_profile["cycle_guidance"] = (
@@ -235,7 +222,7 @@ class TradingRuntimeStateMixin:
             )
             effective_profile["allowed_actions"] = [
                 action for action in allowed_actions
-                if action in ("HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY")
+                if action in ("HOLD", "EXIT", "CANCEL")
             ]
         elif loop_mode == "5m":
             effective_profile["cycle_role"] = "execution_safety"
@@ -245,7 +232,7 @@ class TradingRuntimeStateMixin:
             )
             effective_profile["allowed_actions"] = [
                 action for action in allowed_actions
-                if action in ("HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY")
+                if action in ("HOLD", "EXIT", "CANCEL")
             ]
         elif loop_mode == "1h" and trade_consistency_lock_active:
             effective_profile["cycle_role"] = "trade_consistency_management"
@@ -270,6 +257,64 @@ class TradingRuntimeStateMixin:
         effective_profile["active_thesis_id"] = active_trade_case.get("thesis_id")
         effective_profile["active_management_template_id"] = active_trade_case.get("management_template_id")
         return effective_profile
+
+    def _build_entry_headroom_summary(self, account_state, market_prices: dict, risk_profile: dict) -> dict:
+        risk_profile = dict(risk_profile or {})
+        allowed_actions = {str(action).upper() for action in risk_profile.get("allowed_actions", [])}
+        entries_allowed = bool({"BUY", "SELL"} & allowed_actions)
+        total_balance = float(getattr(account_state, "total_balance", 0.0) or 0.0)
+        mode_cap_pct = float(risk_profile.get("max_order_notional_pct_balance", 100.0) or 0.0)
+        entry_cap_notional = total_balance * max(0.0, mode_cap_pct / 100.0)
+
+        def _order_reference_price(order) -> float:
+            if getattr(order, "price", None) not in (None, ""):
+                return float(order.price or 0.0)
+            symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+            return float((market_prices or {}).get(symbol, 0.0) or 0.0)
+
+        pending_entry_notional = 0.0
+        for order in getattr(account_state, "open_orders", []) or []:
+            side = str(getattr(order, "side", "") or "").upper()
+            status = str(getattr(order, "status", "") or "").lower()
+            if side not in {"BUY", "SELL"}:
+                continue
+            if bool(getattr(order, "reduce_only", False)):
+                continue
+            if status in {"closed", "filled", "canceled", "cancelled", "failed", "rejected"}:
+                continue
+            pending_entry_notional += abs(float(getattr(order, "quantity", 0.0) or 0.0)) * _order_reference_price(order)
+
+        live_position_notional = 0.0
+        for position in getattr(account_state, "positions", []) or []:
+            live_position_notional += abs(float(getattr(position, "size", 0.0) or 0.0)) * abs(
+                float(getattr(position, "entry_price", 0.0) or 0.0)
+            )
+
+        max_leverage = float((self.risk_engine.policy.get("trading") or {}).get("max_leverage", 0.0) or 0.0)
+        leverage_cap_notional = total_balance * max_leverage if max_leverage > 0 else 0.0
+        leverage_used_notional = live_position_notional + pending_entry_notional
+        blocked_reasons = []
+        if not entries_allowed:
+            blocked_reasons.append("allowed_actions_block_entries")
+        if mode_cap_pct <= 0:
+            blocked_reasons.append("mode_cap_zero")
+        entry_cap_remaining_notional = max(0.0, entry_cap_notional - pending_entry_notional)
+        leverage_remaining_notional = max(0.0, leverage_cap_notional - leverage_used_notional) if leverage_cap_notional > 0 else 0.0
+        return {
+            "entries_allowed": entries_allowed and mode_cap_pct > 0,
+            "blocked_reasons": blocked_reasons,
+            "mode_cap_pct": round(mode_cap_pct, 4),
+            "entry_cap_notional": round(entry_cap_notional, 4),
+            "pending_entry_notional": round(pending_entry_notional, 4),
+            "entry_cap_remaining_notional": round(entry_cap_remaining_notional, 4),
+            "entry_cap_remaining_pct_balance": round((entry_cap_remaining_notional / total_balance) * 100.0, 4) if total_balance > 0 else 0.0,
+            "max_leverage": round(max_leverage, 4),
+            "leverage_cap_notional": round(leverage_cap_notional, 4),
+            "leverage_used_notional": round(leverage_used_notional, 4),
+            "leverage_remaining_notional": round(leverage_remaining_notional, 4),
+            "has_live_positions": self._has_live_positions(account_state),
+            "has_live_open_orders": self._has_live_open_orders(account_state),
+        }
 
     def _extract_entry_orders(self, orders):
         return [
@@ -319,17 +364,35 @@ class TradingRuntimeStateMixin:
             self.state_store.release_entry_mutex(symbol, owner=owner)
 
     def _resolve_runtime_state_from_recovered_order(self, recovered_order: dict) -> str:
+        recovered_order = dict(recovered_order or {})
+        info = recovered_order.get("info") or {}
         status = str(
-            (recovered_order or {}).get("status")
-            or ((recovered_order or {}).get("info") or {}).get("orderStatus")
+            recovered_order.get("status")
+            or info.get("orderStatus")
             or "unknown"
         ).lower()
+        filled_quantity = 0.0
+        for candidate in (
+            recovered_order.get("filled"),
+            recovered_order.get("filled_quantity"),
+            recovered_order.get("cumExecQty"),
+            info.get("cumExecQty"),
+            info.get("cum_exec_qty"),
+            info.get("executedQty"),
+            info.get("filledQty"),
+        ):
+            try:
+                filled_quantity = float(candidate or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if abs(filled_quantity) > 0:
+                break
         if status in ("closed", "filled"):
             return "completed"
         if status in ("canceled", "cancelled"):
             return "cancelled"
         if status in ("failed", "rejected"):
             return "failed"
-        if status in ("open", "partially_filled", "partiallyfilled"):
-            return "partial_filled"
+        if status in ("open", "new", "created", "partially_filled", "partiallyfilled"):
+            return "partial_filled" if abs(filled_quantity) > 0 else "submitted"
         return "unknown"

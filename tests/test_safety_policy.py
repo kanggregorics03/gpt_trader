@@ -32,13 +32,39 @@ class DummyStore:
 
 
 class TestSafetyPolicyEngine(unittest.TestCase):
+    def test_emergency_state_does_not_promote_acute_loss_alone_to_5m_emergency(self):
+        engine = SafetyPolicyEngine(policy={}, state_store=DummyStore())
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=920.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=-12.0,
+                    account_unrealized_pnl_pct=-1.2,
+                )
+            ],
+            open_orders=[],
+        )
+
+        state = engine.get_emergency_state(
+            account_state=account_state,
+            market_snapshots={},
+        )
+
+        self.assertFalse(state["active"])
+        self.assertEqual(state["reasons"], [])
+
     def test_flat_portfolio_returns_deterministic_hold(self):
         engine = SafetyPolicyEngine(policy={}, state_store=DummyStore())
 
         result = engine.evaluate(
             account_state=AccountState(total_balance=1000.0, available_balance=1000.0, positions=[], open_orders=[]),
             market_snapshots={},
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
@@ -77,7 +103,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         result = engine.evaluate(
             account_state=account_state,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
@@ -138,7 +164,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         result = engine.evaluate(
             account_state=account_state,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
@@ -162,7 +188,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         confirmed_result = confirmed_engine.evaluate(
             account_state=account_state,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
@@ -232,7 +258,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         result = engine.evaluate(
             account_state=account_state,
             market_snapshots=market_snapshots,
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
@@ -240,7 +266,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
 
     def test_stale_working_orders_without_positions_are_cancelled(self):
         engine = SafetyPolicyEngine(
-            policy={"safety_policy": {"stale_order_minutes": 1, "stale_order_reprice_enabled": False}},
+            policy={"safety_policy": {"stale_order_minutes": 1}},
             state_store=DummyStore(),
         )
         account_state = AccountState(
@@ -263,13 +289,21 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         result = engine.evaluate(
             account_state=account_state,
             market_snapshots={},
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
         self.assertFalse(result["escalate_to_ai"])
         self.assertEqual(result["decision_result"]["decision"], "CANCEL")
         self.assertEqual(result["decision_result"]["orders"][0].action, "CANCEL")
+
+        state = engine.get_emergency_state(
+            account_state=account_state,
+            market_snapshots={},
+        )
+
+        self.assertFalse(state["active"])
+        self.assertEqual(state["reasons"], [])
 
     def test_stale_working_order_can_be_repriced(self):
         engine = SafetyPolicyEngine(policy={"safety_policy": {"stale_order_minutes": 1}}, state_store=DummyStore())
@@ -304,16 +338,13 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         result = engine.evaluate(
             account_state=account_state,
             market_snapshots={"BTCUSDT": snapshot},
-            risk_mode="trigger",
+            risk_mode="guarded",
             loop_mode="5m",
         )
 
         self.assertFalse(result["escalate_to_ai"])
-        self.assertEqual(result["decision_result"]["decision"], "REPLACE_ENTRY")
-        self.assertEqual([order.action for order in result["decision_result"]["orders"]], ["CANCEL", "BUY"])
-        self.assertEqual(result["decision_result"]["orders"][0].lineage_role, "cancel")
-        self.assertEqual(result["decision_result"]["orders"][1].lineage_role, "replacement")
-        self.assertTrue(result["decision_result"]["orders"][1].wait_for_cancel_confirmation)
+        self.assertEqual(result["decision_result"]["decision"], "CANCEL")
+        self.assertEqual([order.action for order in result["decision_result"]["orders"]], ["CANCEL"])
 
 
 if __name__ == "__main__":

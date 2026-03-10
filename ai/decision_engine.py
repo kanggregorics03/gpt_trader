@@ -15,7 +15,7 @@ from ai.llm_provider import (
     resolve_decision_models,
 )
 from core.intent_validator import StructuredIntentValidator
-from core.models import DecisionRequest, LongTermMemoryRecord, TradeIntent
+from core.models import AITradeIntent, DecisionRequest, LongTermMemoryRecord, TradeIntent
 
 @dataclass
 class DecisionResult:
@@ -35,7 +35,7 @@ class DecisionEngine:
         provider: Optional[str] = None,
         base_url: Optional[str] = None,
         default_model: Optional[str] = None,
-        trigger_model: Optional[str] = None,
+        guarded_attention_model: Optional[str] = None,
     ):
         self.provider_name = normalize_provider_name(provider)
         resolved_api_key = resolve_api_key(self.provider_name, explicit_api_key=api_key)
@@ -49,7 +49,7 @@ class DecisionEngine:
         self.flash_model, self.pro_model = resolve_decision_models(
             self.provider_name,
             default_model=default_model,
-            trigger_model=trigger_model,
+            guarded_attention_model=guarded_attention_model,
         )
         self.cache_store = cache_store
         self.intent_validator = StructuredIntentValidator()
@@ -57,13 +57,13 @@ class DecisionEngine:
     def _resolve_models(
         self,
         default_model: Optional[str] = None,
-        trigger_model: Optional[str] = None,
+        guarded_attention_model: Optional[str] = None,
     ) -> tuple[str, str]:
         provider_name = getattr(self, "provider_name", normalize_provider_name())
         return resolve_decision_models(
             provider_name,
             default_model=default_model,
-            trigger_model=trigger_model,
+            guarded_attention_model=guarded_attention_model,
         )
 
     def _compact_json(self, payload) -> str:
@@ -131,22 +131,44 @@ class DecisionEngine:
         text = self._normalize_text(value, default="")
         return text
 
-    def _normalize_order_payload(self, payload: Any) -> dict[str, Any] | None:
+    def _normalize_order_payload(
+        self,
+        payload: Any,
+        *,
+        issues: list[str],
+        order_index: int,
+    ) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
+            issues.append(f"orders[{order_index}] is not an object")
             return None
-        action = self._normalize_text(payload.get("action"), default="BUY").upper()
+        action = self._normalize_text(payload.get("action"), default="").upper()
         if action not in {"BUY", "SELL", "CANCEL"}:
-            action = "BUY"
-        order_type = self._normalize_text(payload.get("order_type"), default="MARKET").upper()
+            issues.append(f"orders[{order_index}].action is invalid")
+            return None
+        order_type = self._normalize_text(payload.get("order_type"), default="").upper()
         if order_type not in {"MARKET", "LIMIT"}:
-            order_type = "MARKET"
+            issues.append(f"orders[{order_index}].order_type is invalid")
+            return None
+        entry_style = self._normalize_text(payload.get("entry_style"), default="").lower()
+        reduce_only = self._coerce_bool(payload.get("reduce_only"), default=False)
+        if action in {"BUY", "SELL"} and not reduce_only:
+            if entry_style not in {"immediate", "retest", "value"}:
+                issues.append(f"orders[{order_index}].entry_style is invalid or missing")
+                return None
+        else:
+            entry_style = ""
+        symbol = self._normalize_text(payload.get("symbol"), default="")
+        if not symbol:
+            issues.append(f"orders[{order_index}].symbol is missing")
+            return None
         return {
-            "symbol": self._normalize_text(payload.get("symbol"), default="BTCUSDT"),
+            "symbol": symbol,
             "action": action,
             "order_type": order_type,
+            "entry_style": entry_style if action in {"BUY", "SELL"} and not reduce_only else None,
             "quantity": self._coerce_float(payload.get("quantity"), default=0.0) or 0.0,
             "price": self._coerce_float(payload.get("price")),
-            "reduce_only": self._coerce_bool(payload.get("reduce_only"), default=False),
+            "reduce_only": reduce_only,
             "take_profit": self._coerce_float(payload.get("take_profit")),
             "stop_loss": self._coerce_float(payload.get("stop_loss")),
             "target_order_id": self._normalize_text(payload.get("target_order_id"), default="") or None,
@@ -159,15 +181,6 @@ class DecisionEngine:
                 payload.get("wait_for_cancel_confirmation"),
                 default=False,
             ),
-            "execution_profile": self._normalize_text(payload.get("execution_profile"), default="") or None,
-            "urgency_score": self._coerce_float(payload.get("urgency_score")),
-            "max_slippage_bps": self._coerce_float(payload.get("max_slippage_bps")),
-            "time_in_force": self._normalize_text(payload.get("time_in_force"), default="") or None,
-            "post_only": self._coerce_bool(payload.get("post_only"), default=False),
-            "limit_offset_bps": self._coerce_float(payload.get("limit_offset_bps")),
-            "execution_context": payload.get("execution_context")
-            if isinstance(payload.get("execution_context"), dict)
-            else {},
         }
 
     def _normalize_evidence_payload(self, payload: Any) -> dict[str, Any] | None:
@@ -228,15 +241,20 @@ class DecisionEngine:
             "evidence": evidence,
         }
 
-    def _normalize_trade_intent_payload(self, payload: Any) -> dict[str, Any]:
+    def _normalize_trade_intent_payload(self, payload: Any) -> tuple[dict[str, Any], list[str]]:
         if not isinstance(payload, dict):
-            return {}
+            return {}, ["root payload is not an object"]
         raw_orders = payload.get("orders")
         if isinstance(raw_orders, dict):
             raw_orders = [raw_orders]
         orders = []
-        for item in raw_orders or []:
-            normalized = self._normalize_order_payload(item)
+        issues: list[str] = []
+        for raw_index, item in enumerate(raw_orders or []):
+            normalized = self._normalize_order_payload(
+                item,
+                issues=issues,
+                order_index=raw_index,
+            )
             if normalized is not None:
                 orders.append(normalized)
 
@@ -249,10 +267,12 @@ class DecisionEngine:
             if normalized is not None:
                 rationale_items.append(normalized)
 
-        decision = self._normalize_text(payload.get("decision"), default="HOLD").upper()
+        decision = self._normalize_text(payload.get("decision"), default="").upper()
         if decision not in {"HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"}:
-            decision = "HOLD"
-        return {
+            issues.append("decision is invalid")
+        if decision in {"BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"} and not orders:
+            issues.append(f"{decision} requires at least one valid order")
+        normalized_payload = {
             "decision": decision,
             "orders": orders,
             "rationale": self._normalize_string_list(payload.get("rationale")),
@@ -265,6 +285,7 @@ class DecisionEngine:
             "management_template_id": self._normalize_text(payload.get("management_template_id"), default="") or None,
             "exit_reason": self._normalize_text(payload.get("exit_reason"), default="") or None,
         }
+        return normalized_payload, issues
 
     def _round_compact_value(self, value: Any) -> Any:
         if isinstance(value, float):
@@ -319,7 +340,12 @@ class DecisionEngine:
         }
         return self._drop_empty(self._round_compact_value(compact))
 
-    def _compact_market_snapshot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _compact_market_snapshot_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        include_signal_triggers: bool = True,
+    ) -> dict[str, Any]:
         compact = {
             "symbol": payload.get("symbol"),
             "current_price": payload.get("current_price"),
@@ -334,9 +360,6 @@ class DecisionEngine:
             "recent_volume_surge": payload.get("recent_volume_surge"),
             "volume_ratio_15m": payload.get("volume_ratio_15m"),
             "volume_surge_15m_now": payload.get("volume_surge_15m_now"),
-            "fast_move_trigger_active": payload.get("fast_move_trigger_active"),
-            "volume_surge_trigger_active": payload.get("volume_surge_trigger_active"),
-            "range_break_trigger_active": payload.get("range_break_trigger_active"),
             "oi_change_15m": payload.get("oi_change_15m"),
             "oi_change_1h": payload.get("oi_change_1h"),
             "funding_rate_change_1h": payload.get("funding_rate_change_1h"),
@@ -347,9 +370,7 @@ class DecisionEngine:
             "distance_to_15m_breakout_level": payload.get("distance_to_15m_breakout_level"),
             "distance_to_1h_breakout_level": payload.get("distance_to_1h_breakout_level"),
             "distance_to_invalid_level": payload.get("distance_to_invalid_level"),
-            "is_opportunity_trigger": payload.get("is_opportunity_trigger"),
             "is_risk_trigger": payload.get("is_risk_trigger"),
-            "opportunity_trigger_reasons": payload.get("opportunity_trigger_reasons"),
             "risk_trigger_reasons": payload.get("risk_trigger_reasons"),
             "trigger_reasons": payload.get("trigger_reasons"),
             "timeframes": {
@@ -380,16 +401,31 @@ class DecisionEngine:
                 "liquidity_regime": ((payload.get("regime") or {}).get("liquidity_regime")),
             },
         }
+        if include_signal_triggers:
+            compact.update(
+                {
+                    "fast_move_signal_active": payload.get("fast_move_signal_active"),
+                    "volume_surge_signal_active": payload.get("volume_surge_signal_active"),
+                    "range_break_signal_active": payload.get("range_break_signal_active"),
+                }
+            )
         return self._drop_empty(self._round_compact_value(compact))
 
     def _build_market_payload(self, request: DecisionRequest):
+        include_signal_triggers = str(request.loop_mode or "").strip().lower() != "1h"
         if request.market_snapshots:
             return {
-                symbol: self._compact_market_snapshot_payload(snapshot.model_dump(mode="json"))
+                symbol: self._compact_market_snapshot_payload(
+                    snapshot.model_dump(mode="json"),
+                    include_signal_triggers=include_signal_triggers,
+                )
                 for symbol, snapshot in request.market_snapshots.items()
             }
         if request.market_snapshot is not None:
-            return self._compact_market_snapshot_payload(request.market_snapshot.model_dump(mode="json"))
+            return self._compact_market_snapshot_payload(
+                request.market_snapshot.model_dump(mode="json"),
+                include_signal_triggers=include_signal_triggers,
+            )
         return {}
 
     def _build_recent_journal_context_payload(self, request: DecisionRequest):
@@ -515,12 +551,39 @@ class DecisionEngine:
         payload = request.account_state.model_dump(mode="json")
         payload.pop("snapshot_timestamp", None)
         return payload
+
+    def _build_compact_risk_state_payload(self, request: DecisionRequest) -> dict:
+        raw = request.risk_state.model_dump(mode="json")
+        compact = {
+            "daily_pnl_pct": raw.get("daily_pnl_pct"),
+            "drawdown_active": raw.get("drawdown_active"),
+            "drawdown_activate_pct": raw.get("drawdown_activate_pct"),
+            "cooldown_active": raw.get("cooldown_active"),
+            "cooldown_remaining_minutes": raw.get("cooldown_remaining_minutes"),
+            "cooldown_minutes_effective": raw.get("cooldown_minutes_effective"),
+            "cooldown_components": raw.get("cooldown_components"),
+            "consecutive_losses": raw.get("consecutive_losses"),
+            "last_loss_estimated_pnl_pct": raw.get("last_loss_estimated_pnl_pct"),
+            "failure_pattern_score": raw.get("failure_pattern_score"),
+            "dominant_failure_reason": raw.get("dominant_failure_reason"),
+            "dominant_failure_count": raw.get("dominant_failure_count"),
+            "reentry_guard_active": raw.get("reentry_guard_active"),
+            "reentry_guard_reason": raw.get("reentry_guard_reason"),
+            "reentry_guard_remaining_minutes": raw.get("reentry_guard_remaining_minutes"),
+            "alpha_policy_blocked_symbols": raw.get("alpha_policy_blocked_symbols"),
+        }
+        return self._drop_empty(self._round_compact_value(compact))
+
+    def _build_entry_headroom_payload(self, request: DecisionRequest) -> dict:
+        return self._drop_empty(self._round_compact_value(dict(request.entry_headroom or {})))
         
     def _create_prompt(self, request: DecisionRequest) -> str:
         market_payload = self._build_market_payload(request)
         memory_payload = self._build_long_term_memory_payload(request)
         recent_journal_payload = self._build_recent_journal_context_payload(request)
         similar_cases_payload = self._build_similar_past_cases_payload(request)
+        compact_risk_state = self._build_compact_risk_state_payload(request)
+        entry_headroom_payload = self._build_entry_headroom_payload(request)
         prompt = f"""
 You are an expert crypto trading strategist.
 You are ONLY a strategist. Do not bypass risk limits.
@@ -534,7 +597,9 @@ account_state:
 market_snapshots:
 {self._compact_json(market_payload)}
 risk_state:
-{request.risk_state.model_dump_json()}
+{self._compact_json(compact_risk_state)}
+entry_headroom:
+{self._compact_json(entry_headroom_payload)}
 risk_mode:
 {request.risk_mode}
 loop_mode:
@@ -549,8 +614,8 @@ long_term_memory:
 {self._compact_json(memory_payload)}
 similar_past_cases:
 {self._compact_json(similar_cases_payload)}
-trigger_mode_active:
-{str(request.is_trigger_mode).lower()}
+guarded_attention_active:
+{str(request.is_guarded_attention).lower()}
 
 MARKET INTERPRETATION
 0. market_snapshots, recent_journal_context, long_term_memory, and similar_past_cases are compact decision views. They intentionally remove low-value duplication while preserving decision-critical structure, trigger, execution, and outcome information.
@@ -558,30 +623,37 @@ MARKET INTERPRETATION
 0b. If retrieved context conflicts with the current market_snapshots or risk_state, prefer the live snapshot evidence.
 0c. Treat fallback, retired, and error-like context as cautionary metadata, not as direct trading instructions.
 0d. policy_summary is an extracted policy digest, not a full document. Treat it as the binding summary of enforceable limits and execution guards.
-1. Prefer derived fields such as change, percentile, distance, and trigger-state over raw values when making decisions.
-2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_trigger_active is the stabilized trigger state after hysteresis. Do not treat them as interchangeable.
-3. fast_move_trigger_active, volume_surge_trigger_active, and range_break_trigger_active represent stabilized trigger states and matter more for cadence and follow-through than one-bar noise.
+1. Prefer derived fields such as change, percentile, distance, and stabilized trigger state over raw values when making decisions.
+2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_signal_active is the stabilized signal state after hysteresis. Do not treat them as interchangeable.
+3. fast_move_signal_active, volume_surge_signal_active, and range_break_signal_active are short-horizon stabilization signals. Use them in 15m and 5m loops for cadence and follow-through. In the 1h loop, prioritize higher-timeframe structure, breakout distance, trend alignment, and participation instead.
 4. spread_vs_1h_avg, spread_percentile_1h, and depth_percentile_1h describe execution quality. Poor execution quality should reduce aggressiveness even if direction looks favorable.
 5. oi_change_15m, oi_change_1h, funding_rate_change_1h, and basis_change_1h describe change and participation, not just static state.
 6. distance_to_15m_breakout_level, distance_to_1h_breakout_level, and distance_to_invalid_level describe structure quality. Smaller and clearer invalidation distance generally supports cleaner entries.
+7. entry_headroom summarizes remaining entry budget and leverage room before this decision. Treat blocked or near-zero headroom as a real constraint, not a suggestion.
 
 RULES
-1. Analyze structure, participation, trigger context, execution quality, and recent performance.
+1. Analyze structure, participation, trigger state, execution quality, and recent performance.
 2. Decide one of HOLD, BUY, SELL, REDUCE, EXIT, CANCEL, REPLACE_ENTRY at the portfolio level.
 3. If entering or reducing, populate orders and include take_profit / stop_loss when appropriate.
-4. Distinguish opportunity triggers vs risk triggers. Opportunity triggers mean closer monitoring; risk triggers mean more conservative execution.
+3a. For non-reduce BUY/SELL entry orders, set entry_style to one of immediate, retest, or value. immediate means the thesis requires entering now. retest means wait for a breakout or reclaim retest near structure. value means wait for a general passive retrace away from the current price.
+3c. Use retest only when there is explicit structure evidence such as breakout/reclaim context, nearby breakout distance, or a clearly defined retest level. If the setup is not anchored to structure, do not call it retest.
+3d. Use value only for a passive retrace inside an already acceptable directional context. If higher-timeframe trend alignment is unclear or the invalidation distance is too wide, prefer HOLD instead of a value entry.
+3b. If the decision is REDUCE or EXIT, use MARKET orders. Do not express exit or reduction intent as passive limit waiting.
+4. Distinguish follow-through or breakout trigger state from risk triggers when they are present. Risk triggers mean more conservative execution and possible de-risking.
 5. Review existing open orders and avoid duplicate or conflicting orders for the same symbol.
 6. If liquidation risk, cooldown pressure, drawdown pressure, wide spread, weak depth, or unfavorable funding is elevated, prefer REDUCE or EXIT over new exposure.
-7. If loop_mode is 5m or cycle_role is execution_safety, do not open new positions. Only HOLD, REDUCE, EXIT, CANCEL, or REPLACE_ENTRY are valid.
-8. If loop_mode is 15m or cycle_role is position_management, avoid opening new positions and focus on managing live exposure and working orders for the configured symbol.
-9. Use REPLACE_ENTRY only for working-order management. It must include a CANCEL leg for the existing entry order and a replacement BUY/SELL limit leg for the same symbol.
+7. If loop_mode is 5m or cycle_role is execution_safety, do not open new positions. Only HOLD, REDUCE, EXIT, or CANCEL are valid.
+8. If loop_mode is 15m or cycle_role is position_management, avoid opening new positions and focus on managing live exposure and stale working orders conservatively. Prefer CANCEL over repricing.
+9. Use REPLACE_ENTRY only when explicitly managing a working entry in the 1h strategy loop. Never use it in 5m safety or 15m position-management loops.
+9a. entry_style and order_type must agree semantically: immediate should usually pair with MARKET or an aggressive limit, while retest and value should pair with LIMIT.
+9b. Do not emit execution_profile, urgency_score, max_slippage_bps, time_in_force, post_only, or limit_offset_bps. The runtime execution layer computes those fields.
 10. Only the 1h strategy loop should initiate fresh directional exposure unless the risk_profile explicitly blocks entries.
-11. In trigger mode, prioritize risk reduction and execution quality over new exposure.
+11. In guarded state, prioritize risk reduction and execution quality over new exposure.
 12. Consider idempotency and avoid repeating a failed request from recent_journal_context.
 13. Put identified risks in risk_notes.
 14. All text fields must be English.
 15. market_snapshots contains the configured trading symbol set. Do not invent or reference other symbols.
-16. Do not force a trade just because an opportunity trigger exists.
+16. Do not force a trade just because trigger state is active.
 17. A breakout without volume, open-interest support, or acceptable execution quality is weak.
 18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
 19. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
@@ -595,7 +667,7 @@ RULES
 OUTPUT EXAMPLE
 {{
   "decision":"BUY",
-  "orders":[{{"symbol":"BTCUSDT","action":"BUY","order_type":"MARKET","quantity":0.01,"price":null,"reduce_only":false,"take_profit":31200.0,"stop_loss":29850.0}}],
+  "orders":[{{"symbol":"BTCUSDT","action":"BUY","order_type":"MARKET","entry_style":"immediate","quantity":0.01,"price":null,"reduce_only":false,"take_profit":31200.0,"stop_loss":29850.0}}],
   "rationale":["BTC breakout has volume and open-interest follow-through while execution quality remains acceptable."],
   "rationale_items":[{{"summary":"BTC breakout has participation and acceptable execution quality","why_it_matters":"Continuation setups are stronger when structure, participation, and execution quality align.","trade_implication":"Allows one small long entry with defined risk.","failure_mode":"Invalidate if the breakout loses participation or falls back through the invalidation level.","evidence":[{{"signal":"volume_ratio_15m","symbol":"BTCUSDT","timeframe":"15m","operator":"gte","observed_value":2.1,"threshold":1.8,"units":"ratio","source":"market_snapshots.BTCUSDT.volume_ratio_15m","confidence_contribution":0.22}},{{"signal":"oi_change_15m","symbol":"BTCUSDT","timeframe":"15m","operator":"gt","observed_value":3.4,"threshold":0.0,"units":"pct","source":"market_snapshots.BTCUSDT.oi_change_15m","confidence_contribution":0.18}},{{"signal":"spread_percentile_1h","symbol":"BTCUSDT","timeframe":"risk","operator":"lte","observed_value":42.0,"threshold":70.0,"units":"percentile","source":"market_snapshots.BTCUSDT.spread_percentile_1h","confidence_contribution":0.1}},{{"signal":"distance_to_invalid_level","symbol":"BTCUSDT","timeframe":"1h","operator":"lte","observed_value":0.9,"threshold":1.2,"units":"atr","source":"market_snapshots.BTCUSDT.distance_to_invalid_level","confidence_contribution":0.14}}]}}],
   "risk_notes":["Wide spread or negative follow-through would invalidate the setup."],
@@ -609,7 +681,8 @@ OUTPUT EXAMPLE
             "policy_summary": request.policy_summary,
             "account_state": self._build_stable_account_payload(request),
             "market_snapshots": self._build_market_payload(request),
-            "risk_state": request.risk_state.model_dump(mode="json"),
+            "risk_state": self._build_compact_risk_state_payload(request),
+            "entry_headroom": self._build_entry_headroom_payload(request),
             "risk_mode": request.risk_mode,
             "loop_mode": request.loop_mode,
             "cycle_role": request.cycle_role,
@@ -652,7 +725,7 @@ OUTPUT EXAMPLE
     def generate_decision(self, request: DecisionRequest) -> DecisionResult:
         prompt = self._create_prompt(request)
         input_hash = self._build_candidate_input_hash(request)
-        model_to_use = self.pro_model if request.is_trigger_mode else self.flash_model
+        model_to_use = self.pro_model if request.is_guarded_attention else self.flash_model
         prompt_hash = self._build_prompt_cache_key(prompt, model_to_use)
         logger.debug(
             f"Prompt generated for {getattr(self, 'provider_name', 'unknown')}. "
@@ -678,16 +751,16 @@ OUTPUT EXAMPLE
             if provider is None:
                 raise RuntimeError("DecisionEngine is missing llm_provider.")
             logger.info(
-                "Calling {} API with model {} (trigger_mode={}, input_hash={})",
+                "Calling {} API with model {} (guarded_attention={}, input_hash={})",
                 getattr(self, "provider_name", "unknown"),
                 model_to_use,
-                bool(request.is_trigger_mode),
+                bool(request.is_guarded_attention),
                 input_hash,
             )
             response = provider.generate_json(
                 prompt=prompt,
                 model_name=model_to_use,
-                schema=TradeIntent,
+                schema=AITradeIntent,
                 temperature=0.2,
             )
             logger.info(
@@ -697,7 +770,33 @@ OUTPUT EXAMPLE
                 input_hash,
             )
             raw_text = response.text
-            intent_payload = self._normalize_trade_intent_payload(json.loads(raw_text))
+            intent_payload, normalization_issues = self._normalize_trade_intent_payload(json.loads(raw_text))
+            if normalization_issues:
+                logger.warning(
+                    "{} output failed semantic normalization: {}",
+                    getattr(self, "provider_name", "unknown"),
+                    ", ".join(normalization_issues),
+                )
+                return DecisionResult(
+                    intent=TradeIntent(
+                        decision="HOLD",
+                        orders=[],
+                        rationale=["Fallback due to invalid semantic contract from AI."],
+                        rationale_items=[],
+                        risk_notes=["Semantic contract validation failed."],
+                        confidence=0.0,
+                    ),
+                    prompt=prompt,
+                    raw_response=raw_text,
+                    model_name=model_to_use,
+                    input_hash=input_hash,
+                    cache_hit=False,
+                    usage_metadata={
+                        "semantic_validation_error": True,
+                        "model_name": model_to_use,
+                        "issues": normalization_issues,
+                    },
+                )
             intent = TradeIntent.model_validate(intent_payload)
             validation_result = self.intent_validator.validate(request, intent)
             if not validation_result.is_valid:

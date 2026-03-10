@@ -19,12 +19,14 @@ class StateStoreLearningRuntimeMixin:
                         domain,
                         symbol,
                         loop_mode,
+                        guarded_attention,
+                        safety_mode,
                         trade_case_id,
                         divergence_type,
                         outcome_status,
                         outcome_estimated_pnl_pct,
                         payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -33,6 +35,8 @@ class StateStoreLearningRuntimeMixin:
                             entry.get("domain"),
                             entry.get("symbol"),
                             entry.get("loop_mode"),
+                            int(bool(entry.get("guarded_attention"))),
+                            int(bool(entry.get("safety_mode"))),
                             entry.get("trade_case_id"),
                             entry.get("divergence_type"),
                             entry.get("outcome_status"),

@@ -31,8 +31,8 @@ class TestRiskEngine(unittest.TestCase):
                 "order_type": "market"
             },
             "risk_limits": {
-                "daily_max_loss_pct": 3.0,
-                "drawdown_activate_pct": 1.5,
+                "daily_max_loss_pct": 10.0,
+                "drawdown_activate_pct": 5.0,
                 "max_consecutive_losses": 3,
                 "cooldown_minutes": 30,
                 "max_open_positions": 2,
@@ -42,10 +42,10 @@ class TestRiskEngine(unittest.TestCase):
                         "max_order_notional_pct_balance": 100,
                         "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
                     },
-                    "trigger": {
+                    "guarded": {
                         "max_open_positions": 1,
-                        "max_order_notional_pct_balance": 30,
-                        "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                        "max_order_notional_pct_balance": 0,
+                        "allowed_actions": ["HOLD", "REDUCE", "EXIT"],
                         "block_additional_entries_when_position_exists": True,
                     },
                     "cooldown": {
@@ -89,7 +89,7 @@ class TestRiskEngine(unittest.TestCase):
         summary_paths = {item["summary_path"] for item in registry}
 
         self.assertIn("risk_limits.daily_max_loss_pct", summary_paths)
-        self.assertIn("risk_limits.mode_profiles.trigger.max_order_notional_pct_balance", summary_paths)
+        self.assertIn("risk_limits.mode_profiles.guarded.max_order_notional_pct_balance", summary_paths)
         self.assertIn("execution_guards.symbol_reentry_loss_cooldown_minutes", summary_paths)
 
     def test_prompt_policy_contract_validation_fails_on_missing_critical_field(self):
@@ -221,7 +221,7 @@ class TestRiskEngine(unittest.TestCase):
             intent,
             acc_state,
             market_prices={"BTCUSDT": 30000},
-            risk_state={"daily_pnl_pct": -4.1},
+            risk_state={"daily_pnl_pct": -10.1},
         )
         self.assertFalse(approved)
         self.assertIn("kill switch", reason.lower())
@@ -239,7 +239,7 @@ class TestRiskEngine(unittest.TestCase):
             intent,
             acc_state,
             market_prices={"BTCUSDT": 30000},
-            risk_state=RiskStateSnapshot(daily_pnl_pct=-4.1),
+            risk_state=RiskStateSnapshot(daily_pnl_pct=-10.1),
         )
         self.assertFalse(approved)
         self.assertIn("kill switch", reason.lower())
@@ -274,7 +274,7 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("projected exposure", reason.lower())
 
-    def test_trigger_profile_rejects_candidate_size_over_profile_cap(self):
+    def test_profile_rejects_candidate_size_over_profile_cap(self):
         intent = TradeIntent(
             decision="BUY",
             orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.02)],
@@ -288,7 +288,10 @@ class TestRiskEngine(unittest.TestCase):
             acc_state,
             market_prices={"BTCUSDT": 30000},
             risk_state={},
-            is_trigger_mode=True,
+            active_profile_override={
+                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "max_order_notional_pct_balance": 35.0,
+            },
         )
         self.assertFalse(approved)
         self.assertIn("candidate size", reason.lower())
@@ -296,11 +299,11 @@ class TestRiskEngine(unittest.TestCase):
     def test_drawdown_mode_is_detected_before_hard_kill_switch(self):
         mode = self.engine.get_active_risk_mode(
             risk_state={"daily_pnl_pct": -1.8, "drawdown_active": True},
-            is_trigger_mode=False,
+            is_guarded_attention=False,
         )
         profile = self.engine.get_active_risk_profile(
             risk_state={"daily_pnl_pct": -1.8, "drawdown_active": True},
-            is_trigger_mode=False,
+            is_guarded_attention=False,
         )
 
         self.assertEqual(mode, "drawdown")
@@ -309,7 +312,7 @@ class TestRiskEngine(unittest.TestCase):
     def test_active_risk_mode_accepts_risk_state_snapshot_model(self):
         mode = self.engine.get_active_risk_mode(
             risk_state=RiskStateSnapshot(cooldown_active=True, cooldown_remaining_minutes=10),
-            is_trigger_mode=False,
+            is_guarded_attention=False,
         )
 
         self.assertEqual(mode, "cooldown")
@@ -345,7 +348,7 @@ class TestRiskEngine(unittest.TestCase):
         )
         profile = self.engine.get_active_risk_profile(
             risk_state={"drawdown_active": True},
-            is_trigger_mode=False,
+            is_guarded_attention=False,
         )
 
         summary = self.engine.get_effective_max_order_notional_pct_balance(
@@ -782,6 +785,142 @@ class TestRiskEngine(unittest.TestCase):
         self.assertLess(summary["effective_cap_pct"], summary["base_cap_pct"])
         self.assertIn("low_signal_diversity", summary["evidence_quality"]["issues"])
 
+    def test_retest_setup_quality_can_tighten_entry_size_cap(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    entry_style="retest",
+                    quantity=0.01,
+                )
+            ],
+            rationale=["Retest entry"],
+            rationale_items=[
+                RationaleItem(
+                    summary="Retest idea",
+                    why_it_matters="Structure could hold.",
+                    trade_implication="Wait for a retest.",
+                    failure_mode="Retest loses structure.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="distance_to_15m_breakout_level",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="lte",
+                            observed_value=1.2,
+                            threshold=0.6,
+                            units="pct",
+                            source="market_snapshots.BTCUSDT.distance_to_15m_breakout_level",
+                        ),
+                        EvidenceItem(
+                            signal="volume_ratio_15m",
+                            symbol="BTCUSDT",
+                            timeframe="15m",
+                            operator="gte",
+                            observed_value=2.0,
+                            threshold=1.5,
+                            units="ratio",
+                            source="market_snapshots.BTCUSDT.volume_ratio_15m",
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.65,
+        )
+
+        summary = self.engine.get_effective_max_order_notional_pct_balance(
+            intent=intent,
+            active_profile=self.engine.get_active_risk_profile(),
+            market_snapshots={
+                "BTCUSDT": MarketSnapshot(
+                    symbol="BTCUSDT",
+                    current_price=30000.0,
+                    atr_15m=120.0,
+                    atr_1h=240.0,
+                    trend_1h="UP",
+                    recent_volume_surge=True,
+                    distance_to_15m_breakout_level=1.2,
+                    distance_to_invalid_level=2.1,
+                )
+            },
+        )
+
+        self.assertTrue(summary["adjusted"])
+        self.assertLess(summary["effective_cap_pct"], summary["base_cap_pct"])
+        self.assertIn("retest_far_from_structure:BTCUSDT", summary["setup_quality"]["issues"])
+
+    def test_value_setup_quality_penalizes_unclear_trend(self):
+        intent = TradeIntent(
+            decision="BUY",
+            orders=[
+                OrderIntent(
+                    symbol="BTCUSDT",
+                    action="BUY",
+                    order_type="LIMIT",
+                    entry_style="value",
+                    quantity=0.01,
+                )
+            ],
+            rationale=["Value retrace entry"],
+            rationale_items=[
+                RationaleItem(
+                    summary="Value idea",
+                    why_it_matters="Passive pullback entry.",
+                    trade_implication="Bid a retrace.",
+                    failure_mode="Trend does not support the bounce.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="distance_to_invalid_level",
+                            symbol="BTCUSDT",
+                            timeframe="1h",
+                            operator="lte",
+                            observed_value=2.1,
+                            threshold=1.8,
+                            units="atr",
+                            source="market_snapshots.BTCUSDT.distance_to_invalid_level",
+                        ),
+                        EvidenceItem(
+                            signal="spread_percentile_1h",
+                            symbol="BTCUSDT",
+                            timeframe="risk",
+                            operator="lte",
+                            observed_value=92.0,
+                            threshold=85.0,
+                            units="percentile",
+                            source="market_snapshots.BTCUSDT.spread_percentile_1h",
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.6,
+        )
+
+        summary = self.engine.get_effective_max_order_notional_pct_balance(
+            intent=intent,
+            active_profile=self.engine.get_active_risk_profile(),
+            market_snapshots={
+                "BTCUSDT": MarketSnapshot(
+                    symbol="BTCUSDT",
+                    current_price=30000.0,
+                    atr_15m=120.0,
+                    atr_1h=240.0,
+                    trend_1h="FLAT",
+                    recent_volume_surge=False,
+                    spread_percentile_1h=92.0,
+                    depth_percentile_1h=10.0,
+                    distance_to_invalid_level=2.1,
+                )
+            },
+        )
+
+        self.assertTrue(summary["adjusted"])
+        self.assertIn("value_trend_unclear:BTCUSDT", summary["setup_quality"]["issues"])
+
     def test_unresolved_unknown_orders_block_new_entry(self):
         intent = TradeIntent(
             decision="BUY",
@@ -869,17 +1008,20 @@ class TestRiskEngine(unittest.TestCase):
             intent,
             acc_state,
             market_prices={"BTCUSDT": 30000},
-            is_trigger_mode=True,
+            active_profile_override={
+                "allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"],
+                "max_order_notional_pct_balance": 35.0,
+            },
         )
 
         self.assertFalse(approved)
         self.assertIn("candidate size", reason.lower())
 
-    def test_trigger_mode_blocks_additional_entry_when_live_position_exists(self):
+    def test_guarded_mode_blocks_new_entries(self):
         intent = TradeIntent(
             decision="BUY",
             orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.002)],
-            rationale=["Trigger follow-through"],
+            rationale=["Guarded mode should not open new exposure"],
             risk_notes=[],
             confidence=0.7,
         )
@@ -902,47 +1044,11 @@ class TestRiskEngine(unittest.TestCase):
             intent,
             acc_state,
             market_prices={"BTCUSDT": 30000},
-            is_trigger_mode=True,
+            is_guarded_attention=True,
         )
 
         self.assertFalse(approved)
-        self.assertIn("trigger mode blocks additional entry", reason.lower())
-
-    def test_trigger_mode_can_allow_additional_entry_when_policy_flag_disabled(self):
-        self.engine.policy["risk_limits"]["mode_profiles"]["trigger"][
-            "block_additional_entries_when_position_exists"
-        ] = False
-        intent = TradeIntent(
-            decision="BUY",
-            orders=[OrderIntent(symbol="BTCUSDT", action="BUY", order_type="MARKET", quantity=0.002)],
-            rationale=["Trigger follow-through"],
-            risk_notes=[],
-            confidence=0.7,
-        )
-        acc_state = AccountState(
-            total_balance=1000,
-            available_balance=900,
-            positions=[
-                PositionState(
-                    symbol="BTCUSDT",
-                    side="LONG",
-                    size=0.01,
-                    entry_price=30000,
-                    unrealized_pnl_pct=0,
-                )
-            ],
-            open_orders_count=0,
-        )
-
-        approved, reason = self.engine.evaluate_intent(
-            intent,
-            acc_state,
-            market_prices={"BTCUSDT": 30000},
-            is_trigger_mode=True,
-        )
-
-        self.assertTrue(approved)
-        self.assertEqual(reason, "Approved")
+        self.assertIn("blocks action buy", reason.lower())
 
 if __name__ == '__main__':
     unittest.main()

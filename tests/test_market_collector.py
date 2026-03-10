@@ -208,13 +208,11 @@ class TestMarketCollector(unittest.TestCase):
         self.assertTrue(snapshot.recent_volume_surge)
         self.assertGreater(snapshot.volume_ratio_15m, 1.8)
         self.assertTrue(snapshot.volume_surge_15m_now)
-        self.assertTrue(snapshot.is_trigger_event)
-        self.assertTrue(snapshot.is_opportunity_trigger)
         self.assertTrue(snapshot.is_risk_trigger)
-        self.assertIn("volume_surge_15m", snapshot.opportunity_trigger_reasons)
         self.assertIn("wide_spread", snapshot.risk_trigger_reasons)
         self.assertIn("elevated_funding", snapshot.risk_trigger_reasons)
-        self.assertTrue(snapshot.volume_surge_trigger_active)
+        self.assertTrue(snapshot.volume_surge_signal_active)
+        self.assertIsInstance(snapshot.range_break_signal_active, bool)
         self.assertGreater(snapshot.timeframes["15m"].rsi_14, 50.0)
         self.assertIn("last_close", snapshot.timeframes["15m"].previous_values)
         self.assertIn("rsi_14", snapshot.timeframes["15m"].previous_values)
@@ -245,51 +243,51 @@ class TestMarketCollector(unittest.TestCase):
 
         active_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"fast_price_move_15m_active": True},
+            trigger_state={"fast_move_signal_15m_active": True},
         )
         inactive_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"fast_price_move_15m_active": False},
+            trigger_state={"fast_move_signal_15m_active": False},
         )
 
-        self.assertIn("fast_price_move_15m", active_snapshot.opportunity_trigger_reasons)
-        self.assertNotIn("fast_price_move_15m", inactive_snapshot.opportunity_trigger_reasons)
-        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["fast_price_move_15m_active"])
-        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["fast_price_move_15m_active"])
+        self.assertTrue(active_snapshot.fast_move_signal_active)
+        self.assertFalse(inactive_snapshot.fast_move_signal_active)
+        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["fast_move_signal_15m_active"])
+        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["fast_move_signal_15m_active"])
 
     def test_volume_surge_hysteresis_keeps_trigger_active_above_release_band(self):
         collector = MarketCollector(VolumeHysteresisExchange())
 
         active_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"volume_surge_15m_active": True},
+            trigger_state={"volume_surge_signal_15m_active": True},
         )
         inactive_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"volume_surge_15m_active": False},
+            trigger_state={"volume_surge_signal_15m_active": False},
         )
 
-        self.assertIn("volume_surge_15m", active_snapshot.opportunity_trigger_reasons)
-        self.assertNotIn("volume_surge_15m", inactive_snapshot.opportunity_trigger_reasons)
-        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["volume_surge_15m_active"])
-        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["volume_surge_15m_active"])
+        self.assertTrue(active_snapshot.volume_surge_signal_active)
+        self.assertFalse(inactive_snapshot.volume_surge_signal_active)
+        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["volume_surge_signal_15m_active"])
+        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["volume_surge_signal_15m_active"])
 
     def test_range_break_hysteresis_keeps_trigger_active_near_release_band(self):
         collector = MarketCollector(RangeBreakHysteresisExchange())
 
         active_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"range_break_1h_active": True},
+            trigger_state={"range_break_signal_1h_active": True},
         )
         inactive_snapshot = collector.get_market_snapshot(
             "BTCUSDT",
-            trigger_state={"range_break_1h_active": False},
+            trigger_state={"range_break_signal_1h_active": False},
         )
 
-        self.assertIn("range_break_1h", active_snapshot.opportunity_trigger_reasons)
-        self.assertNotIn("range_break_1h", inactive_snapshot.opportunity_trigger_reasons)
-        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["range_break_1h_active"])
-        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["range_break_1h_active"])
+        self.assertTrue(active_snapshot.range_break_signal_active)
+        self.assertFalse(inactive_snapshot.range_break_signal_active)
+        self.assertTrue(collector.build_next_trigger_state(active_snapshot)["range_break_signal_1h_active"])
+        self.assertFalse(collector.build_next_trigger_state(inactive_snapshot)["range_break_signal_1h_active"])
 
     def test_ohlcv_cache_uses_incremental_fetch_after_initial_load(self):
         class RecordingExchange(MinimalExchange):

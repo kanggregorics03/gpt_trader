@@ -67,10 +67,9 @@ class MarketRegimeSnapshot(BaseModel):
     volatility_regime: str = "normal"
     momentum_regime: str = "mixed"
     liquidity_regime: str = "balanced"
-    fast_move_trigger_active: bool = False
-    volume_surge_trigger_active: bool = False
-    range_break_trigger_active: bool = False
-    opportunity_trigger_reasons: List[str] = Field(default_factory=list)
+    fast_move_signal_active: bool = False
+    volume_surge_signal_active: bool = False
+    range_break_signal_active: bool = False
     risk_trigger_reasons: List[str] = Field(default_factory=list)
 
 
@@ -85,9 +84,9 @@ class MarketSnapshot(BaseModel):
     recent_volume_surge: bool
     volume_ratio_15m: Optional[float] = None
     volume_surge_15m_now: bool = False
-    fast_move_trigger_active: bool = False
-    volume_surge_trigger_active: bool = False
-    range_break_trigger_active: bool = False
+    fast_move_signal_active: bool = False
+    volume_surge_signal_active: bool = False
+    range_break_signal_active: bool = False
     oi_change_15m: Optional[float] = None
     oi_change_1h: Optional[float] = None
     funding_rate_change_1h: Optional[float] = None
@@ -98,7 +97,6 @@ class MarketSnapshot(BaseModel):
     distance_to_15m_breakout_level: Optional[float] = None
     distance_to_1h_breakout_level: Optional[float] = None
     distance_to_invalid_level: Optional[float] = None
-    is_trigger_event: bool = False
     price_change_24h_pct: Optional[float] = None
     high_24h: Optional[float] = None
     low_24h: Optional[float] = None
@@ -110,9 +108,7 @@ class MarketSnapshot(BaseModel):
     order_book: OrderBookSnapshot = Field(default_factory=OrderBookSnapshot)
     derivatives: DerivativesSnapshot = Field(default_factory=DerivativesSnapshot)
     regime: MarketRegimeSnapshot = Field(default_factory=MarketRegimeSnapshot)
-    is_opportunity_trigger: bool = False
     is_risk_trigger: bool = False
-    opportunity_trigger_reasons: List[str] = Field(default_factory=list)
     risk_trigger_reasons: List[str] = Field(default_factory=list)
     trigger_reasons: List[str] = Field(default_factory=list)
 
@@ -252,11 +248,12 @@ class DecisionRequest(BaseModel):
     market_snapshot: Optional[MarketSnapshot] = None
     market_snapshots: Dict[str, MarketSnapshot] = Field(default_factory=dict)
     risk_state: RiskStateSnapshot
+    entry_headroom: Dict[str, Any] = Field(default_factory=dict)
     recent_journal_context: List[RecentJournalContext] = Field(default_factory=list)
     long_term_memory: List[LongTermMemoryRecord | str]
     similar_past_cases: List[str] = Field(default_factory=list)
-    is_trigger_mode: bool = False
-    risk_mode: Literal["normal", "trigger", "cooldown", "drawdown"] = "normal"
+    is_guarded_attention: bool = False
+    risk_mode: Literal["normal", "guarded", "cooldown", "drawdown"] = "normal"
     risk_profile: Dict[str, Any] = Field(default_factory=dict)
     loop_mode: Literal["1h", "15m", "5m"] = "1h"
     cycle_role: Optional[str] = None
@@ -265,6 +262,10 @@ class OrderIntent(BaseModel):
     symbol: str = Field(description="Trading pair symbol (e.g., BTCUSDT)")
     action: Literal["BUY", "SELL", "CANCEL"] = Field(description="Order action")
     order_type: Literal["MARKET", "LIMIT"] = Field(description="Type of order")
+    entry_style: Optional[Literal["immediate", "retest", "value"]] = Field(
+        None,
+        description="Entry intent semantics for non-reduce BUY/SELL orders. immediate means enter now; retest means wait near breakout/reclaim structure; value means wait for a general passive retrace.",
+    )
     quantity: float = Field(default=0.0, description="Order quantity")
     price: Optional[float] = Field(None, description="Limit price if LIMIT order, null for MARKET")
     reduce_only: bool = Field(False, description="Whether this order is only to reduce position")
@@ -374,6 +375,56 @@ class RationaleItem(BaseModel):
         default_factory=list,
         description="Machine-checkable factual evidence backing this rationale item",
     )
+
+
+class AIOrderIntent(BaseModel):
+    symbol: str = Field(description="Trading pair symbol (e.g., BTCUSDT)")
+    action: Literal["BUY", "SELL", "CANCEL"] = Field(description="Order action")
+    order_type: Literal["MARKET", "LIMIT"] = Field(description="Type of order")
+    entry_style: Optional[Literal["immediate", "retest", "value"]] = Field(
+        None,
+        description="Entry intent semantics for non-reduce BUY/SELL orders.",
+    )
+    quantity: float = Field(default=0.0, description="Order quantity")
+    price: Optional[float] = Field(None, description="Limit price if LIMIT order, null for MARKET")
+    reduce_only: bool = Field(False, description="Whether this order is only to reduce position")
+    take_profit: Optional[float] = Field(None, description="Take profit price")
+    stop_loss: Optional[float] = Field(None, description="Stop loss price")
+    target_order_id: Optional[str] = Field(None, description="Exchange order identifier for CANCEL.")
+    target_client_order_id: Optional[str] = Field(None, description="Client order identifier for CANCEL.")
+    replace_group_id: Optional[str] = Field(None, description="Stable lineage group id for replace-entry flows.")
+    lineage_role: Optional[Literal["cancel", "replacement"]] = Field(
+        None,
+        description="Role of this order within a replace-entry flow.",
+    )
+    lineage_parent_order_id: Optional[str] = Field(None, description="Original exchange order id linked to this order.")
+    lineage_parent_client_order_id: Optional[str] = Field(
+        None,
+        description="Original client order id linked to this order.",
+    )
+    wait_for_cancel_confirmation: bool = Field(
+        False,
+        description="Whether submission must wait for cancel confirmation.",
+    )
+
+
+class AITradeIntent(BaseModel):
+    decision: Literal["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"] = Field(
+        description="Overall strategy decision"
+    )
+    orders: List[AIOrderIntent] = Field(default_factory=list, description="List of proposed orders")
+    rationale: List[str] = Field(default_factory=list, description="Brief reasoning for the decision")
+    rationale_items: List[RationaleItem] = Field(
+        default_factory=list,
+        description="Structured rationale with machine-checkable evidence and human interpretation",
+    )
+    risk_notes: List[str] = Field(default_factory=list, description="Any identified market or strategy risks")
+    confidence: float = Field(default=0.0, description="AI confidence score 0.0 to 1.0")
+    thesis_id: Optional[str] = None
+    thesis_summary: Optional[str] = None
+    invalidation_reason: Optional[str] = None
+    management_template_id: Optional[str] = None
+    exit_reason: Optional[str] = None
 
 
 class TradeIntent(BaseModel):

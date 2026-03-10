@@ -2,21 +2,14 @@ from datetime import UTC, datetime
 
 
 class TradingCycleArtifactPersistenceMixin:
-    def _persist_audit_artifacts(
+    def _persist_runtime_execution_artifacts(
         self,
         *,
         audit_id,
-        cycle_context: dict,
         decision_outcome: dict,
         execution_outcome: dict,
         execution_summary: dict,
-        trigger_symbols: list[str],
-        risk_trigger_symbols: list[str],
-        estimated_pnl_pct,
-    ) -> list[dict]:
-        if audit_id is None:
-            return []
-
+    ) -> tuple[list[dict], list[dict]]:
         ledger_entries = []
         position_state_transitions = []
         if execution_outcome["fills"]:
@@ -42,7 +35,21 @@ class TradingCycleArtifactPersistenceMixin:
             )
             self.state_store.save_order_state_transitions(audit_id, order_state_transitions)
             self.state_store.save_position_state_transitions(audit_id, position_state_transitions)
+        return ledger_entries, position_state_transitions
 
+    def _persist_case_artifacts(
+        self,
+        *,
+        audit_id,
+        cycle_context: dict,
+        decision_outcome: dict,
+        execution_outcome: dict,
+        trigger_symbols: list[str],
+        risk_trigger_symbols: list[str],
+        estimated_pnl_pct,
+        ledger_entries: list[dict],
+        position_state_transitions: list[dict],
+    ) -> list[dict]:
         symbol_journal_entries = self._build_symbol_journal_entries(
             audit_log_id=audit_id,
             intent=decision_outcome["intent"],
@@ -52,6 +59,8 @@ class TradingCycleArtifactPersistenceMixin:
             risk_reason=execution_outcome["reason"],
             risk_mode=cycle_context["risk_mode"],
             risk_approved=execution_outcome["is_approved"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
+            is_safety_mode=cycle_context["is_safety_mode"],
             estimated_pnl_pct=estimated_pnl_pct,
             ledger_entries=ledger_entries,
         )
@@ -66,9 +75,36 @@ class TradingCycleArtifactPersistenceMixin:
             market_snapshots=cycle_context["market_snapshots"],
             fills=execution_outcome["fills"],
             risk_mode=cycle_context["risk_mode"],
+            loop_mode=cycle_context["loop_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
+            is_safety_mode=cycle_context["is_safety_mode"],
             risk_state=cycle_context["risk_state"],
             observed_at=observed_at,
         )
+        self.state_store.save_symbol_journal_entries(symbol_journal_entries)
+        trade_case_snapshot_entries = self._build_trade_case_snapshot_entries(
+            audit_log_id=audit_id,
+            observed_at=observed_at,
+            account_state=(
+                execution_outcome["post_account_state"]
+                or execution_outcome["effective_pre_execution_state"]
+            ),
+            market_snapshots=cycle_context["market_snapshots"],
+            symbol_journal_entries=symbol_journal_entries,
+        )
+        self.state_store.save_trade_case_snapshots(trade_case_snapshot_entries)
+        return symbol_journal_entries
+
+    def _persist_post_trade_learning_artifacts(
+        self,
+        *,
+        audit_id,
+        cycle_context: dict,
+        decision_outcome: dict,
+        execution_outcome: dict,
+        symbol_journal_entries: list[dict],
+        estimated_pnl_pct,
+    ) -> None:
         self._save_retrieval_evaluations_for_audit(
             audit_log_id=audit_id,
             intent=decision_outcome["intent"],
@@ -88,7 +124,8 @@ class TradingCycleArtifactPersistenceMixin:
             symbol_journal_entries=symbol_journal_entries,
             loop_mode=cycle_context["loop_mode"],
             risk_mode=cycle_context["risk_mode"],
-            is_trigger_mode=cycle_context["is_trigger_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
+            is_safety_mode=cycle_context["is_safety_mode"],
         )
         if execution_policy_evaluations and hasattr(self.state_store, "save_execution_policy_evaluations"):
             self.state_store.save_execution_policy_evaluations(
@@ -105,19 +142,50 @@ class TradingCycleArtifactPersistenceMixin:
             ),
             market_snapshots=cycle_context["market_snapshots"],
             risk_mode=cycle_context["risk_mode"],
+            is_guarded_attention=cycle_context["is_guarded_attention"],
+            is_safety_mode=cycle_context["is_safety_mode"],
             symbol_journal_entries=symbol_journal_entries,
             regime_key=cycle_context["regime_key"],
         )
-        self.state_store.save_symbol_journal_entries(symbol_journal_entries)
-        trade_case_snapshot_entries = self._build_trade_case_snapshot_entries(
-            audit_log_id=audit_id,
-            observed_at=observed_at,
-            account_state=(
-                execution_outcome["post_account_state"]
-                or execution_outcome["effective_pre_execution_state"]
-            ),
-            market_snapshots=cycle_context["market_snapshots"],
-            symbol_journal_entries=symbol_journal_entries,
+
+    def _persist_audit_artifacts(
+        self,
+        *,
+        audit_id,
+        cycle_context: dict,
+        decision_outcome: dict,
+        execution_outcome: dict,
+        execution_summary: dict,
+        trigger_symbols: list[str],
+        risk_trigger_symbols: list[str],
+        estimated_pnl_pct,
+    ) -> list[dict]:
+        if audit_id is None:
+            return []
+
+        ledger_entries, position_state_transitions = self._persist_runtime_execution_artifacts(
+            audit_id=audit_id,
+            decision_outcome=decision_outcome,
+            execution_outcome=execution_outcome,
+            execution_summary=execution_summary,
         )
-        self.state_store.save_trade_case_snapshots(trade_case_snapshot_entries)
+        symbol_journal_entries = self._persist_case_artifacts(
+            audit_id=audit_id,
+            cycle_context=cycle_context,
+            decision_outcome=decision_outcome,
+            execution_outcome=execution_outcome,
+            trigger_symbols=trigger_symbols,
+            risk_trigger_symbols=risk_trigger_symbols,
+            estimated_pnl_pct=estimated_pnl_pct,
+            ledger_entries=ledger_entries,
+            position_state_transitions=position_state_transitions,
+        )
+        self._persist_post_trade_learning_artifacts(
+            audit_id=audit_id,
+            cycle_context=cycle_context,
+            decision_outcome=decision_outcome,
+            execution_outcome=execution_outcome,
+            symbol_journal_entries=symbol_journal_entries,
+            estimated_pnl_pct=estimated_pnl_pct,
+        )
         return symbol_journal_entries
