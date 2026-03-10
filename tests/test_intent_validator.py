@@ -6,6 +6,7 @@ from core.models import (
     DecisionRequest,
     EvidenceItem,
     MarketSnapshot,
+    PositionState,
     RationaleItem,
     RiskStateSnapshot,
     TradeIntent,
@@ -270,6 +271,69 @@ class TestStructuredIntentValidator(unittest.TestCase):
             ],
             risk_notes=[],
             confidence=0.3,
+        )
+
+        result = self.validator.validate(request, intent)
+
+        self.assertTrue(result.is_valid)
+
+    def test_validator_accepts_bracket_index_account_state_sources(self):
+        request = self.request.model_copy(
+            update={
+                "account_state": self.request.account_state.model_copy(
+                    update={
+                        "positions": [
+                            PositionState(
+                                symbol="BTCUSDT",
+                                side="LONG",
+                                size=0.1,
+                                entry_price=30000.0,
+                                mark_price=30120.0,
+                                unrealized_pnl=12.0,
+                                unrealized_pnl_pct=0.4,
+                                leverage=3.0,
+                            )
+                        ]
+                    }
+                )
+            }
+        )
+        intent = TradeIntent(
+            decision="HOLD",
+            orders=[],
+            rationale=["Live position remains small and profitable."],
+            rationale_items=[
+                RationaleItem(
+                    summary="The live BTC position is mildly profitable with moderate leverage.",
+                    why_it_matters="Position-management evidence should resolve through list-index account paths.",
+                    trade_implication="Holding is acceptable while exposure remains controlled.",
+                    failure_mode="The live position path cannot be resolved from account_state.",
+                    evidence=[
+                        EvidenceItem(
+                            signal="unrealized_pnl_pct",
+                            symbol="BTCUSDT",
+                            timeframe="risk",
+                            operator="gte",
+                            observed_value=0.4,
+                            threshold=0.0,
+                            units="pct",
+                            source="account_state.positions[0].unrealized_pnl_pct",
+                        ),
+                        EvidenceItem(
+                            signal="leverage",
+                            symbol="BTCUSDT",
+                            timeframe="risk",
+                            operator="lte",
+                            observed_value=3.0,
+                            threshold=5.0,
+                            units="x",
+                            source="account_state.positions[0].leverage",
+                        ),
+                    ],
+                )
+            ],
+            risk_notes=[],
+            confidence=0.35,
         )
 
         result = self.validator.validate(request, intent)

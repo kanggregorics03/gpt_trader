@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from math import isclose
 from typing import Any, Dict, List, Optional
+import re
 
 import yaml
 
@@ -14,6 +15,7 @@ class IntentValidationResult:
 
 
 class StructuredIntentValidator:
+    _PATH_TOKEN_PATTERN = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
     _ROOT_PREFIXES = {
         "account_state",
         "market_context",
@@ -149,7 +151,7 @@ class StructuredIntentValidator:
 
     def _get_path_value(self, payload: Dict[str, Any], path: str) -> Any:
         current: Any = payload
-        for part in path.split("."):
+        for part in self._tokenize_path(path):
             if isinstance(current, dict):
                 if part not in current:
                     return None
@@ -163,6 +165,16 @@ class StructuredIntentValidator:
                 continue
             return None
         return current
+
+    def _tokenize_path(self, path: str) -> List[str]:
+        tokens: List[str] = []
+        for match in self._PATH_TOKEN_PATTERN.finditer(path):
+            field_name, list_index = match.groups()
+            if field_name is not None:
+                tokens.append(field_name)
+            elif list_index is not None:
+                tokens.append(list_index)
+        return tokens
 
     def _coerce_scalar_value(self, value: Any) -> Optional[float | str | bool]:
         if isinstance(value, bool):

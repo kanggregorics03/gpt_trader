@@ -389,11 +389,13 @@ RULES
 18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence or prefer HOLD.
 19. rationale must stay concise for humans, but rationale_items must carry the machine-checkable evidence.
 20. Every rationale_item must include at least one evidence row with a valid source path from the DecisionRequest, and each rationale_item should include at least one numeric evidence row whenever possible.
-21. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, risk_state.cooldown_remaining_minutes, or market_snapshots.BTCUSDT.timeframes.1h.trend.
+21. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, risk_state.cooldown_remaining_minutes, market_snapshots.BTCUSDT.timeframes.1h.trend, or account_state.positions[0].unrealized_pnl_pct when a live position actually exists.
 22. Numeric operators gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte require numeric observed_value and numeric threshold.
 23. If you reference a categorical or boolean field, use operator eq or note only. For eq, observed_value and threshold must match the original categorical/bool value exactly, e.g. "FLAT" or true.
 24. If operator is not note, threshold is required. If operator is note, threshold must be null.
-25. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+25. Do not cite account_state.positions[0].* or account_state.open_orders[0].* unless that list is non-empty in the input. Never invent list entries.
+26. observed_value must be a scalar number, string, or boolean. Never put arrays or objects into observed_value or threshold.
+27. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
 
 OUTPUT EXAMPLE
 {{
