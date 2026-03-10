@@ -249,11 +249,17 @@ class BybitPrivateAccountFeed:
                 return None
 
             allowed_symbols = set(normalize_symbol_list(symbols))
+            total_balance = float(self._wallet_state.get("total_balance") or 0.0)
             positions = [
                 position.model_copy(deep=True)
                 for symbol, position in self._positions_by_symbol.items()
                 if symbol in allowed_symbols
             ]
+            for position in positions:
+                position.account_unrealized_pnl_pct = self._calculate_account_pnl_pct(
+                    unrealized_pnl=position.unrealized_pnl,
+                    total_balance=total_balance,
+                )
             open_orders = [
                 order.model_copy(deep=True)
                 for order in self._open_orders_by_key.values()
@@ -262,7 +268,7 @@ class BybitPrivateAccountFeed:
             total_unrealized_pnl = round(sum(position.unrealized_pnl for position in positions), 8)
             return AccountState(
                 snapshot_timestamp=self._now_ms(),
-                total_balance=float(self._wallet_state.get("total_balance") or 0.0),
+                total_balance=total_balance,
                 available_balance=float(self._wallet_state.get("available_balance") or 0.0),
                 total_unrealized_pnl=total_unrealized_pnl,
                 margin_ratio=self._wallet_state.get("margin_ratio"),
@@ -510,6 +516,10 @@ class BybitPrivateAccountFeed:
             mark_price=self._safe_float(item.get("markPrice"), None),
             unrealized_pnl=unrealized_pnl,
             unrealized_pnl_pct=pnl_pct,
+            account_unrealized_pnl_pct=self._calculate_account_pnl_pct(
+                unrealized_pnl=unrealized_pnl,
+                total_balance=self._wallet_state.get("total_balance"),
+            ),
             liquidation_price=self._safe_float(item.get("liqPrice"), item.get("liquidationPrice"), None),
             leverage=self._safe_float(item.get("leverage"), None),
             notional_value=notional_value,
@@ -517,6 +527,12 @@ class BybitPrivateAccountFeed:
             maintenance_margin=maintenance_margin,
             margin_mode=margin_mode,
         )
+
+    def _calculate_account_pnl_pct(self, unrealized_pnl: float, total_balance: Any) -> Optional[float]:
+        balance = self._safe_float(total_balance, None)
+        if balance is None or balance <= 0:
+            return None
+        return (float(unrealized_pnl) / balance) * 100.0
 
     def _normalize_order(self, item: Dict[str, Any]) -> OpenOrderState:
         return OpenOrderState(

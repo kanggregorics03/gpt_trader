@@ -1,12 +1,13 @@
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from core.models import AccountState, MarketSnapshot, OpenOrderState, PositionState
 from core.position_policy import PositionPolicyEngine
 
 
 class DummyStore:
-    def __init__(self, opened_at="2026-03-08 16:00:00"):
+    def __init__(self, opened_at="2026-03-08 16:00:00", market_history=None):
         self.active_case = {
             "trade_case_id": "BTCUSDT-case-1",
             "opened_at": opened_at,
@@ -14,6 +15,7 @@ class DummyStore:
             "management_template_id": "position_manage_adaptive",
             "payload": {},
         }
+        self.market_history = list(market_history or [])
 
     def get_active_trade_case(self, symbol):
         return dict(self.active_case if symbol == "BTCUSDT" else {})
@@ -23,6 +25,17 @@ class DummyStore:
 
     def get_policy_registry_entry(self, policy_key):
         return {}
+
+    def get_market_snapshot_history_between(self, symbol, start_timestamp, end_timestamp, limit=None):
+        rows = [
+            dict(row)
+            for row in self.market_history
+            if row.get("symbol") == symbol
+            and start_timestamp <= row.get("timestamp", start_timestamp) <= end_timestamp
+        ]
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
 
 
 class TestPositionPolicyEngine(unittest.TestCase):
@@ -37,7 +50,8 @@ class TestPositionPolicyEngine(unittest.TestCase):
                     side="LONG",
                     size=0.1,
                     entry_price=30000.0,
-                    unrealized_pnl_pct=-1.8,
+                    unrealized_pnl_pct=-18.0,
+                    account_unrealized_pnl_pct=-1.8,
                 )
             ],
             open_orders=[],
@@ -58,8 +72,9 @@ class TestPositionPolicyEngine(unittest.TestCase):
         )
         self.assertFalse(result["escalate_to_ai"])
         self.assertEqual(result["decision_result"]["decision"], "EXIT")
+        self.assertIn("account-loss threshold", result["decision_result"]["rationale"][0])
 
-    def test_stalled_position_reduces(self):
+    def test_stalled_position_exits(self):
         engine = PositionPolicyEngine(
             policy={"position_policy": {"stalled_minutes": 1, "stalled_max_pnl_pct": 0.2}},
             state_store=DummyStore(opened_at="2026-03-08 00:00:00"),
@@ -92,7 +107,7 @@ class TestPositionPolicyEngine(unittest.TestCase):
             risk_mode="normal",
             loop_mode="15m",
         )
-        self.assertEqual(result["decision_result"]["decision"], "REDUCE")
+        self.assertEqual(result["decision_result"]["decision"], "EXIT")
 
     def test_stale_open_orders_without_positions_are_cancelled(self):
         engine = PositionPolicyEngine(
@@ -174,6 +189,167 @@ class TestPositionPolicyEngine(unittest.TestCase):
         self.assertEqual(result["decision_result"]["orders"][1].lineage_role, "replacement")
         self.assertTrue(result["decision_result"]["orders"][1].wait_for_cancel_confirmation)
         self.assertEqual(result["decision_result"]["orders"][1].order_type, "LIMIT")
+
+    def test_negative_pnl_without_invalidation_proximity_holds(self):
+        engine = PositionPolicyEngine(
+            policy={"position_policy": {"weakened_minutes": 1, "stalled_minutes": 100000}},
+            state_store=DummyStore(opened_at="2026-03-08 00:00:00"),
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=950.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=-0.4,
+                    account_unrealized_pnl_pct=-0.04,
+                )
+            ],
+            open_orders=[],
+        )
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            current_price=29920.0,
+            atr_15m=100.0,
+            atr_1h=200.0,
+            trend_1h="UP",
+            recent_volume_surge=False,
+            distance_to_invalid_level=1.4,
+        )
+
+        result = engine.evaluate(
+            account_state=account_state,
+            market_snapshots={"BTCUSDT": snapshot},
+            risk_mode="normal",
+            loop_mode="15m",
+        )
+
+        self.assertEqual(result["decision_result"]["decision"], "HOLD")
+
+    def test_negative_pnl_near_invalidation_exits(self):
+        engine = PositionPolicyEngine(
+            policy={
+                "position_policy": {
+                    "weakened_minutes": 1,
+                    "stalled_minutes": 100000,
+                    "invalidation_reduce_distance_atr": 0.8,
+                }
+            },
+            state_store=DummyStore(opened_at="2026-03-08 00:00:00"),
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=950.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=-0.6,
+                    account_unrealized_pnl_pct=-0.06,
+                )
+            ],
+            open_orders=[],
+        )
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            current_price=29880.0,
+            atr_15m=100.0,
+            atr_1h=200.0,
+            trend_1h="UP",
+            recent_volume_surge=False,
+            distance_to_invalid_level=0.5,
+        )
+
+        result = engine.evaluate(
+            account_state=account_state,
+            market_snapshots={"BTCUSDT": snapshot},
+            risk_mode="normal",
+            loop_mode="15m",
+        )
+
+        self.assertEqual(result["decision_result"]["decision"], "EXIT")
+        self.assertIn("approached invalidation", result["decision_result"]["rationale"][0])
+
+    def test_microstructure_exit_requires_confirmed_history(self):
+        now = datetime.now(UTC).replace(tzinfo=None)
+        history = [
+            {
+                "symbol": "BTCUSDT",
+                "timestamp": now - timedelta(minutes=8),
+                "spread_percentile_1h": 92.0,
+                "depth_percentile_1h": 10.0,
+                "payload": {"risk_trigger_reasons": ["wide_spread", "elevated_funding"]},
+            }
+        ]
+        engine = PositionPolicyEngine(
+            policy={"position_policy": {"stalled_minutes": 100000, "weakened_minutes": 100000}},
+            state_store=DummyStore(market_history=history),
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=950.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=-0.2,
+                    account_unrealized_pnl_pct=-0.02,
+                )
+            ],
+            open_orders=[],
+        )
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            current_price=29940.0,
+            atr_15m=100.0,
+            atr_1h=200.0,
+            trend_1h="UP",
+            recent_volume_surge=False,
+            spread_percentile_1h=95.0,
+            depth_percentile_1h=9.0,
+            risk_trigger_reasons=["wide_spread", "elevated_funding"],
+        )
+
+        result = engine.evaluate(
+            account_state=account_state,
+            market_snapshots={"BTCUSDT": snapshot},
+            risk_mode="normal",
+            loop_mode="15m",
+        )
+
+        self.assertEqual(result["decision_result"]["decision"], "HOLD")
+
+        confirmed_engine = PositionPolicyEngine(
+            policy={"position_policy": {"stalled_minutes": 100000, "weakened_minutes": 100000}},
+            state_store=DummyStore(
+                market_history=history
+                + [
+                    {
+                        "symbol": "BTCUSDT",
+                        "timestamp": now - timedelta(minutes=3),
+                        "spread_percentile_1h": 94.0,
+                        "depth_percentile_1h": 11.0,
+                        "payload": {"risk_trigger_reasons": ["wide_spread", "elevated_funding"]},
+                    }
+                ]
+            )
+        )
+        confirmed_result = confirmed_engine.evaluate(
+            account_state=account_state,
+            market_snapshots={"BTCUSDT": snapshot},
+            risk_mode="normal",
+            loop_mode="15m",
+        )
+
+        self.assertEqual(confirmed_result["decision_result"]["decision"], "EXIT")
+        self.assertIn("confirmed liquidity deterioration", confirmed_result["decision_result"]["rationale"][0])
 
 
 if __name__ == "__main__":

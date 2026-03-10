@@ -6,7 +6,7 @@ trading:
   order_type: "market" # legacy fallback; execution_policy.allowed_order_types now controls runtime choice
   
 risk_limits:
-  daily_max_loss_pct: 3.0    # Stop trading if daily loss exceeds 3% of account balance
+  daily_max_loss_pct: 3.0    # Daily kill-switch: stop new entries if realized daily loss exceeds 3% of account balance
   drawdown_activate_pct: 1.5 # Enter drawdown mode before the hard daily kill-switch is hit
   max_consecutive_losses: 3  # Pause trading after 3 consecutive losing closes within the current UTC day
   cooldown_minutes: 30       # Minutes to wait before allowing new trades after a stop-loss
@@ -96,16 +96,15 @@ execution_policy:
   profile_min_support: 4
 
 position_policy:
-  losing_exit_pct: -1.25
+  losing_exit_pct: -1.25     # 15m deterministic stop based on unrealized pnl as % of total account balance
   stalled_minutes: 45
   stalled_max_pnl_pct: 0.2
-  weakened_minutes: 30
-  weakened_reduce_pct: 0.5
-  profit_reduce_trigger_pct: 1.25
-  profit_reduce_fraction: 0.25
+  weakened_minutes: 30       # thesis weaken exit only after the trade has had time to play out
   risk_trigger_exit_count: 2
   microstructure_exit_spread_percentile: 90
   microstructure_exit_depth_percentile: 12
+  microstructure_exit_confirmations: 2   # require consecutive degraded snapshots before a 15m liquidity exit
+  invalidation_reduce_distance_atr: 0.75 # 15m thesis weaken exit only near the invalidation level
   stale_order_minutes: 30
   stale_order_reprice_enabled: true
   stale_order_reprice_spread_percentile_max: 75
@@ -113,12 +112,11 @@ position_policy:
   stale_order_reprice_limit_offset_bps: 4
 
 safety_policy:
-  loss_exit_pct: -0.9
+  loss_exit_pct: -0.9        # 5m deterministic stop based on unrealized pnl as % of total account balance
   risk_trigger_exit_count: 1
   microstructure_exit_spread_percentile: 85
   microstructure_exit_depth_percentile: 15
-  profit_protect_trigger_pct: 1.0
-  profit_protect_reduce_fraction: 0.35
+  microstructure_exit_confirmations: 2   # 5m is emergency-only: one noisy snapshot is not enough to force exit
   stale_order_minutes: 12
   stale_order_risk_trigger_count: 1
   stale_order_reprice_enabled: true

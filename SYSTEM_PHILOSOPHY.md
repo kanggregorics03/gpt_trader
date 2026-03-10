@@ -23,6 +23,19 @@
 
 이 편향은 시스템 철학의 일부이며 제거 대상이 아니다.
 
+### 2.1 루프 역할 계약도 편향의 일부다
+
+이 시스템은 모든 cadence가 같은 수준의 판단 권한을 갖는 구조가 아니다.
+
+- `1h`는 기본적으로 신규 thesis를 만드는 alpha loop다.
+- 다만 live position이 남아 있으면 `1h`도 새 thesis를 덮어쓰지 않고 기존 케이스 관리만 한다.
+- `15m`는 thesis-aware management loop다.
+- `15m`는 작은 음수 손익만으로 바로 줄이지 않고, invalidation 근접이나 time-stop 같은 관리 사유가 있을 때만 청산한다.
+- `5m`는 execution safety loop다.
+- `5m`는 profit protect나 일반 관리가 아니라 acute loss, stale execution failure, confirmed liquidity deterioration 같은 emergency path만 deterministic하게 처리한다.
+
+즉 최근 수정에서 `15m`를 thesis 근접 기반으로 더 묶고, `5m`를 응급 전용으로 줄인 방향은 시스템 철학과 일치한다.
+
 ## 3. 제거해야 하는 편향
 
 아래는 철학이 아니라 구현 우연으로 생기는 편향이라 줄여야 한다.
@@ -80,6 +93,20 @@
 4. holdout, replay, liveness 조건을 통과한 경우에만 promotion이 일어난다.
 
 즉 "좋은 답변을 한 번 받는 것"이 아니라 "운영 결과를 반영해 보조 구조를 천천히 진화시키는 것"이 학습이다.
+
+여기서 중요한 구분이 하나 더 있다.
+
+- `candidate policy / promotion`은 실행 규칙을 직접 바꾸는 경로다.
+- `long_term_memory`는 실행 규칙을 직접 바꾸지 않고, 이후 판단과 lesson synthesis의 보조 근거를 천천히 바꾸는 경로다.
+
+따라서 `15m/5m` 규칙을 수정하면 정책 진화 계층은 즉시 영향을 받고,
+장기 메모리 계층은 새 사례 분포가 누적되면서 간접적으로 따라온다.
+
+운영 계약이 크게 바뀌는 cutover도 같은 원칙으로 다룬다.
+
+- `audit_logs`, `journal`, `trade_cases`, `replay_runs`, `shadow_decisions` 같은 사실 이력은 지우지 않는다.
+- 대신 champion/candidate/memory 같은 학습 표면만 migrate 또는 retire 한다.
+- `2026-03-10` management contract cutover 이후 batch learning은 기본적으로 해당 날짜 이후 case만 promotion 근거로 사용한다.
 
 여기서 replay 자동화는 균등 샘플링이 아니라 운영적으로 의미 있는 audit를 더 자주 본다는 원칙을 따른다.
 

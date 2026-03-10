@@ -74,6 +74,13 @@ class TradingRuntimeStateMixin:
             return configured[0]
         return str(getattr(self, "symbol", "BTCUSDT") or "BTCUSDT").strip().upper()
 
+    def _get_active_trade_case_for_symbol(self, symbol: str) -> dict:
+        fetcher = getattr(self.state_store, "get_active_trade_case", None)
+        if not callable(fetcher) or not symbol:
+            return {}
+        item = fetcher(symbol) or {}
+        return dict(item) if isinstance(item, dict) else {}
+
     def _normalize_market_snapshots(self, market_snapshots):
         market_snapshots = dict(market_snapshots or {})
         if not market_snapshots:
@@ -196,6 +203,11 @@ class TradingRuntimeStateMixin:
         regime_key: str = "",
     ):
         effective_profile = dict(risk_profile or {})
+        primary_symbol = self._primary_symbol()
+        active_trade_case = self._get_active_trade_case_for_symbol(primary_symbol)
+        has_live_positions = self._has_live_positions(account_state)
+        has_live_open_orders = self._has_live_open_orders(account_state)
+        trade_consistency_lock_active = bool(has_live_positions)
         allowed_actions = [
             str(action).upper()
             for action in effective_profile.get("allowed_actions", [])
@@ -223,7 +235,7 @@ class TradingRuntimeStateMixin:
             )
             effective_profile["allowed_actions"] = [
                 action for action in allowed_actions
-                if action in ("HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY")
+                if action in ("HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY")
             ]
         elif loop_mode == "5m":
             effective_profile["cycle_role"] = "execution_safety"
@@ -233,7 +245,17 @@ class TradingRuntimeStateMixin:
             )
             effective_profile["allowed_actions"] = [
                 action for action in allowed_actions
-                if action in ("HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY")
+                if action in ("HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY")
+            ]
+        elif loop_mode == "1h" and trade_consistency_lock_active:
+            effective_profile["cycle_role"] = "trade_consistency_management"
+            effective_profile["cycle_guidance"] = (
+                "A live position is already open. Preserve trade consistency: manage the existing thesis "
+                "or exit conditions, but do not create a new entry thesis in the 1h cycle."
+            )
+            effective_profile["allowed_actions"] = [
+                action for action in allowed_actions
+                if action in ("HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY")
             ]
         else:
             effective_profile["cycle_role"] = "strategy"
@@ -241,8 +263,12 @@ class TradingRuntimeStateMixin:
                 "Set portfolio direction and initiate new exposure only when the higher-timeframe case is justified."
             )
             effective_profile["allowed_actions"] = allowed_actions
-        effective_profile["has_live_positions"] = self._has_live_positions(account_state)
-        effective_profile["has_live_open_orders"] = self._has_live_open_orders(account_state)
+        effective_profile["has_live_positions"] = has_live_positions
+        effective_profile["has_live_open_orders"] = has_live_open_orders
+        effective_profile["trade_consistency_lock_active"] = trade_consistency_lock_active
+        effective_profile["active_trade_case_id"] = active_trade_case.get("trade_case_id")
+        effective_profile["active_thesis_id"] = active_trade_case.get("thesis_id")
+        effective_profile["active_management_template_id"] = active_trade_case.get("management_template_id")
         return effective_profile
 
     def _extract_entry_orders(self, orders):

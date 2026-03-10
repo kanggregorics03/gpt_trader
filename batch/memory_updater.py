@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import shutil
 import statistics
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,45 @@ class MemoryLesson(BaseModel):
 
 
 class MemoryUpdater:
+    DEFAULT_LEARNING_CONTRACT_CUTOVER_DATE = "2026-03-10 00:00:00"
+    LEARNING_CONTRACT_CUTOVER_ENV_VAR = "LEARNING_CONTRACT_CUTOVER_DATE"
+    LEGACY_POSITION_CONFIG_KEYS = (
+        "weakened_reduce_pct",
+        "profit_reduce_trigger_pct",
+        "profit_reduce_fraction",
+    )
+    LEGACY_SAFETY_CONFIG_KEYS = (
+        "profit_protect_trigger_pct",
+        "profit_protect_reduce_fraction",
+    )
+    LEGACY_POSITION_RULE_MARKERS = (
+        "reduce the position",
+        "reduce exposure",
+        "stalled reduce",
+        "scale out",
+        "partial take profit",
+        "partial profit",
+        "profit reduce",
+    )
+    LEGACY_SAFETY_RULE_MARKERS = (
+        "profit protect",
+        "profit-protect",
+        "scale out",
+        "partial take profit",
+        "partial profit",
+        "reduce the position",
+        "reduce exposure",
+    )
+    LEGACY_MEMORY_RULE_MARKERS = (
+        "profit protect",
+        "profit-protect",
+        "scale out",
+        "partial take profit",
+        "partial profit",
+        "reduce the position when",
+        "reduce exposure when",
+    )
+
     def __init__(self, db_path: str = "data/gpt_trader.db"):
         self.db_path = db_path
         self.state_store = StateStore(db_path)
@@ -118,6 +158,111 @@ class MemoryUpdater:
             return normalized
         normalized = self._normalize_text(value, default="")
         return [normalized] if normalized else []
+
+    def _get_learning_contract_cutover(self) -> datetime | None:
+        raw_value = str(
+            os.getenv(
+                self.LEARNING_CONTRACT_CUTOVER_ENV_VAR,
+                self.DEFAULT_LEARNING_CONTRACT_CUTOVER_DATE,
+            )
+            or ""
+        ).strip()
+        if not raw_value or raw_value.lower() in {"off", "none", "disabled"}:
+            return None
+        parsed = self._parse_datetime(raw_value)
+        return parsed.replace(tzinfo=None) if parsed else None
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("T", " ")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    def _filter_rows_for_contract_cutover(
+        self,
+        rows: List[Dict[str, Any]] | None,
+        *,
+        timestamp_keys: tuple[str, ...],
+    ) -> List[Dict[str, Any]]:
+        if not rows:
+            return []
+        cutover = self._get_learning_contract_cutover()
+        if cutover is None:
+            return list(rows)
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            for key in timestamp_keys:
+                parsed = self._parse_datetime((row or {}).get(key))
+                if parsed is None:
+                    continue
+                if parsed >= cutover:
+                    filtered.append(row)
+                break
+        return filtered
+
+    def _clean_legacy_policy_config(
+        self,
+        config: Dict[str, Any] | None,
+        *,
+        domain: str,
+    ) -> tuple[Dict[str, Any], List[str]]:
+        clean_config = dict(config or {})
+        keys_to_remove = (
+            self.LEGACY_SAFETY_CONFIG_KEYS
+            if domain == "safety_5m"
+            else self.LEGACY_POSITION_CONFIG_KEYS
+            if domain == "position_15m"
+            else ()
+        )
+        removed_keys = [key for key in keys_to_remove if key in clean_config]
+        for key in removed_keys:
+            clean_config.pop(key, None)
+        return clean_config, removed_keys
+
+    def _collect_legacy_policy_rule_markers(self, row: Dict[str, Any], *, domain: str) -> List[str]:
+        markers = self.LEGACY_SAFETY_RULE_MARKERS if domain == "safety_5m" else self.LEGACY_POSITION_RULE_MARKERS
+        policy_name = str((row or {}).get("policy_name") or "").strip().lower().replace("-", "_")
+        rule_text = str((row or {}).get("rule_text") or "").strip().lower()
+        matched: List[str] = []
+        for marker in markers:
+            normalized = marker.lower()
+            if normalized in rule_text and normalized not in matched:
+                matched.append(normalized)
+        token_markers = {
+            "reduce": ("_reduce", "reduce_", "reduce"),
+            "scale out": ("scale_out", "scaleout"),
+            "profit protect": ("profit_protect",),
+        }
+        for label, tokens in token_markers.items():
+            if label in matched:
+                continue
+            if any(token in policy_name for token in tokens):
+                matched.append(label)
+        return matched
+
+    def _memory_entry_uses_legacy_management_contract(self, row: Dict[str, Any]) -> List[str]:
+        metrics = dict((row or {}).get("metrics") or {})
+        blob = " ".join(
+            part
+            for part in [
+                str((row or {}).get("rule") or "").strip().lower(),
+                self._normalize_text(metrics.get("candidate_lessons"), default="").lower(),
+                self._normalize_text(metrics.get("merged_rules"), default="").lower(),
+            ]
+            if part
+        )
+        return [marker for marker in self.LEGACY_MEMORY_RULE_MARKERS if marker in blob]
 
     def _coerce_bool(self, value: Any, *, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -2168,20 +2313,20 @@ class MemoryUpdater:
                 {
                     "domain": "position_15m",
                     "policy_type": "management_fsm",
-                    "policy_name": "position_time_stop_reduce",
+                    "policy_name": "position_time_stop_exit",
                     "source": "memory_updater",
                     "status": "candidate",
-                    "rule_text": "If no follow-through within 45 minutes then reduce 50 percent.",
+                    "rule_text": "If no follow-through within 45 minutes then exit the position.",
                     "config": {
                         "stalled_minutes": 45.0,
                         "stalled_max_pnl_pct": 0.2,
-                        "weakened_reduce_pct": 0.5,
                     },
                     "metrics": {"support_count": adverse, "seed_type": "failure_pattern"},
                 }
             )
 
         candidates.extend(self._build_alpha_candidate_policies(trade_cases))
+        candidates.extend(self._build_position_candidate_policies(trade_cases))
         candidates.extend(self._build_safety_candidate_policies(trade_cases))
         candidates.extend(self._build_exposure_candidate_policies(trade_cases))
 
@@ -2210,6 +2355,117 @@ class MemoryUpdater:
                     "metrics": {
                         "support_count": int((lesson or {}).get("support_count") or 0),
                         "seed_type": "candidate_lesson",
+                    },
+                }
+            )
+        return candidates
+
+    def _build_position_candidate_policies(self, trade_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in trade_cases or []:
+            if str(row.get("status") or "") != "closed":
+                continue
+            risk_mode = str(row.get("risk_mode") or "").strip().lower()
+            if risk_mode not in ("trigger", "normal"):
+                continue
+            regime_key = self._extract_trade_case_regime_key(row)
+            grouped.setdefault(regime_key, []).append(row)
+
+        candidates: List[Dict[str, Any]] = []
+        for regime_key, rows in grouped.items():
+            if len(rows) < 3:
+                continue
+            pnl_values = [self._coerce_float(row.get("estimated_pnl_pct")) or 0.0 for row in rows]
+            loss_values = [value for value in pnl_values if value < 0.0]
+            loss_rate = len(loss_values) / max(1, len(rows))
+            avg_loss = sum(loss_values) / max(1, len(loss_values)) if loss_values else 0.0
+            feature_rows = [((row.get("payload") or {}).get("feature_snapshot") or {}) for row in rows]
+            risk_trigger_counts = [
+                len((row.get("risk_trigger_reasons") or []) or (((row.get("payload") or {}).get("risk_trigger_reasons")) or []))
+                for row in rows
+            ]
+            stress_feature_rows = [
+                feature_rows[idx]
+                for idx, pnl in enumerate(pnl_values)
+                if pnl <= 0.2
+            ]
+            invalidation_samples = [
+                self._coerce_float(feature.get("distance_to_invalid_level"))
+                for feature in stress_feature_rows
+                if self._coerce_float(feature.get("distance_to_invalid_level")) is not None
+            ]
+            spread_samples = [
+                self._coerce_float(feature.get("spread_percentile_1h"))
+                for feature in stress_feature_rows
+                if self._coerce_float(feature.get("spread_percentile_1h")) is not None
+            ]
+            depth_samples = [
+                self._coerce_float(feature.get("depth_percentile_1h"))
+                for feature in stress_feature_rows
+                if self._coerce_float(feature.get("depth_percentile_1h")) is not None
+            ]
+
+            config = {
+                "stalled_minutes": 45.0,
+                "stalled_max_pnl_pct": 0.2,
+                "risk_trigger_exit_count": 2,
+                "microstructure_exit_spread_percentile": 90.0,
+                "microstructure_exit_depth_percentile": 12.0,
+                "microstructure_exit_confirmations": 2,
+                "invalidation_reduce_distance_atr": 0.75,
+            }
+            changed = False
+            if (loss_rate >= 0.5 or avg_loss <= -0.45) and invalidation_samples:
+                learned_distance = round(
+                    min(1.25, max(0.35, statistics.median(invalidation_samples))),
+                    2,
+                )
+                if abs(learned_distance - float(config["invalidation_reduce_distance_atr"])) >= 0.05:
+                    config["invalidation_reduce_distance_atr"] = learned_distance
+                    changed = True
+            if (loss_rate >= 0.5 or avg_loss <= -0.45) and spread_samples and depth_samples:
+                learned_spread = round(min(spread_samples), 2)
+                learned_depth = round(max(depth_samples), 2)
+                if abs(learned_spread - float(config["microstructure_exit_spread_percentile"])) >= 0.5:
+                    config["microstructure_exit_spread_percentile"] = learned_spread
+                    changed = True
+                if abs(learned_depth - float(config["microstructure_exit_depth_percentile"])) >= 0.5:
+                    config["microstructure_exit_depth_percentile"] = learned_depth
+                    changed = True
+            trigger_presence_rate = (
+                sum(1 for count in risk_trigger_counts if count >= 1) / max(1, len(risk_trigger_counts))
+                if risk_trigger_counts
+                else 0.0
+            )
+            if trigger_presence_rate >= 0.5 and loss_rate < 0.5:
+                config["microstructure_exit_confirmations"] = 3
+                changed = True
+            if not changed:
+                continue
+            support_count = len(rows)
+            utility_score = round(abs(avg_loss) + loss_rate + trigger_presence_rate, 4)
+            candidates.append(
+                {
+                    "domain": "position_15m",
+                    "policy_type": "management_fsm",
+                    "regime_key": regime_key or None,
+                    "policy_name": f"position_manage_{(regime_key or 'global').replace('|', '_')}",
+                    "source": "memory_updater",
+                    "status": "candidate",
+                    "rule_text": (
+                        f"15m management in {regime_key or 'global'} should exit only near invalidation "
+                        "and require confirmed liquidity deterioration before forced exits."
+                    ),
+                    "config": config,
+                    "metrics": {
+                        "support_count": support_count,
+                        "sample_count": support_count,
+                        "utility_score": utility_score,
+                        "loss_rate": round(loss_rate, 4),
+                        "avg_loss_pct": round(avg_loss, 4),
+                        "trigger_presence_rate": round(trigger_presence_rate, 4),
+                        "seed_type": "trade_case_position",
+                        "regime_key": regime_key or "",
                     },
                 }
             )
@@ -2255,8 +2511,7 @@ class MemoryUpdater:
                 "risk_trigger_exit_count": 1,
                 "microstructure_exit_spread_percentile": 85.0,
                 "microstructure_exit_depth_percentile": 15.0,
-                "profit_protect_trigger_pct": 1.0,
-                "profit_protect_reduce_fraction": 0.35,
+                "microstructure_exit_confirmations": 2,
                 "stale_order_minutes": 12.0,
                 "stale_order_risk_trigger_count": 1,
             }
@@ -2274,7 +2529,7 @@ class MemoryUpdater:
                 changed = True
             if risk_trigger_counts and (sum(risk_trigger_counts) / max(1, len(risk_trigger_counts))) >= 1.5:
                 config["risk_trigger_exit_count"] = 1
-                config["profit_protect_reduce_fraction"] = 0.5
+                config["microstructure_exit_confirmations"] = 2
                 changed = True
             if not changed:
                 continue
@@ -3844,8 +4099,6 @@ Computed statistics:
                 divergence_type = str(row.get("divergence_type") or "")
                 if divergence_type == "risk_exit":
                     adjusted = -outcome
-                elif divergence_type == "risk_reduce":
-                    adjusted = -(outcome * 0.5)
             adjusted_values.append(adjusted)
         return self._build_temporal_holdout_summary(adjusted_values)
 
@@ -3922,8 +4175,6 @@ Computed statistics:
                         divergence_type = str(row.get("divergence_type") or "")
                         if divergence_type == "risk_exit":
                             adjusted = -outcome
-                        elif divergence_type == "risk_reduce":
-                            adjusted = -(outcome * 0.5)
                     realized.append(adjusted)
                 sample_count = len(rows)
                 score = round(sum(realized) / max(1, len(realized)), 4) if realized else 0.0
@@ -4064,6 +4315,176 @@ Computed statistics:
                         "metrics": registry_entry["metrics"],
                     }
                 )
+
+    def _apply_contract_migration_metadata(
+        self,
+        metrics: Dict[str, Any] | None,
+        *,
+        migration_reason: str,
+        removed_keys: List[str] | None = None,
+        rule_markers: List[str] | None = None,
+        now_text: str,
+    ) -> Dict[str, Any]:
+        updated = dict(metrics or {})
+        updated["retired_legacy_config"] = True
+        updated["retirement_reason"] = migration_reason
+        updated["migration_reason"] = migration_reason
+        updated["contract_cutover_date"] = self.DEFAULT_LEARNING_CONTRACT_CUTOVER_DATE.split(" ")[0]
+        updated["contract_migrated_at"] = now_text
+        updated["contract_migrated_from"] = "pre_2026_03_10_reduce_contract"
+        if removed_keys:
+            updated["legacy_config_keys_removed"] = removed_keys
+        if rule_markers:
+            updated["legacy_rule_markers"] = rule_markers
+        return updated
+
+    def _retire_legacy_position_policy_registry_entries(self) -> int:
+        if not hasattr(self.state_store, "list_policy_registry") or not hasattr(self.state_store, "upsert_policy_registry"):
+            return 0
+        retired_count = 0
+        now_text = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        for entry in self.state_store.list_policy_registry(domain="position_15m") or []:
+            config, removed_keys = self._clean_legacy_policy_config(entry.get("config") or {}, domain="position_15m")
+            if not removed_keys:
+                continue
+            metrics = self._apply_contract_migration_metadata(
+                entry.get("metrics") or {},
+                migration_reason="reduce_removed",
+                removed_keys=removed_keys,
+                now_text=now_text,
+            )
+            self.state_store.upsert_policy_registry(
+                {
+                    "policy_key": entry.get("policy_key"),
+                    "domain": entry.get("domain"),
+                    "policy_type": entry.get("policy_type"),
+                    "regime_key": entry.get("regime_key"),
+                    "active_candidate_policy_id": entry.get("active_candidate_policy_id"),
+                    "version": int(entry.get("version") or 0) + 1,
+                    "config": config,
+                    "metrics": metrics,
+                }
+            )
+            retired_count += 1
+        return retired_count
+
+    def _retire_legacy_safety_policy_registry_entries(self) -> int:
+        if not hasattr(self.state_store, "list_policy_registry") or not hasattr(self.state_store, "upsert_policy_registry"):
+            return 0
+        retired_count = 0
+        now_text = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        for entry in self.state_store.list_policy_registry(domain="safety_5m") or []:
+            config, removed_keys = self._clean_legacy_policy_config(entry.get("config") or {}, domain="safety_5m")
+            if not removed_keys:
+                continue
+            metrics = self._apply_contract_migration_metadata(
+                entry.get("metrics") or {},
+                migration_reason="profit_protect_removed",
+                removed_keys=removed_keys,
+                now_text=now_text,
+            )
+            self.state_store.upsert_policy_registry(
+                {
+                    "policy_key": entry.get("policy_key"),
+                    "domain": entry.get("domain"),
+                    "policy_type": entry.get("policy_type"),
+                    "regime_key": entry.get("regime_key"),
+                    "active_candidate_policy_id": entry.get("active_candidate_policy_id"),
+                    "version": int(entry.get("version") or 0) + 1,
+                    "config": config,
+                    "metrics": metrics,
+                }
+            )
+            retired_count += 1
+        return retired_count
+
+    def _retire_legacy_candidate_policy_versions(self) -> int:
+        if not hasattr(self.state_store, "get_candidate_policy_versions") or not hasattr(self.state_store, "update_candidate_policy_version"):
+            return 0
+        retired_count = 0
+        now_text = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        for domain in ("position_15m", "safety_5m"):
+            candidates = self.state_store.get_candidate_policy_versions(domain=domain, limit=5000)
+            for candidate in candidates or []:
+                if str(candidate.get("status") or "").strip().lower() == "retired":
+                    continue
+                clean_config, removed_keys = self._clean_legacy_policy_config(candidate.get("config") or {}, domain=domain)
+                rule_markers = self._collect_legacy_policy_rule_markers(candidate, domain=domain)
+                if not removed_keys and not rule_markers:
+                    continue
+                metrics = self._apply_contract_migration_metadata(
+                    candidate.get("metrics") or {},
+                    migration_reason="contract_cutover_20260310",
+                    removed_keys=removed_keys,
+                    rule_markers=rule_markers,
+                    now_text=now_text,
+                )
+                updated = self.state_store.update_candidate_policy_version(
+                    int(candidate.get("id") or 0),
+                    status="retired",
+                    config=clean_config,
+                    metrics=metrics,
+                    retired_at=now_text,
+                )
+                if updated:
+                    retired_count += 1
+        return retired_count
+
+    def _retire_legacy_long_term_memory_entries(self) -> int:
+        if not hasattr(self.state_store, "get_long_term_memory_pool") or not hasattr(self.state_store, "save_long_term_memory_entries"):
+            return 0
+        existing_rows = self.state_store.get_long_term_memory_pool() or []
+        now = datetime.now(UTC)
+        updates: List[Dict[str, Any]] = []
+        for row in existing_rows:
+            metrics = dict(row.get("metrics") or {})
+            if bool(metrics.get("retired")):
+                continue
+            rule_markers = self._memory_entry_uses_legacy_management_contract(row)
+            if not rule_markers:
+                continue
+            metrics["lifecycle_status"] = "retired"
+            metrics["retired"] = True
+            metrics["retirement_reason"] = "contract_cutover_20260310"
+            metrics["migration_reason"] = "contract_cutover_20260310"
+            metrics["legacy_rule_markers"] = rule_markers
+            metrics["contract_cutover_date"] = self.DEFAULT_LEARNING_CONTRACT_CUTOVER_DATE.split(" ")[0]
+            metrics["contract_migrated_from"] = "pre_2026_03_10_reduce_contract"
+            metrics["last_validated_at"] = now.isoformat()
+            updates.append(
+                {
+                    "id": row.get("id"),
+                    "rule": row.get("rule"),
+                    "version": max(int(row.get("version") or 1) + 1, 2),
+                    "metrics": metrics,
+                }
+            )
+        if updates:
+            self.state_store.save_long_term_memory_entries(updates)
+        return len(updates)
+
+    def migrate_learning_contract_state(self, *, backup_db: bool = False) -> Dict[str, Any]:
+        backup_path = None
+        if backup_db:
+            source_path = Path(getattr(self, "db_path", "") or "")
+            if source_path.exists() and source_path.is_file():
+                backup_path = source_path.with_name(f"{source_path.stem}.pre_contract_20260310{source_path.suffix}.bak")
+                shutil.copy2(source_path, backup_path)
+        summary = {
+            "cutover_date": self.DEFAULT_LEARNING_CONTRACT_CUTOVER_DATE.split(" ")[0],
+            "backup_path": str(backup_path) if backup_path else None,
+            "position_registry_migrated_count": self._retire_legacy_position_policy_registry_entries(),
+            "safety_registry_migrated_count": self._retire_legacy_safety_policy_registry_entries(),
+            "candidate_policy_retired_count": self._retire_legacy_candidate_policy_versions(),
+            "long_term_memory_retired_count": self._retire_legacy_long_term_memory_entries(),
+        }
+        if hasattr(self.state_store, "upsert_learning_artifact"):
+            self.state_store.upsert_learning_artifact(
+                "policy_contract_cutover_20260310",
+                summary,
+                artifact_type="migration",
+            )
+        return summary
 
     def _build_replay_execution_summary(self, replay_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not replay_runs:
@@ -4325,6 +4746,7 @@ Computed statistics:
     def run(self, window_hours: int = 24):
         logger.info("Starting Daily Memory Update Batch with model: {}", self.model_name)
         journals = self._fetch_window_entries(window_hours=window_hours)
+        journals = self._filter_rows_for_contract_cutover(journals, timestamp_keys=("timestamp",))
         if not journals:
             logger.info("No journals found in the selected window. Skipping.")
             return
@@ -4351,6 +4773,7 @@ Computed statistics:
         shadow_decisions = self._fetch_shadow_decision_window_entries(window_hours=window_hours)
         symbol_journals = self._filter_audit_linked_rows(symbol_journals, audit_ids=eligible_audit_ids)
         trade_cases = self._filter_trade_cases_for_learning(trade_cases, audit_ids=eligible_audit_ids)
+        trade_cases = self._filter_rows_for_contract_cutover(trade_cases, timestamp_keys=("closed_at", "opened_at"))
         retrieval_evaluations = self._filter_audit_linked_rows(
             retrieval_evaluations,
             audit_ids=eligible_audit_ids,
@@ -4456,6 +4879,9 @@ Computed statistics:
             confidence_calibration_summary=stats_package.get("confidence_calibration_summary") or {},
         )
         self._promote_candidate_policies(saved_candidates, candidate_evaluations)
+        migration_summary = self.migrate_learning_contract_state(backup_db=False)
+        if any(int(value or 0) > 0 for key, value in migration_summary.items() if key.endswith("_count")):
+            logger.info("Applied learning-contract migration summary: {}", migration_summary)
         bundles = self._build_policy_bundles()
         if bundles and hasattr(self.state_store, "upsert_policy_bundle"):
             for bundle in bundles:

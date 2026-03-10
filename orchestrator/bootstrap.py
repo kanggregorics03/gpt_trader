@@ -167,7 +167,11 @@ class TradingBootstrapMixin:
             target_symbols = {position.symbol for position in account_state.positions}
 
         matched_positions = [
-            position.unrealized_pnl_pct
+            (
+                position.account_unrealized_pnl_pct
+                if getattr(position, "account_unrealized_pnl_pct", None) is not None
+                else position.unrealized_pnl_pct
+            )
             for position in account_state.positions
             if position.symbol in target_symbols
         ]
@@ -576,8 +580,6 @@ class TradingBootstrapMixin:
         if shadow_rank > live_rank:
             if shadow_decision == "EXIT":
                 return "risk_exit"
-            if shadow_decision == "REDUCE":
-                return "risk_reduce"
         return "decision"
 
     def _build_context_budget(self):

@@ -1057,6 +1057,187 @@ class TestMemoryUpdater(unittest.TestCase):
 
         self.assertEqual(self.updater.state_store.promotions, [])
 
+    def test_retire_legacy_safety_policy_registry_entries_strips_profit_protect_keys(self):
+        class DummyStore:
+            def __init__(self):
+                self.upserts = []
+
+            def list_policy_registry(self, domain=None):
+                self.last_domain = domain
+                return [
+                    {
+                        "policy_key": "champion:safety_5m:aligned_up|high",
+                        "domain": "safety_5m",
+                        "policy_type": "execution_safety_fsm",
+                        "regime_key": "aligned_up|high",
+                        "active_candidate_policy_id": 21,
+                        "version": 3,
+                        "config": {
+                            "loss_exit_pct": -0.9,
+                            "profit_protect_trigger_pct": 1.0,
+                            "profit_protect_reduce_fraction": 0.35,
+                        },
+                        "metrics": {"score": 0.8},
+                    }
+                ]
+
+            def upsert_policy_registry(self, payload):
+                self.upserts.append(payload)
+
+        self.updater.state_store = DummyStore()
+
+        retired_count = self.updater._retire_legacy_safety_policy_registry_entries()
+
+        self.assertEqual(retired_count, 1)
+        self.assertEqual(self.updater.state_store.last_domain, "safety_5m")
+        self.assertEqual(len(self.updater.state_store.upserts), 1)
+        updated = self.updater.state_store.upserts[0]
+        self.assertEqual(updated["version"], 4)
+        self.assertNotIn("profit_protect_trigger_pct", updated["config"])
+        self.assertNotIn("profit_protect_reduce_fraction", updated["config"])
+        self.assertTrue(updated["metrics"]["retired_legacy_config"])
+        self.assertEqual(updated["metrics"]["retirement_reason"], "profit_protect_removed")
+        self.assertEqual(updated["metrics"]["contract_cutover_date"], "2026-03-10")
+
+    def test_retire_legacy_position_policy_registry_entries_strips_reduce_keys(self):
+        class DummyStore:
+            def __init__(self):
+                self.upserts = []
+
+            def list_policy_registry(self, domain=None):
+                self.last_domain = domain
+                return [
+                    {
+                        "policy_key": "champion:position_15m:aligned_up|high",
+                        "domain": "position_15m",
+                        "policy_type": "management_fsm",
+                        "regime_key": "aligned_up|high",
+                        "active_candidate_policy_id": 31,
+                        "version": 6,
+                        "config": {
+                            "stalled_minutes": 45,
+                            "weakened_reduce_pct": 0.4,
+                            "profit_reduce_trigger_pct": 1.25,
+                            "profit_reduce_fraction": 0.25,
+                        },
+                        "metrics": {"score": 0.9},
+                    }
+                ]
+
+            def upsert_policy_registry(self, payload):
+                self.upserts.append(payload)
+
+        self.updater.state_store = DummyStore()
+
+        retired_count = self.updater._retire_legacy_position_policy_registry_entries()
+
+        self.assertEqual(retired_count, 1)
+        self.assertEqual(self.updater.state_store.last_domain, "position_15m")
+        updated = self.updater.state_store.upserts[0]
+        self.assertEqual(updated["version"], 7)
+        self.assertNotIn("weakened_reduce_pct", updated["config"])
+        self.assertNotIn("profit_reduce_trigger_pct", updated["config"])
+        self.assertNotIn("profit_reduce_fraction", updated["config"])
+        self.assertEqual(updated["metrics"]["migration_reason"], "reduce_removed")
+        self.assertEqual(updated["metrics"]["contract_cutover_date"], "2026-03-10")
+
+    def test_retire_legacy_candidate_policy_versions_marks_legacy_position_and_safety_candidates(self):
+        class DummyStore:
+            def __init__(self):
+                self.updated = []
+
+            def get_candidate_policy_versions(self, domain=None, limit=5000):
+                if domain == "position_15m":
+                    return [
+                        {
+                            "id": 41,
+                            "domain": "position_15m",
+                            "status": "candidate",
+                            "policy_name": "position_time_stop_reduce",
+                            "rule_text": "Reduce the position when it stalls.",
+                            "config": {"stalled_minutes": 45, "weakened_reduce_pct": 0.4},
+                            "metrics": {"support_count": 4},
+                        }
+                    ]
+                if domain == "safety_5m":
+                    return [
+                        {
+                            "id": 42,
+                            "domain": "safety_5m",
+                            "status": "shadow",
+                            "policy_name": "safety_profit_protect",
+                            "rule_text": "Profit protect with partial take profit.",
+                            "config": {"profit_protect_trigger_pct": 1.0},
+                            "metrics": {"support_count": 3},
+                        }
+                    ]
+                return []
+
+            def update_candidate_policy_version(self, candidate_policy_id, **payload):
+                self.updated.append({"candidate_policy_id": candidate_policy_id, **payload})
+                return True
+
+        self.updater.state_store = DummyStore()
+
+        retired_count = self.updater._retire_legacy_candidate_policy_versions()
+
+        self.assertEqual(retired_count, 2)
+        self.assertEqual(len(self.updater.state_store.updated), 2)
+        position_update = next(item for item in self.updater.state_store.updated if item["candidate_policy_id"] == 41)
+        safety_update = next(item for item in self.updater.state_store.updated if item["candidate_policy_id"] == 42)
+        self.assertEqual(position_update["status"], "retired")
+        self.assertNotIn("weakened_reduce_pct", position_update["config"])
+        self.assertEqual(position_update["metrics"]["retirement_reason"], "contract_cutover_20260310")
+        self.assertEqual(safety_update["status"], "retired")
+        self.assertNotIn("profit_protect_trigger_pct", safety_update["config"])
+        self.assertIn("profit protect", safety_update["metrics"]["legacy_rule_markers"])
+
+    def test_retire_legacy_long_term_memory_entries_soft_retires_scale_out_rules(self):
+        class DummyStore:
+            def __init__(self):
+                self.saved = []
+
+            def get_long_term_memory_pool(self):
+                return [
+                    {
+                        "id": 51,
+                        "rule": "Scale out when the first 15m push stalls after entry.",
+                        "version": 2,
+                        "metrics": {
+                            "retired": False,
+                            "lifecycle_status": "active",
+                            "candidate_lessons": ["Scale out winners early in noisy conditions."],
+                        },
+                    }
+                ]
+
+            def save_long_term_memory_entries(self, entries):
+                self.saved.extend(entries)
+
+        self.updater.state_store = DummyStore()
+
+        retired_count = self.updater._retire_legacy_long_term_memory_entries()
+
+        self.assertEqual(retired_count, 1)
+        self.assertEqual(len(self.updater.state_store.saved), 1)
+        saved = self.updater.state_store.saved[0]
+        self.assertEqual(saved["id"], 51)
+        self.assertTrue(saved["metrics"]["retired"])
+        self.assertEqual(saved["metrics"]["lifecycle_status"], "retired")
+        self.assertEqual(saved["metrics"]["retirement_reason"], "contract_cutover_20260310")
+
+    def test_filter_rows_for_contract_cutover_keeps_only_post_cutover_rows(self):
+        rows = [
+            {"timestamp": "2026-03-09 23:59:59", "id": 1},
+            {"timestamp": "2026-03-10 00:00:00", "id": 2},
+            {"timestamp": "2026-03-10 12:00:00", "id": 3},
+        ]
+
+        with patch.dict("os.environ", {"LEARNING_CONTRACT_CUTOVER_DATE": "2026-03-10 00:00:00"}, clear=False):
+            filtered = self.updater._filter_rows_for_contract_cutover(rows, timestamp_keys=("timestamp",))
+
+        self.assertEqual([row["id"] for row in filtered], [2, 3])
+
     def test_retrieval_counterfactual_summary_uses_path_utility_not_only_pnl_sign(self):
         summary = self.updater._apply_retrieval_outcome_counterfactual_summary(
             summary={

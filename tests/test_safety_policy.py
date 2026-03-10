@@ -1,13 +1,15 @@
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from core.models import AccountState, MarketSnapshot, OpenOrderState, OrderBookSnapshot, PositionState
 from core.safety_policy import SafetyPolicyEngine
 
 
 class DummyStore:
-    def __init__(self, registry=None):
+    def __init__(self, registry=None, market_history=None):
         self.registry = dict(registry or {})
+        self.market_history = list(market_history or [])
 
     def get_policy_registry_entry(self, policy_key):
         return dict(self.registry.get(policy_key, {}))
@@ -16,6 +18,17 @@ class DummyStore:
         regime_text = str(regime_key or "")
         scoped_key = f"champion:{domain}:{regime_text}" if regime_text else f"champion:{domain}"
         return dict(self.registry.get(scoped_key, {}))
+
+    def get_market_snapshot_history_between(self, symbol, start_timestamp, end_timestamp, limit=None):
+        rows = [
+            dict(row)
+            for row in self.market_history
+            if row.get("symbol") == symbol
+            and start_timestamp <= row.get("timestamp", start_timestamp) <= end_timestamp
+        ]
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
 
 
 class TestSafetyPolicyEngine(unittest.TestCase):
@@ -44,7 +57,8 @@ class TestSafetyPolicyEngine(unittest.TestCase):
                     side="LONG",
                     size=0.1,
                     entry_price=30000.0,
-                    unrealized_pnl_pct=-1.2,
+                    unrealized_pnl_pct=-12.0,
+                    account_unrealized_pnl_pct=-1.2,
                 )
             ],
             open_orders=[],
@@ -70,20 +84,20 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         self.assertEqual(result["decision_result"]["decision"], "EXIT")
         self.assertEqual(result["decision_result"]["exit_reason"], "emergency_exit")
         self.assertEqual(result["decision_result"]["orders"][0].reduce_only, True)
+        self.assertIn("account-loss threshold", result["decision_result"]["rationale"][0])
 
-    def test_registry_override_can_reduce_on_profit_protection(self):
-        store = DummyStore(
+    def test_liquidity_exit_requires_confirmed_history(self):
+        now = datetime.now(UTC).replace(tzinfo=None)
+        history = [
             {
-                "champion:safety_5m:aligned_up|high": {
-                    "config": {
-                        "profit_protect_trigger_pct": 0.5,
-                        "profit_protect_reduce_fraction": 0.5,
-                        "risk_trigger_exit_count": 2,
-                    }
-                }
+                "symbol": "BTCUSDT",
+                "timestamp": now - timedelta(minutes=6),
+                "spread_percentile_1h": 88.0,
+                "depth_percentile_1h": 12.0,
+                "payload": {"risk_trigger_reasons": ["wide_spread"]},
             }
-        )
-        engine = SafetyPolicyEngine(policy={}, state_store=store)
+        ]
+        engine = SafetyPolicyEngine(policy={}, state_store=DummyStore(market_history=history))
         account_state = AccountState(
             total_balance=1000.0,
             available_balance=900.0,
@@ -99,7 +113,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
             open_orders=[
                 OpenOrderState(
                     symbol="BTCUSDT",
-                    side="SELL",
+                    side="BUY",
                     order_type="LIMIT",
                     quantity=0.1,
                     timestamp=int((time.time() - (5 * 60)) * 1000),
@@ -117,7 +131,7 @@ class TestSafetyPolicyEngine(unittest.TestCase):
                 spread_percentile_1h=88.0,
                 depth_percentile_1h=10.0,
                 risk_trigger_reasons=["wide_spread"],
-                order_book=OrderBookSnapshot(spread_bps=12.0),
+                order_book=OrderBookSnapshot(spread_bps=12.0, best_bid=30230.0, best_ask=30250.0),
             )
         }
 
@@ -126,11 +140,103 @@ class TestSafetyPolicyEngine(unittest.TestCase):
             market_snapshots=market_snapshots,
             risk_mode="trigger",
             loop_mode="5m",
-            regime_key="aligned_up|high",
         )
 
-        self.assertEqual(result["decision_result"]["decision"], "REDUCE")
-        self.assertEqual(result["decision_result"]["orders"][0].quantity, 0.1)
+        self.assertEqual(result["decision_result"]["decision"], "HOLD")
+
+        confirmed_engine = SafetyPolicyEngine(
+            policy={},
+            state_store=DummyStore(
+                market_history=history
+                + [
+                    {
+                        "symbol": "BTCUSDT",
+                        "timestamp": now - timedelta(minutes=2),
+                        "spread_percentile_1h": 90.0,
+                        "depth_percentile_1h": 10.0,
+                        "payload": {"risk_trigger_reasons": ["wide_spread"]},
+                    }
+                ]
+            ),
+        )
+        confirmed_result = confirmed_engine.evaluate(
+            account_state=account_state,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            loop_mode="5m",
+        )
+
+        self.assertEqual(confirmed_result["decision_result"]["decision"], "EXIT")
+        self.assertEqual(confirmed_result["decision_result"]["exit_reason"], "liquidity_exit")
+
+    def test_stale_order_risk_requires_confirmed_history(self):
+        now = datetime.now(UTC).replace(tzinfo=None)
+        engine = SafetyPolicyEngine(
+            policy={"safety_policy": {"stale_order_minutes": 1}},
+            state_store=DummyStore(
+                market_history=[
+                    {
+                        "symbol": "BTCUSDT",
+                        "timestamp": now - timedelta(minutes=6),
+                        "spread_percentile_1h": 89.0,
+                        "depth_percentile_1h": 11.0,
+                        "payload": {"risk_trigger_reasons": ["wide_spread"]},
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "timestamp": now - timedelta(minutes=2),
+                        "spread_percentile_1h": 91.0,
+                        "depth_percentile_1h": 10.0,
+                        "payload": {"risk_trigger_reasons": []},
+                    },
+                ]
+            ),
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=900.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.2,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=0.1,
+                    account_unrealized_pnl_pct=0.01,
+                )
+            ],
+            open_orders=[
+                OpenOrderState(
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="LIMIT",
+                    quantity=0.1,
+                    timestamp=int((time.time() - (5 * 60)) * 1000),
+                )
+            ],
+        )
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30020.0,
+                atr_15m=110.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+                spread_percentile_1h=91.0,
+                depth_percentile_1h=10.0,
+                risk_trigger_reasons=["wide_spread"],
+            )
+        }
+
+        result = engine.evaluate(
+            account_state=account_state,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            loop_mode="5m",
+        )
+
+        self.assertEqual(result["decision_result"]["decision"], "HOLD")
 
     def test_stale_working_orders_without_positions_are_cancelled(self):
         engine = SafetyPolicyEngine(

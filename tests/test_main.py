@@ -394,6 +394,35 @@ class TestTradingOrchestrator(unittest.TestCase):
             },
         )
 
+    def test_estimate_realized_pnl_pct_prefers_account_metric(self):
+        orchestrator = self._make_orchestrator()
+        intent = TradeIntent(
+            decision="EXIT",
+            orders=[OrderIntent(symbol="BTCUSDT", action="SELL", order_type="MARKET", quantity=0.1, reduce_only=True)],
+            rationale=["Exit"],
+            risk_notes=[],
+            confidence=0.9,
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=900.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=-12.0,
+                    account_unrealized_pnl_pct=-1.2,
+                )
+            ],
+            open_orders=[],
+        )
+
+        estimated = orchestrator._estimate_realized_pnl_pct(intent, account_state)
+
+        self.assertEqual(estimated, -1.2)
+
     def test_build_daily_batch_config_reads_policy_overrides(self):
         orchestrator = self._make_orchestrator()
 
@@ -1711,7 +1740,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "position_management")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
 
     def test_trigger_cycle_profile_blocks_new_entries(self):
         orchestrator = self._make_orchestrator()
@@ -1741,7 +1770,7 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "execution_safety")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
 
     def test_trigger_cycle_profile_blocks_new_entries_even_when_flat(self):
         orchestrator = self._make_orchestrator()
@@ -1753,7 +1782,106 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(effective_profile["cycle_role"], "execution_safety")
-        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+
+    def test_strategy_cycle_locks_to_trade_consistency_when_active_case_exists(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.state_store.upsert_active_trade_case(
+            symbol="BTCUSDT",
+            trade_case_id="BTCUSDT-case-1",
+            opened_at="2026-03-10 12:00:00",
+            entry_decision="BUY",
+            thesis_id="thesis-1",
+            management_template_id="entry_swing_base",
+            last_decision="BUY",
+            last_audit_log_id=77,
+            payload={},
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=900.0,
+            positions=[
+                PositionState(
+                    symbol="BTCUSDT",
+                    side="LONG",
+                    size=0.1,
+                    entry_price=30000.0,
+                    unrealized_pnl_pct=0.0,
+                )
+            ],
+            open_orders=[],
+            open_orders_count=0,
+        )
+
+        effective_profile = orchestrator._build_effective_risk_profile(
+            "1h",
+            account_state=account_state,
+            risk_profile={"allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"]},
+        )
+
+        self.assertEqual(effective_profile["cycle_role"], "trade_consistency_management")
+        self.assertEqual(effective_profile["allowed_actions"], ["HOLD", "EXIT", "CANCEL", "REPLACE_ENTRY"])
+        self.assertTrue(effective_profile["trade_consistency_lock_active"])
+        self.assertEqual(effective_profile["active_trade_case_id"], "BTCUSDT-case-1")
+        self.assertEqual(effective_profile["active_thesis_id"], "thesis-1")
+        self.assertEqual(effective_profile["active_management_template_id"], "entry_swing_base")
+
+    def test_strategy_cycle_keeps_entry_actions_when_only_working_order_exists(self):
+        orchestrator = self._make_orchestrator()
+
+        effective_profile = orchestrator._build_effective_risk_profile(
+            "1h",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=1000.0,
+                positions=[],
+                open_orders=[OpenOrderState(symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=0.1)],
+                open_orders_count=1,
+            ),
+            risk_profile={"allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"]},
+        )
+
+        self.assertNotEqual(effective_profile.get("cycle_role"), "trade_consistency_management")
+        self.assertEqual(
+            effective_profile["allowed_actions"],
+            ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
+        )
+        self.assertFalse(effective_profile["trade_consistency_lock_active"])
+
+    def test_strategy_cycle_keeps_entry_actions_when_only_active_case_exists(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.state_store.upsert_active_trade_case(
+            symbol="BTCUSDT",
+            trade_case_id="BTCUSDT-case-1",
+            opened_at="2026-03-10 12:00:00",
+            entry_decision="BUY",
+            thesis_id="thesis-1",
+            management_template_id="entry_swing_base",
+            last_decision="EXIT",
+            last_audit_log_id=77,
+            payload={},
+        )
+
+        effective_profile = orchestrator._build_effective_risk_profile(
+            "1h",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=1000.0,
+                positions=[],
+                open_orders=[],
+                open_orders_count=0,
+            ),
+            risk_profile={"allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT"]},
+        )
+
+        self.assertNotEqual(effective_profile.get("cycle_role"), "trade_consistency_management")
+        self.assertEqual(
+            effective_profile["allowed_actions"],
+            ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"],
+        )
+        self.assertFalse(effective_profile["trade_consistency_lock_active"])
+        self.assertEqual(effective_profile["active_trade_case_id"], "BTCUSDT-case-1")
+        self.assertTrue(effective_profile["trade_consistency_lock_active"])
 
     def test_effective_risk_profile_applies_exposure_policy_override_outside_drawdown(self):
         orchestrator = self._make_orchestrator()

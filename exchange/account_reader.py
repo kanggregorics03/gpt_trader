@@ -98,6 +98,7 @@ class AccountReader:
                     ) or (size * entry_price)
                     margin = initial_margin or notional_value
                     pnl_pct = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
+                    account_pnl_pct = (unrealized_pnl / total_balance * 100) if total_balance > 0 else None
 
                     active_positions.append(PositionState(
                         symbol=normalize_symbol(pos['symbol']),
@@ -107,6 +108,7 @@ class AccountReader:
                         mark_price=mark_price,
                         unrealized_pnl=unrealized_pnl,
                         unrealized_pnl_pct=pnl_pct,
+                        account_unrealized_pnl_pct=account_pnl_pct,
                         liquidation_price=self._safe_float(pos.get("liquidationPrice"), info.get("liqPrice")),
                         leverage=self._safe_float(pos.get("leverage"), info.get("leverage")),
                         notional_value=notional_value,

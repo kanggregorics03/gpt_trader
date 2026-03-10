@@ -1624,10 +1624,10 @@ class TestStateStore(unittest.TestCase):
                 "domain": "position_15m",
                 "policy_type": "management_fsm",
                 "regime_key": "aligned_up|high",
-                "policy_name": "reduce_stalled",
+                "policy_name": "exit_stalled",
                 "source": "test",
                 "status": "candidate",
-                "rule_text": "Reduce when stalled.",
+                "rule_text": "Exit when stalled.",
                 "config": {"stalled_minutes": 45},
                 "metrics": {"support_count": 4},
             }
@@ -1665,8 +1665,42 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(registry["active_candidate_policy_id"], candidate_id)
         self.assertEqual(registry["regime_key"], "aligned_up|high")
         self.assertEqual(registry["config"]["stalled_minutes"], 45)
-        self.assertEqual(candidates[0]["rule_text"], "Reduce when stalled.")
+        self.assertEqual(candidates[0]["rule_text"], "Exit when stalled.")
         self.assertEqual(evaluations[0]["sample_count"], 5)
+
+    def test_update_candidate_policy_version_round_trip(self):
+        candidate_id = self.store.save_candidate_policy_version(
+            {
+                "domain": "safety_5m",
+                "policy_type": "execution_safety_fsm",
+                "policy_name": "legacy_profit_protect",
+                "source": "test",
+                "status": "candidate",
+                "rule_text": "Profit protect with partial take profit.",
+                "config": {"profit_protect_trigger_pct": 1.0},
+                "metrics": {"support_count": 2},
+            }
+        )
+
+        updated = self.store.update_candidate_policy_version(
+            candidate_id,
+            status="retired",
+            config={},
+            metrics={"retirement_reason": "contract_cutover_20260310"},
+            retired_at="2026-03-10 01:00:00",
+        )
+
+        candidates = self.store.get_candidate_policy_versions(
+            domain="safety_5m",
+            statuses=["retired"],
+            limit=5,
+        )
+
+        self.assertTrue(updated)
+        self.assertEqual(candidates[0]["id"], candidate_id)
+        self.assertEqual(candidates[0]["status"], "retired")
+        self.assertEqual(candidates[0]["config"], {})
+        self.assertEqual(candidates[0]["metrics"]["retirement_reason"], "contract_cutover_20260310")
 
     def test_policy_bundle_round_trip(self):
         self.store.upsert_policy_bundle(

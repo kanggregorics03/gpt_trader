@@ -129,6 +129,7 @@ class PositionState(BaseModel):
     mark_price: Optional[float] = None
     unrealized_pnl: float = 0.0
     unrealized_pnl_pct: float
+    account_unrealized_pnl_pct: Optional[float] = None
     liquidation_price: Optional[float] = None
     leverage: Optional[float] = None
     notional_value: float = 0.0

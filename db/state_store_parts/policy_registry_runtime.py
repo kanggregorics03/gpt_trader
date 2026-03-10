@@ -82,6 +82,67 @@ class StateStorePolicyRegistryRuntimeMixin:
             rows.append(item)
         return rows
 
+    def update_candidate_policy_version(
+        self,
+        candidate_policy_id: int,
+        *,
+        status: Optional[str] = None,
+        policy_name: Optional[str] = None,
+        rule_text: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+        evaluated_at: Optional[str] = None,
+        promoted_at: Optional[str] = None,
+        retired_at: Optional[str] = None,
+    ) -> bool:
+        try:
+            candidate_id = int(candidate_policy_id)
+        except (TypeError, ValueError):
+            return False
+        updates: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if policy_name is not None:
+            updates.append("policy_name = ?")
+            params.append(policy_name)
+        if rule_text is not None:
+            updates.append("rule_text = ?")
+            params.append(rule_text)
+        if config is not None:
+            updates.append("config = ?")
+            params.append(json.dumps(config))
+        if metrics is not None:
+            updates.append("metrics = ?")
+            params.append(json.dumps(metrics))
+        if evaluated_at is not None:
+            updates.append("evaluated_at = ?")
+            params.append(evaluated_at)
+        if promoted_at is not None:
+            updates.append("promoted_at = ?")
+            params.append(promoted_at)
+        if retired_at is not None:
+            updates.append("retired_at = ?")
+            params.append(retired_at)
+        if not updates:
+            return False
+        params.append(candidate_id)
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"""
+                    UPDATE candidate_policy_versions
+                    SET {", ".join(updates)}
+                    WHERE id = ?
+                    """,
+                    params,
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update candidate policy version {candidate_id}: {e}")
+            return False
+
     def save_policy_evaluation(self, record: Dict[str, Any]) -> Optional[int]:
         try:
             with self.conn:

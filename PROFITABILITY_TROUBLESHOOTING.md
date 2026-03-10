@@ -60,6 +60,7 @@
 7. `execution_policy_evaluations`, `shadow_decisions`, `bundle_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
 8. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
 9. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
+   - 현재 철학상 `safety_5m`는 emergency exit 품질을 보는 계층이지, profit protect 감축 빈도를 높이는 계층이 아니다.
 10. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, promotion blocked 상태를 확인한다.
 
 ## 4. 원인별 해석 가이드
@@ -299,7 +300,10 @@
 - `replay_runs`
 - `retrieval_evaluations`
 - `long_term_memory`
+  - contract cutover 직후에는 legacy `scale out` / `profit protect` lesson이 retire 되었는지 본다
+  - 필요하면 `python -m tools.migrate_contract_cutover_20260310 --db-path data/gpt_trader.db`를 한 번 실행해 learning surface를 정리한다
   - runtime retrieval과 batch reconciliation이 같은 lifecycle pool을 읽는지 본다. 오래된 active rule이 recent cap 때문에 사라지면 해석이 틀어진다.
+  - 다만 최근 15m/5m 규칙 수정은 long-term memory보다 candidate policy / promotion에 먼저 직접 반영된다.
 - `learning_artifacts`
   - `journal_reranker_profile`, `similar_case_reranker_profile`, `shadow_model_dataset`, `learning_liveness`가 최근 배치에서 갱신됐는지 본다.
 - `candidate_lessons`

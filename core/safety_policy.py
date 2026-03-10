@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, Optional
 
 from core.models import AccountState, OrderIntent
@@ -13,8 +13,7 @@ class SafetyPolicyEngine:
         "risk_trigger_exit_count": 1,
         "microstructure_exit_spread_percentile": 85.0,
         "microstructure_exit_depth_percentile": 15.0,
-        "profit_protect_trigger_pct": 1.0,
-        "profit_protect_reduce_fraction": 0.35,
+        "microstructure_exit_confirmations": 2,
         "stale_order_minutes": 12.0,
         "stale_order_risk_trigger_count": 1,
         "stale_order_reprice_enabled": True,
@@ -200,53 +199,46 @@ class SafetyPolicyEngine:
 
     def _evaluate_symbol_state(self, position, snapshot, open_orders, config: Dict[str, Any]) -> Dict[str, Any]:
         symbol = str(getattr(position, "symbol", "") or "")
-        pnl_pct = self._safe_float(getattr(position, "unrealized_pnl_pct", None)) or 0.0
-        spread_percentile = self._safe_float(getattr(snapshot, "spread_percentile_1h", None))
-        depth_percentile = self._safe_float(getattr(snapshot, "depth_percentile_1h", None))
-        risk_trigger_reasons = list(getattr(snapshot, "risk_trigger_reasons", []) or []) if snapshot is not None else []
+        pnl_pct = self._select_loss_metric_pct(position)
         state = "stable"
         action = "HOLD"
         reason = f"{symbol} remains inside the 5m safety envelope."
         exit_reason = None
-        reduce_fraction = float(config["profit_protect_reduce_fraction"])
         severity = 0.1
-
-        microstructure_degraded = (
-            spread_percentile is not None
-            and spread_percentile >= float(config["microstructure_exit_spread_percentile"])
-            and depth_percentile is not None
-            and depth_percentile <= float(config["microstructure_exit_depth_percentile"])
-        )
         stale_orders = self._count_stale_orders(open_orders, float(config["stale_order_minutes"]))
+        liquidity_exit_confirmed = self._is_microstructure_exit_confirmed(
+            symbol,
+            config,
+            min_risk_trigger_count=int(config["risk_trigger_exit_count"]),
+        )
+        stale_order_liquidity_risk = self._is_microstructure_exit_confirmed(
+            symbol,
+            config,
+            min_risk_trigger_count=int(config["stale_order_risk_trigger_count"]),
+        )
 
         if pnl_pct <= float(config["loss_exit_pct"]):
             state = "acute_loss"
             action = "EXIT"
-            reason = f"{symbol} breached the 5m safety loss threshold at {pnl_pct:.2f}%."
+            reason = f"{symbol} breached the 5m safety account-loss threshold at {pnl_pct:.2f}%."
             exit_reason = "emergency_exit"
             severity = 1.0
-        elif len(risk_trigger_reasons) >= int(config["risk_trigger_exit_count"]) and microstructure_degraded:
+        elif liquidity_exit_confirmed:
             state = "liquidity_risk"
             action = "EXIT"
-            reason = f"{symbol} has concurrent risk triggers and degraded microstructure."
+            reason = f"{symbol} confirmed liquidity deterioration across consecutive safety snapshots."
             exit_reason = "liquidity_exit"
             severity = 0.98
-        elif stale_orders >= 1 and len(risk_trigger_reasons) >= int(config["stale_order_risk_trigger_count"]) and microstructure_degraded:
+        elif stale_orders >= 1 and stale_order_liquidity_risk:
             state = "stale_order_risk"
             action = "EXIT"
             reason = f"{symbol} has stale working orders while trigger quality deteriorates."
             exit_reason = "emergency_exit"
             severity = 0.94
-        elif pnl_pct >= float(config["profit_protect_trigger_pct"]) and len(risk_trigger_reasons) >= 1:
-            state = "protect_profit"
-            action = "REDUCE"
-            reason = f"{symbol} is in profit but 5m risk signals increased, so safety policy trims exposure."
-            exit_reason = "scale_out"
-            severity = 0.68
 
         order = None
-        if action in ("REDUCE", "EXIT"):
-            order = self._build_reduce_order(position, action, reduce_fraction)
+        if action == "EXIT":
+            order = self._build_reduce_order(position, action, 1.0)
 
         return {
             "symbol": symbol,
@@ -424,3 +416,59 @@ class SafetyPolicyEngine:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _select_loss_metric_pct(self, position) -> float:
+        account_pnl_pct = self._safe_float(getattr(position, "account_unrealized_pnl_pct", None))
+        if account_pnl_pct is not None:
+            return account_pnl_pct
+        return self._safe_float(getattr(position, "unrealized_pnl_pct", None)) or 0.0
+
+    def _is_microstructure_exit_confirmed(
+        self,
+        symbol: str,
+        config: Dict[str, Any],
+        *,
+        min_risk_trigger_count: int,
+    ) -> bool:
+        required = max(1, int(config.get("microstructure_exit_confirmations", 2) or 1))
+        rows = self._get_recent_market_history(symbol, lookback_minutes=max(15, required * 10), limit=required)
+        if len(rows) < required:
+            return False
+        return all(
+            self._row_meets_microstructure_exit(
+                row,
+                spread_threshold=float(config["microstructure_exit_spread_percentile"]),
+                depth_threshold=float(config["microstructure_exit_depth_percentile"]),
+                min_risk_trigger_count=min_risk_trigger_count,
+            )
+            for row in rows[-required:]
+        )
+
+    def _get_recent_market_history(self, symbol: str, lookback_minutes: int, limit: int) -> list[dict]:
+        fetcher = getattr(self.state_store, "get_market_snapshot_history_between", None)
+        if not callable(fetcher) or not symbol:
+            return []
+        end_dt = datetime.now(UTC).replace(tzinfo=None)
+        start_dt = end_dt - timedelta(minutes=max(1, int(lookback_minutes or 1)))
+        rows = fetcher(symbol, start_timestamp=start_dt, end_timestamp=end_dt, limit=max(limit * 3, limit)) or []
+        return [dict(row) for row in rows][-limit:]
+
+    def _row_meets_microstructure_exit(
+        self,
+        row: dict,
+        *,
+        spread_threshold: float,
+        depth_threshold: float,
+        min_risk_trigger_count: int,
+    ) -> bool:
+        spread_percentile = self._safe_float(row.get("spread_percentile_1h"))
+        depth_percentile = self._safe_float(row.get("depth_percentile_1h"))
+        payload = dict(row.get("payload") or {})
+        risk_trigger_reasons = list(payload.get("risk_trigger_reasons") or [])
+        return (
+            spread_percentile is not None
+            and spread_percentile >= spread_threshold
+            and depth_percentile is not None
+            and depth_percentile <= depth_threshold
+            and len(risk_trigger_reasons) >= int(min_risk_trigger_count)
+        )

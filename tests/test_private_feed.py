@@ -100,6 +100,7 @@ class TestPrivateFeed(unittest.TestCase):
         state = feed.get_account_state(["BTCUSDT"])
         self.assertIsNotNone(state)
         self.assertEqual(state.total_balance, 1500.0)
+        self.assertAlmostEqual(state.positions[0].account_unrealized_pnl_pct, 12.5 / 1500.0 * 100)
 
     def test_feed_stays_healthy_when_first_private_event_arrives_after_reconcile_bootstrap(self):
         feed = ControlledTimeFeed(
@@ -308,6 +309,7 @@ class TestPrivateFeed(unittest.TestCase):
 
         self.assertIsNotNone(state)
         self.assertEqual(state.positions[0].symbol, "BTCUSDT")
+        self.assertAlmostEqual(state.positions[0].account_unrealized_pnl_pct, 10.0 / 1500.0 * 100)
 
     def test_transport_heartbeat_keeps_feed_healthy_without_account_events(self):
         feed = ControlledTimeFeed(

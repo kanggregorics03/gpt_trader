@@ -346,12 +346,14 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
   - `AlphaPolicyEngine`이 먼저 레짐별 진입 필터를 적용하고, 통과한 심볼만 AI 판단 대상으로 보낸다
 - `15m`
   - 포지션/주문 관리 중심
-  - 기본적으로 신규 진입보다 `REDUCE`, `EXIT`, `CANCEL`, 주문 정리 쪽으로 제한
+  - 기본적으로 신규 진입보다 `EXIT`, `CANCEL`, 주문 정리 쪽으로 제한
+  - 작은 음수 손익만으로 바로 꺾지 않고, 하드 손절 또는 invalidation 근접 같은 thesis 약화 신호가 있을 때만 청산한다
   - 기본 경로는 AI가 아니라 `PositionPolicyEngine` FSM이며, 예외시만 AI가 다시 본다
 - `5m`
   - execution safety 중심
   - active trigger 구간에서 더 짧은 주기로 실행 품질과 급변 리스크를 감시
-  - 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이며, 신규 진입은 만들지 않고 `HOLD / REDUCE / EXIT / CANCEL`만 다룬다
+  - 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이며, 신규 진입은 만들지 않고 `HOLD / EXIT / CANCEL / REPLACE_ENTRY`만 다룬다
+  - acute account-loss, stale order execution 문제, 연속 확인된 liquidity deterioration 같은 emergency path만 다룬다
   - 포지션이 사라진 뒤에는 recent execution / close만으로 `5m`를 유지하지 않고 `15m` 관리 주기로 즉시 내린다
 
 이 구조는 `1h = alpha loop`, `15m = position management loop`, `5m = execution safety loop`라는 역할 분리를 따른다.
@@ -487,6 +489,7 @@ LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 �
   - 성능 우위 시 champion 승격
 - `position_15m`
   - FSM 관리 정책 후보 생성
+  - recent trade case의 invalidation 거리와 microstructure stress를 읽어 `invalidation_reduce_distance_atr`, liquidity exit 임계치를 함께 튜닝
   - shadow decision과 실제 outcome을 비교
   - 성능 우위 시 champion 승격
 - `execution_5m`
@@ -495,6 +498,7 @@ LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 �
   - context bucket별 champion profile 승격
 - `safety_5m`
   - 5분 safety FSM 후보 생성
+  - acute exit 후보만 shadow로 비교하며, 과거 `risk_reduce` 보너스는 더 이상 승격 점수에 반영하지 않음
   - live safety decision과 shadow candidate 차이를 저장
   - 손실 회피 효과가 확인되면 champion 승격
 - `exposure_budget`
@@ -513,6 +517,11 @@ AI 출력은 `TradeIntent`다.
 
 프롬프트도 이제 `loop_mode`와 `cycle_role`을 직접 입력으로 받는다.
 즉 `1h`에서는 전략 판단, `15m`에서는 포지션 관리, `5m`에서는 execution safety 제약을 프롬프트 레벨에서도 명시적으로 따른다.
+
+추가로 live position이 남아 있으면 `1h`도 예외 없이
+`trade_consistency_management` 역할로 내려간다.
+이때는 기존 `trade_case_id` / `thesis_id` / `management_template_id`를 유지한 채
+`HOLD/EXIT/CANCEL/REPLACE_ENTRY`만 허용하고 새 진입 thesis는 만들지 않는다.
 
 - `decision`
   - `HOLD`, `BUY`, `SELL`, `REDUCE`, `EXIT`, `CANCEL`, `REPLACE_ENTRY`
@@ -693,6 +702,16 @@ context_budget:
 
 - `daily_max_loss_pct: 3.0`
   - 하루 손익률이 `-3.0%` 이하로 내려가면 신규 진입은 kill-switch에 걸린다.
+  - 이 값은 일중 계좌 가드레일이지, 개별 포지션 손절 퍼센트가 아니다.
+- `position_policy.losing_exit_pct`, `safety_policy.loss_exit_pct`
+  - 15m/5m deterministic 손절은 포지션의 `account_unrealized_pnl_pct`를 기준으로 본다.
+  - 즉 `미실현손익 / 총자본 * 100` 기준이며, 레버리지로 증폭된 `margin ROE%`를 그대로 손절 트리거로 쓰지 않는다.
+- `position_policy.invalidation_reduce_distance_atr`
+  - 15m 관리 루프는 단순히 약손실이라고 줄이지 않는다.
+  - 보유 시간이 지난 뒤 `distance_to_invalid_level`이 이 ATR 임계값 안으로 들어왔을 때만 thesis weaken 청산을 허용한다.
+- `position_policy.microstructure_exit_confirmations`, `safety_policy.microstructure_exit_confirmations`
+  - 15m/5m liquidity exit는 단일 snapshot 노이즈로 발동하지 않는다.
+  - 최근 market snapshot history에서 연속으로 spread/depth 악화와 risk trigger가 확인될 때만 deterministic exit로 승격한다.
 - `max_consecutive_losses: 3`
   - 현재 UTC 일자(`00:00 UTC` 이후) 안에서 손실 종료가 3번 연속 누적되면 신규 진입은 kill-switch에 걸린다.
   - 전일 손실 streak는 다음 UTC day boundary에서 리셋된다.
@@ -1096,6 +1115,7 @@ policy 평가에도 같은 opportunity cost를 함께 반영한다.
 
 이 테이블은 케이스 경과 중의 가격/체결 품질/손익률 변화를 누적해서 나중에 excursion, slippage 문맥, 실패 패턴 복기에 사용한다.  
 run cycle 때뿐 아니라 scheduler poll 구간에서도 active case를 경량 샘플링해서 `mark_price`/`mid_price`/`unrealized_pnl_pct` 경로를 더 촘촘히 남긴다.
+여기 저장되는 `unrealized_pnl_pct`는 포지션/증거금 기준 ROE 경로이고, 15m/5m 손절 FSM이 보는 계좌 기준 손실률은 별도 runtime 필드(`account_unrealized_pnl_pct`)로 계산한다.
 
 ### `trade_case_vector_index`
 
@@ -1726,6 +1746,8 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - stale entry order가 오래됐지만 execution quality가 아직 괜찮으면 decision은 `REPLACE_ENTRY`로 분리되고, 내부 leg는 `CANCEL + BUY/SELL LIMIT`로 표현된다.
 - `REPLACE_ENTRY`의 replacement leg는 cancel confirmation 전에는 제출되지 않는다. cancel receipt가 미확정이면 `deferred_waiting_cancel` 상태로 남고 다음 관리 사이클에서 이어서 처리한다.
 - order runtime/state transition에는 `replace_group_id`, parent order id, lineage role이 함께 저장돼 원래 주문 -> 취소 -> 대체 주문 흐름을 추적할 수 있다.
+- live position이 있으면 `1h` 전략 루프도 새 엔트리를 열지 않고 기존 케이스 관리만 수행한다.
+- 즉 한 번 열린 트레이드는 기본적으로 같은 `trade_case_id` / `thesis_id` 아래에서 관리되고, 반대 새 thesis로 즉시 뒤집는 행동은 허용하지 않는다.
 - 주문 실행 중 일반 예외가 나면 receipt에 `failed` 상태로 남는다.
 - 알림 웹훅이 없으면 알림은 로그만 남기고 종료한다.
 
@@ -1857,6 +1879,16 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 프로젝트의 철학, 의도된 편향, 프롬프트 계약, 학습/승격 원칙은 [`SYSTEM_PHILOSOPHY.md`](./SYSTEM_PHILOSOPHY.md)에 따로 정리했다.
 현재 한계와 다음 단계 우선순위는 [`IMPROVEMENT_ROADMAP.md`](./IMPROVEMENT_ROADMAP.md)에 정리했다.
 
+최근 15m/5m 수정 방향도 이 철학과 같다.
+
+- `1h`는 기본적으로 thesis 생성, live position이 있으면 새 thesis 금지
+- `15m`는 thesis-aware management, 약손실 자체보다 invalidation 근접과 시간 경과를 우선
+- `5m`는 execution safety emergency path만 담당
+- 정책 진화는 즉시 반응하지만 `long_term_memory`는 새 사례가 누적되며 천천히 반영
+- `2026-03-10` contract cutover 이후 batch learning은 기본적으로 그 날짜 이후 journal/trade_case만 학습에 사용한다.
+- 과거 `audit_logs` / `journal` / `trade_cases` / `shadow_decisions`는 사실 이력으로 보존하고, `policy_registry` / `candidate_policy_versions` / `long_term_memory`만 soft-migration 한다.
+- 일회성 정리가 필요하면 `python -m tools.migrate_contract_cutover_20260310 --db-path data/gpt_trader.db`로 DB 백업 후 migration summary를 남긴다.
+
 ## 권장 운영 순서
 
 1. Bybit Demo Trading 키로 시작하고 `BYBIT_TRADING_MODE=demo`로 둔다.
@@ -1870,20 +1902,21 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 
 ## 참고 파일
 
-- 메인 엔트리포인트 facade: [`main.py`](/c:/gpt_trader/main.py)
-- 오케스트레이터 구현: [`orchestrator/bootstrap.py`](/c:/gpt_trader/orchestrator/bootstrap.py)
-- 정책 파일: [`policy.yaml`](/c:/gpt_trader/policy.yaml)
-- 데이터 모델: [`core/models.py`](/c:/gpt_trader/core/models.py)
-- 리스크 엔진: [`core/risk_engine.py`](/c:/gpt_trader/core/risk_engine.py)
-- 상태 저장소 facade: [`db/state_store.py`](/c:/gpt_trader/db/state_store.py)
-- 상태 저장소 구현: [`db/state_store_parts/trade_case_repository.py`](/c:/gpt_trader/db/state_store_parts/trade_case_repository.py)
-- 의사결정 엔진: [`ai/decision_engine.py`](/c:/gpt_trader/ai/decision_engine.py)
-- 실행 엔진: [`exchange/execution_engine.py`](/c:/gpt_trader/exchange/execution_engine.py)
-- 메모리 배치: [`batch/memory_updater.py`](/c:/gpt_trader/batch/memory_updater.py)
-- 리플레이 도구: [`tools/replay_audit.py`](/c:/gpt_trader/tools/replay_audit.py)
-- 시스템 철학: [`SYSTEM_PHILOSOPHY.md`](/c:/gpt_trader/SYSTEM_PHILOSOPHY.md)
-- 개선 로드맵: [`IMPROVEMENT_ROADMAP.md`](/c:/gpt_trader/IMPROVEMENT_ROADMAP.md)
-- 대시보드: [`dashboard/app.py`](/c:/gpt_trader/dashboard/app.py)
+- 메인 엔트리포인트 facade: [`main.py`](./main.py)
+- 오케스트레이터 구현: [`orchestrator/bootstrap.py`](./orchestrator/bootstrap.py)
+- 정책 파일: [`policy.yaml`](./policy.yaml)
+- 데이터 모델: [`core/models.py`](./core/models.py)
+- 리스크 엔진: [`core/risk_engine.py`](./core/risk_engine.py)
+- 상태 저장소 facade: [`db/state_store.py`](./db/state_store.py)
+- 상태 저장소 구현: [`db/state_store_parts/`](./db/state_store_parts/)
+- 의사결정 엔진: [`ai/decision_engine.py`](./ai/decision_engine.py)
+- 실행 엔진: [`exchange/execution_engine.py`](./exchange/execution_engine.py)
+- 메모리 배치: [`batch/memory_updater.py`](./batch/memory_updater.py)
+- 계약 컷오버 마이그레이션: [`tools/migrate_contract_cutover_20260310.py`](./tools/migrate_contract_cutover_20260310.py)
+- 리플레이 도구: [`tools/replay_audit.py`](./tools/replay_audit.py)
+- 시스템 철학: [`SYSTEM_PHILOSOPHY.md`](./SYSTEM_PHILOSOPHY.md)
+- 개선 로드맵: [`IMPROVEMENT_ROADMAP.md`](./IMPROVEMENT_ROADMAP.md)
+- 대시보드: [`dashboard/app.py`](./dashboard/app.py)
 ## 실행 정책
 
 주문 타입은 더 이상 전역 `market` 또는 `limit` 고정이 아니다.

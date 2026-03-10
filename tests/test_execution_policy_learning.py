@@ -109,6 +109,71 @@ class TestExecutionPolicyLearning(unittest.TestCase):
         )
         self.assertTrue(any(item["domain"] == "position_15m" for item in candidates))
 
+    def test_memory_updater_builds_position_candidate_with_invalidation_controls(self):
+        updater = MemoryUpdater.__new__(MemoryUpdater)
+        candidates = updater._build_candidate_policies(
+            stats_package_seed={
+                "candidate_lessons": [],
+                "trade_case_patterns": {"failure_reason_counts": {}},
+            },
+            trade_cases=[
+                {
+                    "status": "closed",
+                    "risk_mode": "normal",
+                    "estimated_pnl_pct": -1.1,
+                    "risk_trigger_reasons": ["wide_spread", "elevated_funding"],
+                    "payload": {
+                        "regime_tags": ["trend:aligned_up", "volatility:high"],
+                        "feature_snapshot": {
+                            "distance_to_invalid_level": 0.62,
+                            "spread_percentile_1h": 92.0,
+                            "depth_percentile_1h": 11.0,
+                        },
+                    },
+                },
+                {
+                    "status": "closed",
+                    "risk_mode": "normal",
+                    "estimated_pnl_pct": -0.7,
+                    "risk_trigger_reasons": ["wide_spread", "elevated_funding"],
+                    "payload": {
+                        "regime_tags": ["trend:aligned_up", "volatility:high"],
+                        "feature_snapshot": {
+                            "distance_to_invalid_level": 0.55,
+                            "spread_percentile_1h": 90.0,
+                            "depth_percentile_1h": 12.0,
+                        },
+                    },
+                },
+                {
+                    "status": "closed",
+                    "risk_mode": "normal",
+                    "estimated_pnl_pct": 0.1,
+                    "risk_trigger_reasons": ["wide_spread"],
+                    "payload": {
+                        "regime_tags": ["trend:aligned_up", "volatility:high"],
+                        "feature_snapshot": {
+                            "distance_to_invalid_level": 0.9,
+                            "spread_percentile_1h": 89.0,
+                            "depth_percentile_1h": 13.0,
+                        },
+                    },
+                },
+            ],
+            execution_policy_recommendations=[],
+        )
+
+        position_candidate = next(
+            item
+            for item in candidates
+            if item["domain"] == "position_15m" and item["metrics"].get("seed_type") == "trade_case_position"
+        )
+        self.assertEqual(position_candidate["regime_key"], "aligned_up|high")
+        self.assertLess(position_candidate["config"]["invalidation_reduce_distance_atr"], 0.75)
+        self.assertLess(position_candidate["config"]["microstructure_exit_spread_percentile"], 90.0)
+        self.assertGreater(position_candidate["config"]["microstructure_exit_depth_percentile"], 12.0)
+        self.assertEqual(position_candidate["config"]["microstructure_exit_confirmations"], 2)
+
     def test_memory_updater_builds_alpha_candidate_policy_from_trade_cases(self):
         updater = MemoryUpdater.__new__(MemoryUpdater)
         candidates = updater._build_candidate_policies(
@@ -277,6 +342,30 @@ class TestExecutionPolicyLearning(unittest.TestCase):
 
         self.assertEqual(evaluations[0]["evaluation_scope"], "shadow")
         self.assertEqual(evaluations[0]["score"], 1.1)
+
+    def test_memory_updater_does_not_reward_legacy_safety_risk_reduce_shadow(self):
+        updater = MemoryUpdater.__new__(MemoryUpdater)
+        updater.state_store = type("Store", (), {})()
+        evaluations = updater._evaluate_candidate_policies(
+            [
+                {
+                    "id": 22,
+                    "domain": "safety_5m",
+                    "policy_type": "execution_safety_fsm",
+                    "metrics": {"support_count": 4, "utility_score": 0.0},
+                }
+            ],
+            shadow_decisions=[
+                {
+                    "candidate_policy_id": 22,
+                    "divergence_type": "risk_reduce",
+                    "outcome_estimated_pnl_pct": -1.1,
+                }
+            ],
+        )
+
+        self.assertEqual(evaluations[0]["evaluation_scope"], "shadow")
+        self.assertEqual(evaluations[0]["score"], -1.1)
 
 
 if __name__ == "__main__":

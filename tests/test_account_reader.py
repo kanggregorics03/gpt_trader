@@ -156,6 +156,7 @@ class TestAccountReader(unittest.TestCase):
         self.assertEqual(position.maintenance_margin, 18.0)
         self.assertEqual(position.margin_mode, "isolated")
         self.assertAlmostEqual(position.unrealized_pnl_pct, 12.5 / 300.0 * 100)
+        self.assertAlmostEqual(position.account_unrealized_pnl_pct, 12.5 / 1500.0 * 100)
 
         open_order = state.open_orders[0]
         self.assertEqual(open_order.symbol, "BTCUSDT")

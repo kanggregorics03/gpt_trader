@@ -141,7 +141,16 @@ decision_engine (provider adapter)
 Gemini / OpenAI(GPT) / DeepSeek / Anthropic(Claude)를 adapter로 선택할 수 있다
 
 프롬프트는 `loop_mode`와 `cycle_role`을 함께 받아 루프별 제약을 직접 반영한다.
+
+최근 규칙에서는 일관성 유지를 위해 `1h`도 완전히 자유로운 진입 루프가 아니다.
+live position이 있으면 `1h`의 `cycle_role`은
+`trade_consistency_management`로 강등되고, 기존 trade case를 유지하는 관리 액션만 허용한다.
+즉 새로운 entry thesis를 같은 심볼 위에 덮어쓰지 않고,
+기존 `trade_case_id` / `thesis_id` / `management_template_id`를 따라 `HOLD/EXIT/CANCEL/REPLACE_ENTRY`
+범위 안에서만 후속 결정을 내리게 한다.
 따라서 `5m`는 프롬프트 레벨에서도 신규 진입 금지, `15m`는 관리 중심, `1h`만 신규 방향성 판단이라는 계약을 공유한다.
+추가로 `15m`는 단순 약손실만으로 줄이지 않고 invalidation 근접 시점에서만 thesis weaken 청산을 허용하며,
+`5m`는 acute loss, stale execution failure, 연속 확인된 liquidity deterioration 같은 emergency path만 deterministic하게 처리한다.
 
 JSON mode가 가능한 provider는 native JSON 응답을 우선 사용하고, 그렇지 않은 경우에도 JSON-only 지시와 Pydantic 검증을 함께 사용한다
 
@@ -173,10 +182,17 @@ long_term_memory_updater (Batch)
 
 - `alpha_1h` 진입 필터 후보 생성/평가/승격
 - `position_15m` FSM 관리 정책 후보 생성/평가/승격
+  - trade case의 invalidation 거리와 microstructure stress를 읽어 thesis weaken / liquidity exit 파라미터를 함께 조정
 - `safety_5m` execution safety FSM 후보 생성/평가/승격
+  - emergency exit 중심 shadow divergence만 승격 근거로 사용하고 legacy `risk_reduce` 가점은 사용하지 않음
 - `execution_5m` market/limit 및 execution profile 추천/승격
 - `exposure_budget` 레짐별 최대 참여율/entry multiplier 추천/승격
 - 레짐별 `policy_bundle` 생성/평가/승격/rollback
+- legacy management contract 정리
+  - `policy_registry` champion config에서 구 `reduce/profit_protect` 키를 제거한다
+  - `candidate_policy_versions`의 legacy 15m/5m 후보는 `retired`로 내린다
+  - `long_term_memory`의 obvious `scale out` / `profit protect` lesson은 soft-retire 한다
+  - 사실 이력 테이블은 보존하고, 학습 입력은 `2026-03-10` cutover 이후 window로 제한한다
 
 monitoring & alert
 
@@ -240,12 +256,13 @@ active management 대상:
 역할: execution safety, trigger deterioration 대응, emergency de-risking
 
 기본 경로는 AI가 아니라 `SafetyPolicyEngine` FSM이다.
-5분 루프는 신규 진입을 만들지 않고 HOLD/REDUCE/EXIT/CANCEL만 다룬다.
+5분 루프는 신규 진입을 만들지 않고 HOLD/EXIT/CANCEL/REPLACE_ENTRY만 다룬다.
+즉 일반적인 profit protect나 thesis 관리 감축보다 응급 청산과 stale order 정리가 우선이다.
 
 즉, strong trigger가 떠도 flat 상태에서 관리 대상이 없으면 5분 cadence가 바로 선점하지 않는다. 5분은 trigger와 관리 필요가 동시에 있을 때만 승격되고, trigger가 사라지면 포지션/주문 상태에 따라 15분 또는 1시간으로 강등된다.
 
 5분 루프는 방향 예측보다 실행/안전 계층에 가깝다.
-`SafetyPolicyEngine`이 먼저 HOLD/REDUCE/EXIT/CANCEL을 결정하고, 실제 주문이 생기면 `ExecutionPolicyEngine`이 market/limit, urgency, execution profile을 결정한다.
+`SafetyPolicyEngine`이 먼저 HOLD/EXIT/CANCEL/REPLACE_ENTRY를 결정하고, 실제 주문이 생기면 `ExecutionPolicyEngine`이 market/limit, urgency, execution profile을 결정한다.
 
 4.1.1 스냅샷 materialization
 
@@ -654,6 +671,12 @@ slippage, thesis_failure_reason, feature_vector를 함께 저장한다
 
 추가로 trade_case_snapshots 테이블을 두어 active/just-closed case의 cycle별 current_price, spread, volume_ratio,
 unrealized_pnl_pct 경로를 저장한다
+
+여기 저장되는 `unrealized_pnl_pct`는 포지션/증거금 기준 ROE 경로다.
+최근 수정에서는 deterministic 15m/5m 손절 FSM이 별도 runtime 필드인 `account_unrealized_pnl_pct`
+(`미실현손익 / 총자본 * 100`)를 우선 사용하도록 분리했다.
+또한 15m thesis weaken 청산은 `distance_to_invalid_level`이 가까워졌을 때만 허용하고,
+15m/5m liquidity exit는 market snapshot history에서 연속 확인이 있어야만 발동하게 해 단발성 microstructure noise 청산을 줄인다.
 
 observed MFE/MAE는 단일 cycle 값이 아니라 이 snapshot 경로를 다시 읽어 재계산한다
 가능하면 entry/exit audit의 fill timestamp를 복원해 실제 체결 구간 안쪽 경로만 우선 사용한다
