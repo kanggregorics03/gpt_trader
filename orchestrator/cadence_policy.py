@@ -163,10 +163,12 @@ class TradingCadencePolicyMixin:
             self.run_recovery_sweep()
             self.last_recovery_sweep_at = time.time()
 
+        daily_batch_config = self._build_daily_batch_config()
         now_local = datetime.now().astimezone()
         if (
-            now_local.hour == 4
-            and now_local.minute == 0
+            daily_batch_config.get("enabled", True)
+            and now_local.hour == daily_batch_config["run_hour_local"]
+            and now_local.minute == daily_batch_config["run_minute_local"]
             and self.last_daily_batch_date != now_local.date().isoformat()
         ):
             self.run_daily_batch()

@@ -1,5 +1,6 @@
 
 import hashlib
+import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -689,6 +690,12 @@ class TradingBootstrapMixin:
         self.last_close_at = None
         self.last_recovery_sweep_at = 0.0
         self.last_daily_batch_date = None
+        self.daily_batch_running = False
+        self.daily_batch_started_at = None
+        self.daily_batch_finished_at = None
+        self.daily_batch_last_status = None
+        self._daily_batch_thread = None
+        self._daily_batch_lock = threading.Lock()
         self.last_trade_case_snapshot_at = 0.0
         self.last_similar_case_matches = []
         self._learning_artifact_cache = {}

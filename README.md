@@ -660,6 +660,13 @@ intervals:
   position_loop_minutes: 15
   trigger_loop_minutes: 5
 
+daily_batch:
+  enabled: true
+  run_hour_local: 4
+  run_minute_local: 0
+  replay_timeout_seconds: 1800
+  memory_timeout_seconds: 1800
+
 execution_guards:
   loop_lock_ttl_seconds: 240
   decision_cooldown_minutes: 10
@@ -701,6 +708,10 @@ context_budget:
   - 루프 전역 락, 심볼별 entry mutex, 반복 판단 쿨다운, unknown 주문 상태 감시/복구 주기, recent close/loss 뒤 심볼 재진입 유예 시간을 정책에서 조정한다.
   - recent symbol re-entry guard는 `완전히 flat`일 때만 강하게 적용된다. 포지션, working order, active trade case가 남아 있으면 재진입 가드는 cycle risk state에 실리지 않는다.
   - startup 시 policy validator가 단일 심볼 구성, stale reprice 값 범위, re-entry cooldown 관계를 함께 검증한다.
+- `daily_batch`
+  - replay batch와 memory updater는 스케줄 시각에 백그라운드로 시작되고, 메인 trading loop를 블록하지 않는다.
+  - 각 subprocess는 timeout을 가지며, hang 되어도 adaptive loop와 recovery sweep은 계속 돈다.
+  - 수동 실행(`python -m batch.memory_updater`)과 별개로 자동 스케줄의 시각과 timeout만 제어한다.
 - `context_budget`
   - Retrieval note: recent journal candidates now mix a recent slice with semantic anchor rows such as `good_hold`, `missed_opportunity_hold`, and loss/risk outcomes.
   - Lifecycle note: runtime `long_term_memory` retrieval and batch reconciliation now read the same full lifecycle-managed pool instead of separate recent caps.
@@ -1617,6 +1628,7 @@ GEMINI_API_KEY="your_gemini_api_key_here"
 - 모드별 리스크 프로파일
 - 루프 주기
 - replay batch 설정
+- daily batch 스케줄/timeout
 
 ## 실행 방법
 
@@ -1625,6 +1637,9 @@ GEMINI_API_KEY="your_gemini_api_key_here"
 ```powershell
 python main.py
 ```
+
+자동 스케줄의 replay batch + memory updater는 백그라운드 데몬 스레드에서 별도 subprocess로 실행된다.  
+따라서 daily batch가 오래 걸리거나 timeout 되어도 메인 adaptive loop, snapshot materialization, recovery sweep은 계속 진행된다.
 
 대시보드 실행:
 

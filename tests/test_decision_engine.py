@@ -264,6 +264,85 @@ class TestDecisionEngine(unittest.TestCase):
             store.close()
             tmpdir.cleanup()
 
+    def test_generate_decision_normalizes_common_llm_schema_drift(self):
+        class DummyResponse:
+            text = (
+                '{"decision":"hold","orders":{"symbol":"ethusdt","action":"buy","order_type":"market",'
+                '"quantity":"0.01","reduce_only":"false"},"rationale":"ETHUSDT shows mixed signals and '
+                'recent losses warrant caution.","rationale_items":[{"summary":"Action list leaked into '
+                'evidence","why_it_matters":"Schema drift should not force a HOLD fallback.",'
+                '"trade_implication":"Prefer hold while keeping the payload machine-readable.","evidence":'
+                '[{"signal":"valid_actions","symbol":"ETHUSDT","timeframe":"risk","operator":"eq",'
+                '"observed_value":["HOLD","REDUCE","EXIT","CANCEL","REPLACE_ENTRY"],'
+                '"threshold":["HOLD","REDUCE","EXIT","CANCEL","REPLACE_ENTRY"],'
+                '"source":"policy_summary.valid_actions"}]}],"risk_notes":"Wait for cleaner trigger.",'
+                '"confidence":"0.55"}'
+            )
+            usage_metadata = {}
+
+        class DummyProvider:
+            @staticmethod
+            def generate_json(**kwargs):
+                return DummyResponse()
+
+        class AcceptingValidator:
+            @staticmethod
+            def validate(request, intent):
+                class Result:
+                    is_valid = True
+                    issues = []
+
+                return Result()
+
+        engine = DecisionEngine.__new__(DecisionEngine)
+        engine.client = None
+        engine.provider_name = "deepseek"
+        engine.llm_provider = DummyProvider()
+        engine.flash_model = "deepseek-reasoner"
+        engine.pro_model = "deepseek-reasoner"
+        engine.cache_store = None
+        engine.intent_validator = AcceptingValidator()
+
+        request = DecisionRequest(
+            policy_summary="valid_actions: [HOLD, REDUCE, EXIT, CANCEL, REPLACE_ENTRY]",
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=900.0,
+            ),
+            market_snapshot=MarketSnapshot(
+                symbol="ETHUSDT",
+                current_price=2000.0,
+                atr_15m=20.0,
+                atr_1h=40.0,
+                trend_1h="FLAT",
+                recent_volume_surge=False,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            long_term_memory=[],
+        )
+
+        result = engine.generate_decision(request)
+
+        self.assertEqual(result.intent.decision, "HOLD")
+        self.assertEqual(result.intent.rationale, ["ETHUSDT shows mixed signals and recent losses warrant caution."])
+        self.assertEqual(result.intent.risk_notes, ["Wait for cleaner trigger."])
+        self.assertEqual(len(result.intent.orders), 1)
+        self.assertEqual(result.intent.orders[0].symbol, "ETHUSDT")
+        self.assertEqual(result.intent.orders[0].quantity, 0.01)
+        self.assertFalse(result.intent.orders[0].reduce_only)
+        self.assertEqual(
+            result.intent.rationale_items[0].evidence[0].observed_value,
+            "HOLD, REDUCE, EXIT, CANCEL, REPLACE_ENTRY",
+        )
+        self.assertEqual(result.intent.confidence, 0.55)
+        self.assertIn('"decision":"hold"', result.raw_response)
+
     def test_market_snapshots_are_included_in_candidate_hash(self):
         engine = DecisionEngine.__new__(DecisionEngine)
         base_request = DecisionRequest(

@@ -522,6 +522,7 @@ LLM provider는 통계 해석과 교훈 구조화만 수행
 6. 최근 shadow 성과가 크게 악화되면 이전 bundle로 rollback
 7. 같은 배치에서 retrieval reranker artifact와 `shadow_decision_dataset.jsonl`을 생성해 retrieval/decision 보조 모델 학습 기반을 축적
 8. replay batch heartbeat, memory updater heartbeat, replay 처리율로 `learning_liveness`를 계산하고 stale 시 자동 승격을 중지
+9. 운영 스케줄에서 replay batch와 memory updater는 백그라운드 subprocess로 비동기 실행하고 timeout을 둬서, 장기 학습이 메인 trading loop를 멈추지 못하게 한다
 
 8) 리스크 관리(필수 안전장치)
 8.1 회로차단기(Kill switch)
@@ -827,6 +828,8 @@ memory batch 모델은 실시간 의사결정 모델과 분리할 수 있고, `M
 운영 중 룰 수정이 쉬워지고, 모델이 이상한 주문을 제안해도 실행기가 차단
 
 `execution_guards` 섹션에서 loop lock TTL, decision cooldown, entry mutex TTL, unknown state block window, recovery sweep 주기를 조정
+
+`daily_batch` 섹션에서 local schedule 시각과 replay/memory subprocess timeout을 조정하며, 이 배치는 스케줄러 메인 루프와 분리되어 동작해야 한다
 
 11) 보안/운영
 

@@ -84,6 +84,131 @@ class MemoryUpdater:
             explicit_model=os.getenv("MEMORY_MODEL"),
         )
 
+    def _normalize_text(self, value: Any, *, default: str = "") -> str:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            text = value.strip()
+            return text or default
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            parts = [self._normalize_text(item, default="") for item in value]
+            parts = [part for part in parts if part]
+            return ", ".join(parts) or default
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, sort_keys=True, ensure_ascii=True)
+            except TypeError:
+                return str(value)
+        return str(value)
+
+    def _normalize_string_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            normalized = [self._normalize_text(item, default="") for item in value]
+            return [item for item in normalized if item]
+        if isinstance(value, dict):
+            normalized = [
+                f"{key}: {self._normalize_text(item, default='unknown')}"
+                for key, item in value.items()
+                if self._normalize_text(item, default="")
+            ]
+            return normalized
+        normalized = self._normalize_text(value, default="")
+        return [normalized] if normalized else []
+
+    def _coerce_bool(self, value: Any, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"false", "0", "no", "n", "off"}:
+            return False
+        return default
+
+    def _coerce_int(self, value: Any, *, default: int = 0) -> int:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _normalize_memory_condition_payload(self, payload: Any) -> Dict[str, List[str]]:
+        if isinstance(payload, MemoryCondition):
+            raw = payload.model_dump()
+        elif isinstance(payload, dict):
+            raw = dict(payload)
+        else:
+            raw = {}
+        return {
+            "regime": self._normalize_string_list(raw.get("regime")),
+            "volatility": self._normalize_string_list(raw.get("volatility")),
+            "trend": self._normalize_string_list(raw.get("trend")),
+        }
+
+    def _normalize_memory_lesson_payload(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        apply_when = self._normalize_memory_condition_payload(payload.get("apply_when"))
+        evidence_journal_ids = [
+            self._coerce_int(item)
+            for item in (
+                payload.get("evidence_journal_ids")
+                if isinstance(payload.get("evidence_journal_ids"), list)
+                else [payload.get("evidence_journal_ids")]
+            )
+            if item is not None and self._coerce_int(item, default=0) > 0
+        ]
+        category = self._normalize_text(payload.get("category"), default="").lower()
+        if category not in {"lesson", "anti_pattern", "risk_control", "opportunity"}:
+            if self._coerce_bool(payload.get("risk_control"), default=False):
+                category = "risk_control"
+            else:
+                category = "lesson"
+        ignore_when = self._normalize_string_list(payload.get("ignore_when"))
+        if not ignore_when:
+            ignore_when = ["Ignore when live evidence contradicts this lesson."]
+        rule = self._normalize_text(
+            payload.get("rule") or payload.get("title") or payload.get("lesson") or payload.get("summary"),
+            default="Derived lesson from replay evidence.",
+        )
+        regime = self._normalize_text(payload.get("regime"), default="")
+        if not regime:
+            regime = apply_when["regime"][0] if apply_when["regime"] else "general"
+        support_count = max(
+            1,
+            self._coerce_int(
+                payload.get("support_count", payload.get("support", len(evidence_journal_ids) or 1)),
+                default=len(evidence_journal_ids) or 1,
+            ),
+        )
+        return {
+            "rule": rule,
+            "regime": regime,
+            "category": category,
+            "support_count": support_count,
+            "evidence_journal_ids": evidence_journal_ids,
+            "hypothesis": self._coerce_bool(payload.get("hypothesis"), default=False),
+            "apply_when": apply_when,
+            "ignore_when": ignore_when,
+            "trigger_context": self._normalize_text(payload.get("trigger_context"), default=""),
+            "execution_context": self._normalize_text(payload.get("execution_context"), default=""),
+            "trend_context": self._normalize_text(payload.get("trend_context"), default=""),
+            "hold_quality": self._normalize_text(payload.get("hold_quality"), default=""),
+        }
+
     def _fetch_window_entries(self, window_hours: int = 24) -> List[Dict[str, Any]]:
         since = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=window_hours)
         return self.state_store.get_journal_entries_since(since)
@@ -3126,7 +3251,7 @@ Computed statistics:
             return []
 
         candidate_lessons = [
-            MemoryLesson.model_validate(item)
+            MemoryLesson.model_validate(self._normalize_memory_lesson_payload(item))
             for item in stats_package.get("candidate_lessons") or []
         ]
         try:
@@ -3143,7 +3268,10 @@ Computed statistics:
             lessons = json.loads(raw_text)
             if not isinstance(lessons, list):
                 return candidate_lessons
-            generated_lessons = [MemoryLesson.model_validate(item) for item in lessons]
+            generated_lessons = [
+                MemoryLesson.model_validate(self._normalize_memory_lesson_payload(item))
+                for item in lessons
+            ]
             return self._merge_candidate_lessons(candidate_lessons, generated_lessons)
         except Exception as e:
             logger.error(

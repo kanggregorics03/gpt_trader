@@ -3,6 +3,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -39,6 +40,105 @@ from exchange.execution_engine import ExecutionEngine
 from utils.logger import log
 
 class TradingMaintenanceMixin:
+    def _build_daily_batch_config(self):
+        configured = self.risk_engine.policy.get("daily_batch", {})
+        config = dict(self.DEFAULT_DAILY_BATCH)
+        config.update(configured or {})
+        config["enabled"] = bool(config.get("enabled", self.DEFAULT_DAILY_BATCH["enabled"]))
+        config["run_hour_local"] = min(
+            23,
+            max(0, int(config.get("run_hour_local", self.DEFAULT_DAILY_BATCH["run_hour_local"]) or 0)),
+        )
+        config["run_minute_local"] = min(
+            59,
+            max(0, int(config.get("run_minute_local", self.DEFAULT_DAILY_BATCH["run_minute_local"]) or 0)),
+        )
+        config["replay_timeout_seconds"] = max(
+            60,
+            int(
+                config.get(
+                    "replay_timeout_seconds",
+                    self.DEFAULT_DAILY_BATCH["replay_timeout_seconds"],
+                )
+                or 0
+            ),
+        )
+        config["memory_timeout_seconds"] = max(
+            60,
+            int(
+                config.get(
+                    "memory_timeout_seconds",
+                    self.DEFAULT_DAILY_BATCH["memory_timeout_seconds"],
+                )
+                or 0
+            ),
+        )
+        return config
+
+    def _run_batch_subprocess(self, args: list[str], *, timeout_seconds: int, label: str) -> bool:
+        try:
+            subprocess.run(args, check=True, timeout=timeout_seconds)
+            log.info("{} finished successfully.", label)
+            return True
+        except subprocess.TimeoutExpired:
+            log.error("{} timed out after {} seconds.", label, timeout_seconds)
+            return False
+        except Exception as e:
+            log.error(f"{label} failed: {e}")
+            return False
+
+    def _run_daily_batch_worker(self, replay_config: dict, daily_batch_config: dict):
+        final_status = "success"
+        try:
+            if replay_config["enabled"]:
+                log.info("Running incremental replay batch before daily memory updater...")
+                replay_args = [
+                    sys.executable,
+                    "-m",
+                    "tools.replay_audit",
+                    "--auto",
+                    "--limit",
+                    str(replay_config["limit"]),
+                    "--max-limit",
+                    str(replay_config["max_limit"]),
+                    "--coverage-target",
+                    str(replay_config["coverage_target"]),
+                    "--hold-quota",
+                    str(replay_config["hold_quota"]),
+                    "--candidate-pool-limit",
+                    str(replay_config["candidate_pool_limit"]),
+                    "--window-hours",
+                    str(replay_config["window_hours"]),
+                ]
+                if replay_config["save"]:
+                    replay_args.append("--save")
+                replay_ok = self._run_batch_subprocess(
+                    replay_args,
+                    timeout_seconds=daily_batch_config["replay_timeout_seconds"],
+                    label="Incremental replay batch",
+                )
+                if not replay_ok:
+                    final_status = "replay_failed"
+            log.info("Running daily memory updater batch...")
+            memory_ok = self._run_batch_subprocess(
+                [sys.executable, "-m", "batch.memory_updater"],
+                timeout_seconds=daily_batch_config["memory_timeout_seconds"],
+                label="Daily memory updater batch",
+            )
+            if not memory_ok:
+                final_status = "memory_failed" if final_status == "success" else f"{final_status}+memory_failed"
+        except Exception as e:
+            final_status = "unexpected_error"
+            log.error(f"Daily batch worker failed unexpectedly: {e}")
+        finally:
+            finished_at = time.time()
+            with self._daily_batch_lock:
+                self.daily_batch_running = False
+                self.daily_batch_finished_at = finished_at
+                self.daily_batch_last_status = final_status
+                self._daily_batch_thread = None
+            log.info("Daily batch worker finished with status={}", final_status)
+
     def run_recovery_sweep(self):
         log.info("Running unresolved order recovery sweep...")
         try:
@@ -91,41 +191,44 @@ class TradingMaintenanceMixin:
             )
 
     def run_daily_batch(self):
+        daily_batch_config = self._build_daily_batch_config()
+        if not daily_batch_config["enabled"]:
+            log.info("Daily batch disabled; skipping launch.")
+            with self._daily_batch_lock:
+                self.daily_batch_last_status = "disabled"
+            return False
+
         replay_config = self._build_replay_batch_config()
-        if replay_config["enabled"]:
-            log.info("Running incremental replay batch before daily memory updater...")
+        with self._daily_batch_lock:
+            thread = self._daily_batch_thread
+            if self.daily_batch_running or (thread is not None and thread.is_alive()):
+                log.warning("Daily batch already running; skipping new launch.")
+                self.daily_batch_last_status = "already_running"
+                return False
+            self.daily_batch_running = True
+            self.daily_batch_started_at = time.time()
+            self.daily_batch_finished_at = None
+            self.daily_batch_last_status = "running"
+            worker = threading.Thread(
+                target=self._run_daily_batch_worker,
+                args=(replay_config, daily_batch_config),
+                name="daily-batch-worker",
+                daemon=True,
+            )
+            self._daily_batch_thread = worker
             try:
-                replay_args = [
-                    sys.executable,
-                    "-m",
-                    "tools.replay_audit",
-                    "--auto",
-                    "--limit",
-                    str(replay_config["limit"]),
-                    "--max-limit",
-                    str(replay_config["max_limit"]),
-                    "--coverage-target",
-                    str(replay_config["coverage_target"]),
-                    "--hold-quota",
-                    str(replay_config["hold_quota"]),
-                    "--candidate-pool-limit",
-                    str(replay_config["candidate_pool_limit"]),
-                    "--window-hours",
-                    str(replay_config["window_hours"]),
-                ]
-                if replay_config["save"]:
-                    replay_args.append("--save")
-                subprocess.run(replay_args, check=True)
-                log.info("Incremental replay batch finished successfully.")
-            except Exception as e:
-                log.error(f"Incremental replay batch failed: {e}")
-        log.info("Running daily memory updater batch...")
-        try:
-            # Reuse the current interpreter so the batch job sees the same virtualenv.
-            subprocess.run([sys.executable, "-m", "batch.memory_updater"], check=True)
-            log.info("Daily batch finished successfully.")
-        except Exception as e:
-            log.error(f"Daily batch failed: {e}")
+                worker.start()
+            except Exception:
+                self.daily_batch_running = False
+                self.daily_batch_last_status = "launch_failed"
+                self._daily_batch_thread = None
+                raise
+        log.info(
+            "Daily batch launched asynchronously (replay_timeout={}s, memory_timeout={}s).",
+            daily_batch_config["replay_timeout_seconds"],
+            daily_batch_config["memory_timeout_seconds"],
+        )
+        return True
 
     def start_scheduler(self):
         execution_guards = self._build_execution_guards()

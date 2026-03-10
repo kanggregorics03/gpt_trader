@@ -73,6 +73,13 @@ replay_batch:
   candidate_pool_limit: 240
   save: true
 
+daily_batch:
+  enabled: true
+  run_hour_local: 4
+  run_minute_local: 0
+  replay_timeout_seconds: 1800
+  memory_timeout_seconds: 1800
+
 execution_policy:
   allowed_order_types: [market, limit]
   default_entry_order_type: limit

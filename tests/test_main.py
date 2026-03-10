@@ -51,6 +51,13 @@ class DummyRiskEngine:
             "funding_ttl_ms": 180000,
             "open_interest_ttl_ms": 45000,
         },
+        "daily_batch": {
+            "enabled": True,
+            "run_hour_local": 4,
+            "run_minute_local": 0,
+            "replay_timeout_seconds": 900,
+            "memory_timeout_seconds": 1200,
+        },
     }
 
 
@@ -386,6 +393,67 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "open_interest": 45000,
             },
         )
+
+    def test_build_daily_batch_config_reads_policy_overrides(self):
+        orchestrator = self._make_orchestrator()
+
+        config = orchestrator._build_daily_batch_config()
+
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["run_hour_local"], 4)
+        self.assertEqual(config["run_minute_local"], 0)
+        self.assertEqual(config["replay_timeout_seconds"], 900)
+        self.assertEqual(config["memory_timeout_seconds"], 1200)
+
+    def test_run_daily_batch_launches_background_worker_without_blocking(self):
+        orchestrator = self._make_orchestrator()
+
+        created_threads = []
+
+        class DummyThread:
+            def __init__(self, target=None, args=(), name=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.name = name
+                self.daemon = daemon
+                self.started = False
+                created_threads.append(self)
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        with patch("orchestrator.maintenance.threading.Thread", DummyThread), patch(
+            "orchestrator.maintenance.subprocess.run"
+        ) as subprocess_run:
+            launched = orchestrator.run_daily_batch()
+
+        self.assertTrue(launched)
+        self.assertTrue(orchestrator.daily_batch_running)
+        self.assertEqual(orchestrator.daily_batch_last_status, "running")
+        self.assertEqual(len(created_threads), 1)
+        self.assertTrue(created_threads[0].started)
+        subprocess_run.assert_not_called()
+
+    def test_run_daily_batch_skips_when_worker_already_running(self):
+        orchestrator = self._make_orchestrator()
+
+        class BusyThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+        orchestrator.daily_batch_running = True
+        orchestrator._daily_batch_thread = BusyThread()
+
+        with patch("orchestrator.maintenance.threading.Thread") as thread_ctor:
+            launched = orchestrator.run_daily_batch()
+
+        self.assertFalse(launched)
+        self.assertEqual(orchestrator.daily_batch_last_status, "already_running")
+        thread_ctor.assert_not_called()
 
     def test_serialize_json_payload_converts_pydantic_models(self):
         orchestrator = self._make_orchestrator()

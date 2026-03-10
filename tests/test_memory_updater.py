@@ -1185,6 +1185,61 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(len(lessons), 1)
         self.assertEqual(lessons[0].category, "opportunity")
 
+    def test_generate_lessons_normalizes_common_llm_schema_drift(self):
+        class DummyResponse:
+            text = """
+            [
+              {
+                "title": "Enforce Symbol-specific risk controls when Safe action repeats under mixed conditions.",
+                "support_count": "2",
+                "evidence_journal_ids": ["12", "13"],
+                "risk_control": true,
+                "apply_when": {
+                  "regime": "mixed",
+                  "volatility": "normal",
+                  "trend": "mixed"
+                },
+                "ignore_when": {
+                  "risk_reason": "Safe action.",
+                  "risk_mode": "normal"
+                }
+              }
+            ]
+            """
+
+        class DummyProvider:
+            @staticmethod
+            def generate_json(**kwargs):
+                return DummyResponse()
+
+        self.updater.provider_name = "deepseek"
+        self.updater.llm_provider = DummyProvider()
+        self.updater.model_name = "deepseek-reasoner"
+
+        lessons = self.updater._generate_lessons(
+            {
+                "journal_count": 2,
+                "candidate_lessons": [],
+            }
+        )
+
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0].category, "risk_control")
+        self.assertEqual(
+            lessons[0].rule,
+            "Enforce Symbol-specific risk controls when Safe action repeats under mixed conditions.",
+        )
+        self.assertEqual(lessons[0].regime, "mixed")
+        self.assertEqual(lessons[0].support_count, 2)
+        self.assertEqual(lessons[0].evidence_journal_ids, [12, 13])
+        self.assertEqual(lessons[0].apply_when.regime, ["mixed"])
+        self.assertEqual(lessons[0].apply_when.volatility, ["normal"])
+        self.assertEqual(lessons[0].apply_when.trend, ["mixed"])
+        self.assertEqual(
+            lessons[0].ignore_when,
+            ["risk_reason: Safe action.", "risk_mode: normal"],
+        )
+
     def test_prepare_memory_entries_marks_hypothesis_under_low_support(self):
         stats = {
             "window_hours": 24,

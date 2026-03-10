@@ -49,6 +49,13 @@ class TradingOrchestrator(
         "candidate_pool_limit": 240,
         "save": True,
     }
+    DEFAULT_DAILY_BATCH = {
+        "enabled": True,
+        "run_hour_local": 4,
+        "run_minute_local": 0,
+        "replay_timeout_seconds": 1800,
+        "memory_timeout_seconds": 1800,
+    }
     DEFAULT_ADAPTIVE_LOOP = {
         "base_loop_minutes": 60,
         "position_loop_minutes": 15,

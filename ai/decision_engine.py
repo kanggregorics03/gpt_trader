@@ -69,6 +69,203 @@ class DecisionEngine:
     def _compact_json(self, payload) -> str:
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
+    def _normalize_text(self, value: Any, *, default: str = "") -> str:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            text = value.strip()
+            return text or default
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            parts = [self._normalize_text(item, default="") for item in value]
+            parts = [part for part in parts if part]
+            return ", ".join(parts) or default
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, sort_keys=True, ensure_ascii=True)
+            except TypeError:
+                return str(value)
+        return str(value)
+
+    def _normalize_string_list(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            normalized = [self._normalize_text(item, default="") for item in value]
+            return [item for item in normalized if item]
+        normalized = self._normalize_text(value, default="")
+        return [normalized] if normalized else []
+
+    def _coerce_float(self, value: Any, *, default: float | None = None) -> float | None:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return default
+        return default
+
+    def _coerce_bool(self, value: Any, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"false", "0", "no", "n", "off"}:
+            return False
+        return default
+
+    def _normalize_evidence_scalar(self, value: Any) -> float | str | bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = self._normalize_text(value, default="")
+        return text
+
+    def _normalize_order_payload(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        action = self._normalize_text(payload.get("action"), default="BUY").upper()
+        if action not in {"BUY", "SELL", "CANCEL"}:
+            action = "BUY"
+        order_type = self._normalize_text(payload.get("order_type"), default="MARKET").upper()
+        if order_type not in {"MARKET", "LIMIT"}:
+            order_type = "MARKET"
+        return {
+            "symbol": self._normalize_text(payload.get("symbol"), default="BTCUSDT"),
+            "action": action,
+            "order_type": order_type,
+            "quantity": self._coerce_float(payload.get("quantity"), default=0.0) or 0.0,
+            "price": self._coerce_float(payload.get("price")),
+            "reduce_only": self._coerce_bool(payload.get("reduce_only"), default=False),
+            "take_profit": self._coerce_float(payload.get("take_profit")),
+            "stop_loss": self._coerce_float(payload.get("stop_loss")),
+            "target_order_id": self._normalize_text(payload.get("target_order_id"), default="") or None,
+            "target_client_order_id": self._normalize_text(payload.get("target_client_order_id"), default="") or None,
+            "replace_group_id": self._normalize_text(payload.get("replace_group_id"), default="") or None,
+            "lineage_role": self._normalize_text(payload.get("lineage_role"), default="") or None,
+            "lineage_parent_order_id": self._normalize_text(payload.get("lineage_parent_order_id"), default="") or None,
+            "lineage_parent_client_order_id": self._normalize_text(payload.get("lineage_parent_client_order_id"), default="") or None,
+            "wait_for_cancel_confirmation": self._coerce_bool(
+                payload.get("wait_for_cancel_confirmation"),
+                default=False,
+            ),
+            "execution_profile": self._normalize_text(payload.get("execution_profile"), default="") or None,
+            "urgency_score": self._coerce_float(payload.get("urgency_score")),
+            "max_slippage_bps": self._coerce_float(payload.get("max_slippage_bps")),
+            "time_in_force": self._normalize_text(payload.get("time_in_force"), default="") or None,
+            "post_only": self._coerce_bool(payload.get("post_only"), default=False),
+            "limit_offset_bps": self._coerce_float(payload.get("limit_offset_bps")),
+            "execution_context": payload.get("execution_context")
+            if isinstance(payload.get("execution_context"), dict)
+            else {},
+        }
+
+    def _normalize_evidence_payload(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        operator = self._normalize_text(payload.get("operator"), default="note").lower()
+        allowed = {"gte", "lte", "gt", "lt", "eq", "cross_up", "cross_down", "delta_abs_gte", "note"}
+        if operator not in allowed:
+            operator = "note"
+        observed_value = self._normalize_evidence_scalar(payload.get("observed_value"))
+        threshold = self._normalize_evidence_scalar(payload.get("threshold"))
+        numeric_operator = operator in {"gte", "lte", "gt", "lt", "cross_up", "cross_down", "delta_abs_gte"}
+        if numeric_operator:
+            observed_float = self._coerce_float(observed_value)
+            threshold_float = self._coerce_float(threshold)
+            if observed_float is None or threshold_float is None:
+                operator = "note"
+                threshold = None
+            else:
+                observed_value = observed_float
+                threshold = threshold_float
+        elif operator == "note":
+            threshold = None
+        return {
+            "signal": self._normalize_text(payload.get("signal"), default="note"),
+            "symbol": self._normalize_text(payload.get("symbol"), default="") or None,
+            "timeframe": self._normalize_text(payload.get("timeframe"), default="risk"),
+            "operator": operator,
+            "observed_value": observed_value,
+            "threshold": threshold,
+            "units": self._normalize_text(payload.get("units"), default="") or None,
+            "source": self._normalize_text(payload.get("source"), default="policy_summary"),
+            "confidence_contribution": self._coerce_float(payload.get("confidence_contribution")),
+        }
+
+    def _normalize_rationale_item_payload(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        raw_evidence = payload.get("evidence")
+        if isinstance(raw_evidence, dict):
+            raw_evidence = [raw_evidence]
+        evidence = []
+        for item in raw_evidence or []:
+            normalized = self._normalize_evidence_payload(item)
+            if normalized is not None:
+                evidence.append(normalized)
+        return {
+            "summary": self._normalize_text(payload.get("summary"), default="Structured rationale item."),
+            "why_it_matters": self._normalize_text(
+                payload.get("why_it_matters"),
+                default="This context affects decision quality.",
+            ),
+            "trade_implication": self._normalize_text(
+                payload.get("trade_implication"),
+                default="Keep position management conservative.",
+            ),
+            "failure_mode": self._normalize_text(payload.get("failure_mode"), default="") or None,
+            "evidence": evidence,
+        }
+
+    def _normalize_trade_intent_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        raw_orders = payload.get("orders")
+        if isinstance(raw_orders, dict):
+            raw_orders = [raw_orders]
+        orders = []
+        for item in raw_orders or []:
+            normalized = self._normalize_order_payload(item)
+            if normalized is not None:
+                orders.append(normalized)
+
+        raw_rationale_items = payload.get("rationale_items")
+        if isinstance(raw_rationale_items, dict):
+            raw_rationale_items = [raw_rationale_items]
+        rationale_items = []
+        for item in raw_rationale_items or []:
+            normalized = self._normalize_rationale_item_payload(item)
+            if normalized is not None:
+                rationale_items.append(normalized)
+
+        decision = self._normalize_text(payload.get("decision"), default="HOLD").upper()
+        if decision not in {"HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"}:
+            decision = "HOLD"
+        return {
+            "decision": decision,
+            "orders": orders,
+            "rationale": self._normalize_string_list(payload.get("rationale")),
+            "rationale_items": rationale_items,
+            "risk_notes": self._normalize_string_list(payload.get("risk_notes")),
+            "confidence": self._coerce_float(payload.get("confidence"), default=0.0) or 0.0,
+            "thesis_id": self._normalize_text(payload.get("thesis_id"), default="") or None,
+            "thesis_summary": self._normalize_text(payload.get("thesis_summary"), default="") or None,
+            "invalidation_reason": self._normalize_text(payload.get("invalidation_reason"), default="") or None,
+            "management_template_id": self._normalize_text(payload.get("management_template_id"), default="") or None,
+            "exit_reason": self._normalize_text(payload.get("exit_reason"), default="") or None,
+        }
+
     def _round_compact_value(self, value: Any) -> Any:
         if isinstance(value, float):
             return round(value, 4)
@@ -500,7 +697,8 @@ OUTPUT EXAMPLE
                 input_hash,
             )
             raw_text = response.text
-            intent = TradeIntent.model_validate_json(raw_text)
+            intent_payload = self._normalize_trade_intent_payload(json.loads(raw_text))
+            intent = TradeIntent.model_validate(intent_payload)
             validation_result = self.intent_validator.validate(request, intent)
             if not validation_result.is_valid:
                 logger.warning(
@@ -558,7 +756,7 @@ OUTPUT EXAMPLE
                 usage_metadata=usage_metadata,
             )
              
-        except ValidationError as ve:
+        except (ValidationError, json.JSONDecodeError, TypeError) as ve:
             logger.error(
                 f"{getattr(self, 'provider_name', 'AI').upper()} output failed validation: {ve}"
             )
