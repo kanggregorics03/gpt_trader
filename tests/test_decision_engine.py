@@ -648,6 +648,26 @@ class TestDecisionEngine(unittest.TestCase):
                 range_break_signal_active=True,
                 distance_to_1h_breakout_level=0.5,
                 oi_change_15m=3.4,
+                timeframes={
+                    "5m": {
+                        "timeframe": "5m",
+                        "last_close": 30010.0,
+                        "rsi_14": 71.0,
+                        "change_1bar_pct": 0.6,
+                    },
+                    "15m": {
+                        "timeframe": "15m",
+                        "last_close": 30000.0,
+                        "rsi_14": 63.0,
+                        "change_1bar_pct": 0.8,
+                    },
+                    "1h": {
+                        "timeframe": "1h",
+                        "last_close": 29920.0,
+                        "trend": "UP",
+                        "change_1bar_pct": 1.1,
+                    },
+                },
             ),
             risk_state=RiskStateSnapshot(
                 daily_start_balance=1000.0,
@@ -665,7 +685,13 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertNotIn('"fast_move_signal_active":true', prompt)
         self.assertNotIn('"volume_surge_signal_active":true', prompt)
         self.assertNotIn('"range_break_signal_active":true', prompt)
+        self.assertNotIn('"5m":{"timeframe":"5m"', prompt)
+        self.assertIn('"15m":{"timeframe":"15m"', prompt)
         self.assertIn('"distance_to_1h_breakout_level":0.5', prompt)
+        self.assertIn(
+            "In the 1h loop, treat 15m context as entry confirmation only.",
+            prompt,
+        )
 
     def test_prompt_includes_compact_entry_headroom(self):
         engine = DecisionEngine.__new__(DecisionEngine)

@@ -1,13 +1,19 @@
 import json
 import os
 from typing import Optional
-from urllib.parse import urlparse
-from urllib import request
+from urllib import error, request
+from urllib.parse import urlparse, urlunparse
 
 from loguru import logger
 
 
 class AlertManager:
+    DEFAULT_USER_AGENT = (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+
     def __init__(
         self,
         webhook_url: Optional[str] = None,
@@ -56,20 +62,51 @@ class AlertManager:
             "level": level,
         }
 
+    def _resolved_webhook_url(self) -> str:
+        if not self.webhook_url:
+            return ""
+        webhook_format = self._resolve_format()
+        parsed = urlparse(self.webhook_url)
+        host = (parsed.netloc or "").lower()
+        if webhook_format == "discord" and host == "discordapp.com":
+            return urlunparse(parsed._replace(netloc="discord.com"))
+        return self.webhook_url
+
     def send(self, title: str, message: str, level: str = "warning"):
         logger.log(level.upper(), f"{title}: {message}")
         if not self.webhook_url:
             return
 
+        webhook_format = self._resolve_format()
+        target_url = self._resolved_webhook_url()
         payload = json.dumps(self._build_payload(title, message, level)).encode("utf-8")
         req = request.Request(
-            self.webhook_url,
+            target_url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "User-Agent": self.DEFAULT_USER_AGENT,
+            },
             method="POST",
         )
         try:
             with request.urlopen(req, timeout=5):
                 return
+        except error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace").strip()
+            logger.warning(
+                "Failed to send alert webhook: status={} reason={} host={} format={} body={}",
+                exc.code,
+                exc.reason,
+                (urlparse(target_url).netloc or "").lower(),
+                webhook_format,
+                response_body[:300] or "<empty>",
+            )
         except Exception as exc:
-            logger.warning(f"Failed to send alert webhook: {exc}")
+            logger.warning(
+                "Failed to send alert webhook: host={} format={} error={}",
+                (urlparse(target_url).netloc or "").lower(),
+                webhook_format,
+                exc,
+            )

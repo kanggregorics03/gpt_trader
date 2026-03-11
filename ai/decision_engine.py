@@ -345,7 +345,9 @@ class DecisionEngine:
         payload: dict[str, Any],
         *,
         include_signal_triggers: bool = True,
+        allowed_timeframes: set[str] | None = None,
     ) -> dict[str, Any]:
+        timeframe_keys = allowed_timeframes or {"5m", "15m", "1h", "4h"}
         compact = {
             "symbol": payload.get("symbol"),
             "current_price": payload.get("current_price"),
@@ -376,7 +378,7 @@ class DecisionEngine:
             "timeframes": {
                 key: self._compact_timeframe_snapshot(value)
                 for key, value in (payload.get("timeframes") or {}).items()
-                if key in {"5m", "15m", "1h", "4h"} and isinstance(value, dict)
+                if key in timeframe_keys and isinstance(value, dict)
             },
             "order_book": {
                 "best_bid": ((payload.get("order_book") or {}).get("best_bid")),
@@ -412,12 +414,15 @@ class DecisionEngine:
         return self._drop_empty(self._round_compact_value(compact))
 
     def _build_market_payload(self, request: DecisionRequest):
-        include_signal_triggers = str(request.loop_mode or "").strip().lower() != "1h"
+        loop_mode = str(request.loop_mode or "").strip().lower()
+        include_signal_triggers = loop_mode != "1h"
+        allowed_timeframes = {"15m", "1h", "4h"} if loop_mode == "1h" else {"5m", "15m", "1h", "4h"}
         if request.market_snapshots:
             return {
                 symbol: self._compact_market_snapshot_payload(
                     snapshot.model_dump(mode="json"),
                     include_signal_triggers=include_signal_triggers,
+                    allowed_timeframes=allowed_timeframes,
                 )
                 for symbol, snapshot in request.market_snapshots.items()
             }
@@ -425,6 +430,7 @@ class DecisionEngine:
             return self._compact_market_snapshot_payload(
                 request.market_snapshot.model_dump(mode="json"),
                 include_signal_triggers=include_signal_triggers,
+                allowed_timeframes=allowed_timeframes,
             )
         return {}
 
@@ -626,6 +632,7 @@ MARKET INTERPRETATION
 1. Prefer derived fields such as change, percentile, distance, and stabilized trigger state over raw values when making decisions.
 2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_signal_active is the stabilized signal state after hysteresis. Do not treat them as interchangeable.
 3. fast_move_signal_active, volume_surge_signal_active, and range_break_signal_active are short-horizon stabilization signals. Use them in 15m and 5m loops for cadence and follow-through. In the 1h loop, prioritize higher-timeframe structure, breakout distance, trend alignment, and participation instead.
+3a. In the 1h loop, treat 15m context as entry confirmation only. Do not let 15m momentum or noise create a fresh thesis that is not already supported by the 1h structure.
 4. spread_vs_1h_avg, spread_percentile_1h, and depth_percentile_1h describe execution quality. Poor execution quality should reduce aggressiveness even if direction looks favorable.
 5. oi_change_15m, oi_change_1h, funding_rate_change_1h, and basis_change_1h describe change and participation, not just static state.
 6. distance_to_15m_breakout_level, distance_to_1h_breakout_level, and distance_to_invalid_level describe structure quality. Smaller and clearer invalidation distance generally supports cleaner entries.
