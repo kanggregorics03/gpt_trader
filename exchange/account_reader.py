@@ -139,15 +139,18 @@ class AccountReader:
             logger.error(f"Failed to fetch account state: {e}")
             raise
 
-    def invalidate_cache(self):
+    def invalidate_cache(self, *, reconcile_private_feed: bool = True):
+        self._clear_cached_account_state()
+        private_feed = getattr(self, "private_feed", None)
+        if reconcile_private_feed and private_feed is not None:
+            private_feed.mark_reconcile_required()
+
+    def _clear_cached_account_state(self):
         self._account_state_cache = {
             "cache_key": None,
             "cached_at_ms": 0,
             "state": None,
         }
-        private_feed = getattr(self, "private_feed", None)
-        if private_feed is not None:
-            private_feed.mark_reconcile_required()
 
     def get_runtime_diagnostics(self) -> Dict[str, Any]:
         cache_entry = getattr(self, "_account_state_cache", None) or {}
@@ -179,7 +182,7 @@ class AccountReader:
         if cached_state is None:
             return None
         if (int(time.time() * 1000) - cached_at_ms) > ttl_ms:
-            self.invalidate_cache()
+            self.invalidate_cache(reconcile_private_feed=False)
             return None
         return cached_state.model_copy(deep=True)
 

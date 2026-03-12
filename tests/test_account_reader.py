@@ -106,6 +106,7 @@ class HealthyPrivateFeed:
 
     def seed_from_account_state(self, state):
         self.seeded = state
+        self.reconcile_required = False
 
     def mark_reconcile_required(self):
         self.reconcile_required = True
@@ -289,6 +290,20 @@ class TestAccountReader(unittest.TestCase):
 
         self.assertEqual(exchange.balance_calls, 2)
         self.assertEqual(exchange.position_calls, 2)
+
+    def test_expired_cache_does_not_force_private_feed_reconcile(self):
+        exchange = DummyExchange()
+        private_feed = HealthyPrivateFeed()
+        reader = AccountReader(exchange, cache_ttl_ms=10, private_feed=private_feed)
+
+        first = reader.get_account_state(["BTCUSDT"])
+        time.sleep(0.02)
+        second = reader.get_account_state(["BTCUSDT"])
+
+        self.assertEqual(exchange.balance_calls, 0)
+        self.assertFalse(private_feed.reconcile_required)
+        self.assertEqual(first.total_balance, 1600.0)
+        self.assertEqual(second.total_balance, 1600.0)
 
     def test_healthy_private_feed_snapshot_is_used_before_rest_reconcile(self):
         exchange = DummyExchange()
