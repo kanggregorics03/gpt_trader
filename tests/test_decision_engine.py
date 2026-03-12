@@ -344,6 +344,75 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertEqual(result.intent.confidence, 0.55)
         self.assertIn('"decision":"hold"', result.raw_response)
 
+    def test_generate_decision_keeps_action_when_explanation_validation_fails(self):
+        class DummyResponse:
+            text = (
+                '{"decision":"BUY","orders":[{"symbol":"ETHUSDT","action":"BUY","order_type":"LIMIT",'
+                '"entry_style":"retest","quantity":0.01,"price":2000.0,"reduce_only":false}],'
+                '"rationale":["ETH reclaimed structure with improving participation.","Execution is acceptable and risk is defined."],'
+                '"rationale_items":[{"summary":"Regime label is mixed","why_it_matters":"Context is not fully aligned.",'
+                '"trade_implication":"Keep size small.","failure_mode":"Momentum fades.",'
+                '"evidence":[{"signal":"trend_alignment","symbol":"ETHUSDT","timeframe":"regime","operator":"eq",'
+                '"observed_value":"mixed","threshold":"mixed","source":"market_snapshots.ETHUSDT.regime.trend_alignment"}]}],'
+                '"risk_notes":["Use smaller size while structure is only partially aligned."],"confidence":0.58}'
+            )
+            usage_metadata = {"total_token_count": 321}
+
+        class DummyProvider:
+            @staticmethod
+            def generate_json(**kwargs):
+                return DummyResponse()
+
+        class RejectingValidator:
+            @staticmethod
+            def validate(request, intent):
+                class Result:
+                    is_valid = False
+                    issues = ["rationale_items[0].numeric_evidence_missing"]
+
+                return Result()
+
+        engine = DecisionEngine.__new__(DecisionEngine)
+        engine.client = None
+        engine.provider_name = "deepseek"
+        engine.llm_provider = DummyProvider()
+        engine.flash_model = "deepseek-reasoner"
+        engine.pro_model = "deepseek-reasoner"
+        engine.cache_store = None
+        engine.intent_validator = RejectingValidator()
+
+        request = DecisionRequest(
+            policy_summary="valid_actions: [HOLD, BUY, SELL, REDUCE, EXIT]",
+            account_state=AccountState(total_balance=1000.0, available_balance=900.0),
+            market_snapshot=MarketSnapshot(
+                symbol="ETHUSDT",
+                current_price=2000.0,
+                atr_15m=20.0,
+                atr_1h=40.0,
+                trend_1h="UP",
+                recent_volume_surge=False,
+            ),
+            risk_state=RiskStateSnapshot(
+                daily_start_balance=1000.0,
+                daily_pnl_pct=0.0,
+                drawdown_active=False,
+                consecutive_losses=0,
+                cooldown_active=False,
+            ),
+            long_term_memory=[],
+        )
+
+        result = engine.generate_decision(request)
+
+        self.assertEqual(result.intent.decision, "BUY")
+        self.assertTrue(result.decision_valid)
+        self.assertFalse(result.explanation_valid)
+        self.assertFalse(result.learning_eligible)
+        self.assertTrue(result.usage_metadata["semantic_validation_error"])
+        self.assertTrue(result.usage_metadata["explanation_invalid"])
+        self.assertEqual(result.usage_metadata["validation_stage"], "explanation_semantic")
+        self.assertIn("numeric_evidence_missing", result.usage_metadata["issues"][0])
+
     def test_market_snapshots_are_included_in_candidate_hash(self):
         engine = DecisionEngine.__new__(DecisionEngine)
         base_request = DecisionRequest(
@@ -690,6 +759,38 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn('"distance_to_1h_breakout_level":0.5', prompt)
         self.assertIn(
             "In the 1h loop, treat 15m context as entry confirmation only.",
+            prompt,
+        )
+        self.assertIn(
+            "Every rationale_item must include at least one numeric or boolean evidence row.",
+            prompt,
+        )
+        self.assertIn(
+            "Never make rationale_items[0] categorical-only; lead with the strongest numeric evidence-backed rationale_item.",
+            prompt,
+        )
+        self.assertIn(
+            "Do not infer HOLD just because many retrieved examples held",
+            prompt,
+        )
+        self.assertIn(
+            "a small probe entry is allowed when directional bias exists",
+            prompt,
+        )
+        self.assertIn(
+            "Do not let regime.trend_alignment='mixed' veto an otherwise tradable setup by itself.",
+            prompt,
+        )
+        self.assertIn(
+            "distance_to_invalid_level is a sizing and risk-definition input, not a standalone veto.",
+            prompt,
+        )
+        self.assertIn(
+            "Separate account-risk pressure from execution-quality pressure.",
+            prompt,
+        )
+        self.assertIn(
+            "Treat execution-quality deterioration as a sizing penalty before treating it as a reason to HOLD",
             prompt,
         )
 

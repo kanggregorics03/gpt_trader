@@ -164,7 +164,7 @@ risk_engine
 
 최근 구현에서는 쿨다운도 고정 30분이 아니라 손실 강도, 연속 손실, 반복된 `thesis_failure_reason`을 같이 봐서 동적으로 늘어난다.
 또 `drawdown`은 BUY/SELL을 완전히 막지 않되 `confidence_cap`, `entry_size_multiplier`, `failure_pattern_score`로 추가 감쇠한다.
-현재 구현에서는 live runtime이 레짐별 `policy_registry` champion을 직접 읽어 contract를 바꾸지 않는다. exposure 조정도 기본 risk profile을 그대로 사용한다.
+현재 구현에서는 live runtime이 `policy_registry` 같은 offline registry를 직접 읽어 contract를 바꾸지 않는다. exposure 조정도 기본 risk profile을 그대로 사용한다.
 반면 `max_leverage`, `drawdown_activate_pct`, `daily_max_loss_pct`는 자동 진화 대상이 아닌 하드 가드레일로 유지한다.
 
 execution_engine
@@ -187,9 +187,9 @@ long_term_memory_updater (Batch)
 - `safety_5m` execution safety FSM 후보 생성/평가
   - emergency exit 중심 shadow divergence만 승격 근거로 사용하고 legacy `risk_reduce` 가점은 사용하지 않음
 - `execution_5m` fill/slippage/latency 평가 저장과 오프라인 tuning 후보 분석
-- `policy_bundle` 계층은 제거하고 개별 champion/promotion 기록만 유지
+- `policy_bundle` 계층은 제거했고, candidate/promotion 기록도 legacy offline review surface로만 유지한다
 - legacy management contract 정리
-  - `policy_registry` champion config에서 구 `reduce/profit_protect` 키를 제거한다
+  - `policy_registry` legacy config에서 구 `reduce/profit_protect` 키를 제거한다
   - `candidate_policy_versions`의 legacy 15m/5m 후보는 `retired`로 내린다
   - `long_term_memory`의 obvious `scale out` / `profit protect` lesson은 soft-retire 한다
   - 사실 이력 테이블은 보존하고, 학습 입력은 `2026-03-10` cutover 이후 window로 제한한다
@@ -219,9 +219,10 @@ monitoring & alert
 
 추가 원칙:
 
-- `AlphaPolicyEngine`이 먼저 레짐별 champion 진입 필터를 적용
-- 통과한 심볼만 AI가 최종 방향성 판단
-- 후보 알파 정책은 live entry 기준 `entry_block` shadow decision을 남긴다
+- `AlphaPolicyEngine`은 현재 live pre-filter가 아니라 advisory signal로만 남는다
+- AI는 전체 심볼 스냅샷을 보고 최종 방향성 판단을 한다
+- blocked reason은 audit/execution summary에 advisory metadata로만 남긴다
+- AI structured fallback이 발생해도 다음 loop contract를 `15m` 관리 모드로 바꾸지 않고, 같은 `1h` 전략 계약으로 최대 두 번 더 빠르게 재시도한다
 
 15분 cadence
 
@@ -381,6 +382,8 @@ action bias를 줄인다
 semantic validation 실패, JSON validation fallback, loop error로 만들어진 fallback HOLD는
 retrieval context에서 기본 제외해 "시장 판단 HOLD"와 "시스템 오류 HOLD"가 섞이지 않게 한다
 같은 기준으로 similar_past_cases의 RAG fallback audit와 그 audit에 연결된 trade case도 prompt 후보에서 제외한다
+설명 품질 실패는 raw intent를 보존한 채 `explanation_valid=false`, `learning_eligible=false`로 분리 기록하고,
+행동 자체는 `decision_valid`와 `execution_admissible`이 실제로 막을 때만 차단한다
 
 long_term_memory: 장기 교훈/안티패턴/국면-전략 맵(압축본)
   - Lifecycle note: runtime retrieval and daily reconciliation now read the same lifecycle-managed memory pool, so older active rules are not silently dropped by a separate recent cap.
@@ -445,11 +448,15 @@ rationale_items[]: 구조화 근거
 
 timeframe snapshot에는 previous_values를 둘 수 있고, cross_up/cross_down 검증 시 source별 직전값으로 사용한다
 
-source는 DecisionRequest 안의 실제 경로여야 하고, 관측값과 맞지 않으면 보수적으로 HOLD fallback
+source는 DecisionRequest 안의 실제 경로여야 하고, 관측값과 맞지 않으면 explanation invalid 또는 action/schema invalid로 기록된다
 
-operator도 의미 검증한다. gte/lt/cross_up/delta_abs_gte 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 HOLD fallback
+operator도 의미 검증한다. gte/lt/cross_up/delta_abs_gte 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 action/schema 단계에서 차단된다
 
-신규 진입에서는 trade_implication이 실제 행동 방향과 맞지 않거나, 근거 품질에 비해 confidence가 과하면 보수적으로 HOLD fallback
+신규 진입에서는 trade_implication이 실제 행동 방향과 맞지 않거나, 근거 품질에 비해 confidence가 과하면 explanation invalid 또는 action/schema invalid로 분리 기록된다
+
+프롬프트는 adverse condition도 두 층으로 나눈다.
+liquidation risk, hard cooldown pressure, drawdown pressure 같은 account-risk 압박은 신규 노출을 강하게 억제할 수 있지만,
+wide spread, weak depth, unfavorable funding 같은 execution-quality 악화는 우선 size/confidence penalty로만 다루고 단독 HOLD veto로 쓰지 않는다.
 
 신규 진입에서는 구조화 근거의 품질도 리스크 판단에 반영한다
 
@@ -546,11 +553,12 @@ LLM provider는 통계 해석과 교훈 구조화만 수행
 
 1. trade case와 symbol journal에서 candidate lesson과 feature gap을 추출
 2. 이를 `candidate_policy_versions`로 저장
-3. `shadow_decisions`와 `replay_runs`로 후보 정책을 평가
-4. 후보 평가 결과를 offline registry와 promotion history에만 저장
+3. `shadow_decisions`와 `replay_runs`는 legacy/offline 비교 표면으로만 유지한다
+4. 후보 평가 결과는 live 승격이 아니라 offline registry/history 용도로만 저장한다
 5. 같은 배치에서 retrieval reranker artifact와 `shadow_decision_dataset.jsonl`을 생성해 retrieval/decision 보조 모델 학습 기반을 축적
 6. replay batch heartbeat, memory updater heartbeat, replay 처리율로 `learning_liveness`를 계산하고 stale 시 자동 반영을 중지
-9. 운영 스케줄에서 replay batch와 memory updater는 백그라운드 subprocess로 비동기 실행하고 timeout을 둬서, 장기 학습이 메인 trading loop를 멈추지 못하게 한다
+7. good hold와 missed hold는 같은 `HOLD`라도 분리 집계해 undertrading / overtrading 균형 점수의 보조 입력으로 사용한다
+8. 운영 스케줄에서 replay batch와 memory updater는 백그라운드 subprocess로 비동기 실행하고 timeout을 둬서, 장기 학습이 메인 trading loop를 멈추지 못하게 한다
 
 8) 리스크 관리(필수 안전장치)
 8.1 회로차단기(Kill switch)
@@ -731,10 +739,10 @@ daily memory batch는 rationale_json의 evidence signal 반복 패턴과 당시 
 anti-undertrading lesson도 넓게 "HOLD를 줄여라"가 아니라,
 dominant trigger context, execution context, trend context가 반복된 구간에서만 좁게 seed를 만든다.
 그리고 이 `trigger_context`, `execution_context`, `trend_context`, `hold_quality`는 문장 설명에만 남지 않고
-구조화 memory schema에도 같이 저장해, 이후 merge/revive/promotion 과정에서도 유지한다.
-정책 평가 역시 같은 opportunity cost를 bundle/candidate score의 보조 메트릭으로 반영해,
-지나친 `HOLD` 편향이 장기적으로 승격되지 않게 한다.
-최근 promotion gate에서는 `alpha_1h` 후보와 regime bundle을 볼 때
+구조화 memory schema에도 같이 저장해, 이후 merge/revive/offline review 과정에서도 유지한다.
+정책 평가는 같은 opportunity cost를 offline candidate score의 보조 메트릭으로 반영해,
+지나친 `HOLD` 편향이 장기적으로 좋은 review score를 받지 못하게 한다.
+최근 offline review에서는 `alpha_1h` 후보와 regime context를 볼 때
 `hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
 `portfolio_utility_score`, `confidence_alignment_score`, `temporal_holdout_summary`도 같이 확인한다.
 즉 비용 한쪽이 너무 크거나 두 압력의 비율이 지나치게 깨져 있거나,

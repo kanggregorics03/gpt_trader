@@ -102,18 +102,47 @@ class TestMemoryUpdater(unittest.TestCase):
             },
             {
                 "id": 3,
+                "audit_log_id": 104,
+                "decision": "BUY",
+                "risk_reason": "Approved",
+                "rationale": ["Breakout long."],
+                "execution_summary": {
+                    "decision_quality": {
+                        "decision_valid": True,
+                        "explanation_valid": False,
+                        "learning_eligible": False,
+                    }
+                },
+            },
+            {
+                "id": 4,
                 "audit_log_id": 103,
                 "decision": "HOLD",
                 "risk_reason": "Error in Adaptive (1h) cycle: boom",
                 "rationale": ["Loop error during Adaptive (1h)."],
                 "execution_summary": {"error": "boom"},
             },
+            {
+                "id": 5,
+                "audit_log_id": 105,
+                "decision": "BUY",
+                "risk_reason": "Blocked",
+                "rationale": ["Probe long."],
+                "execution_summary": {
+                    "decision_quality": {
+                        "decision_valid": True,
+                        "explanation_valid": True,
+                        "execution_admissible": False,
+                        "learning_eligible": True,
+                    }
+                },
+            },
         ]
 
         eligible, excluded = self.updater._filter_learning_eligible_journals(journals)
 
         self.assertEqual([row["audit_log_id"] for row in eligible], [101])
-        self.assertEqual([row["audit_log_id"] for row in excluded], [102, 103])
+        self.assertEqual([row["audit_log_id"] for row in excluded], [102, 104, 103, 105])
 
     def test_build_recent_journal_reranker_profile_learns_bucket_biases(self):
         profile = self.updater._build_recent_journal_reranker_profile(
@@ -947,7 +976,7 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(merged[0].execution_context, "acceptable_spread|deep_book|manageable_invalidation")
         self.assertEqual(merged[0].apply_when.regime, ["aligned_up_high"])
 
-    def test_promote_candidate_policies_blocks_unbalanced_alpha_candidate(self):
+    def test_promote_candidate_policies_is_disabled_for_fixed_policy_runtime(self):
         class DummyStore:
             def __init__(self):
                 self.promotions = []
@@ -975,29 +1004,13 @@ class TestMemoryUpdater(unittest.TestCase):
                 "config": {},
             }
         ]
-        evaluations = [
-            {
-                "candidate_policy_id": 11,
-                "evaluation_scope": "seed",
-                "sample_count": 6,
-                "score": 0.4,
-                "metrics": {
-                    "regime_key": "aligned_up|normal",
-                    "trading_balance_summary": {
-                        "hold_opportunity_cost": 4.2,
-                        "false_entry_cost": 0.4,
-                        "balance_score": 0.18,
-                        "pressure_ratio": 10.5,
-                    },
-                },
-            }
-        ]
+        evaluations = [{"candidate_policy_id": 11, "evaluation_scope": "seed", "sample_count": 6, "score": 0.4, "metrics": {}}]
 
         self.updater._promote_candidate_policies(candidates, evaluations)
 
         self.assertEqual(self.updater.state_store.promotions, [])
 
-    def test_promote_candidate_policies_blocks_negative_holdout_candidate(self):
+    def test_promote_candidate_policies_is_disabled_even_for_positive_candidate(self):
         class DummyStore:
             def __init__(self):
                 self.promotions = []
@@ -1029,25 +1042,25 @@ class TestMemoryUpdater(unittest.TestCase):
             {
                 "candidate_policy_id": 12,
                 "evaluation_scope": "shadow",
-                "sample_count": 5,
-                "score": 0.42,
+                "sample_count": 8,
+                "score": 0.9,
                 "metrics": {
                     "regime_key": "aligned_up|high",
-                    "confidence_alignment_score": 0.62,
+                    "confidence_alignment_score": 0.9,
                     "temporal_holdout_summary": {
-                        "train_count": 3,
-                        "holdout_count": 2,
+                        "train_count": 5,
+                        "holdout_count": 3,
                         "train_score": 0.8,
-                        "holdout_score": -0.2,
-                        "score_gap": 1.0,
-                        "stability_score": 0.18,
+                        "holdout_score": 0.7,
+                        "score_gap": 0.1,
+                        "stability_score": 0.9,
                     },
                     "trading_balance_summary": {
-                        "hold_opportunity_cost": 0.8,
-                        "false_entry_cost": 0.6,
-                        "balance_score": 0.82,
-                        "pressure_ratio": 1.1,
-                        "portfolio_utility_score": 0.74,
+                        "hold_opportunity_cost": 0.2,
+                        "false_entry_cost": 0.1,
+                        "balance_score": 0.9,
+                        "pressure_ratio": 1.0,
+                        "portfolio_utility_score": 0.9,
                     },
                 },
             }

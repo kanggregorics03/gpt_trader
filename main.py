@@ -61,6 +61,8 @@ class TradingOrchestrator(
         "base_loop_minutes": 60,
         "position_loop_minutes": 15,
         "trigger_loop_minutes": 5,
+        "ai_fallback_retry_limit": 2,
+        "ai_fallback_retry_mode": "15m",
         "trigger_clear_cycles": 2,
         "position_min_duration_minutes": 30,
         "flat_clear_cycles": 4,

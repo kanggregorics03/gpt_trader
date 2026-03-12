@@ -55,12 +55,12 @@
 2. `1h alpha` 신규 진입 기준과 `5m safety` 민감도를 더 보수적으로 둔다.
 3. 심볼 수를 줄인다.
 4. 문제 구간의 실거래를 멈추고 demo 또는 축소 size로 재관찰한다.
-5. `regime_drift`가 감지된 상태에서 현재 champion이 계속 유지되고 있지 않은지 본다.
-6. `execution_policy_evaluations`, `shadow_decisions`, `policy_promotions`가 최근 구간에 실제로 쌓이고 있는지 본다.
+5. `regime_drift`가 감지된 상태에서 current policy와 recent replay/memory 결과가 어긋나지 않는지 본다.
+6. `execution_policy_evaluations`, `replay_runs`, `learning_artifacts`가 최근 구간에 실제로 갱신되고 있는지 본다.
 7. `replay_runs`가 최근 24시간 대표 audit 기준으로 꾸준히 쌓이고 있는지 본다.
-8. `safety_5m` champion이 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 shadow divergence를 본다.
+8. `safety_5m` contract가 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 recent audit/replay divergence를 본다.
    - 현재 철학상 `safety_5m`는 emergency exit 품질을 보는 계층이지, profit protect 감축 빈도를 높이는 계층이 아니다.
-9. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, promotion blocked 상태를 확인한다.
+9. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, artifact freshness를 확인한다.
 
 ## 4. 원인별 해석 가이드
 
@@ -166,7 +166,6 @@
 - `drawdown_active`
 - `daily_pnl_pct`
 - 모드별 평균 진입 size
-- `policy_registry`의 `exposure_budget` champion
 - `entry_size_cap.effective_cap_pct`
 
 어떻게 해석할 것인가:
@@ -183,7 +182,7 @@
 4. 연속 손실 시 `Cooldown Extended`가 더 빨리 켜지게 만든다.
 5. trigger mode와 normal mode의 size 차이를 더 벌린다.
 
-현재 구조에서는 고정값을 바로 손대기 전에, 해당 레짐의 `exposure_budget` champion이 과도하게 공격적으로 승격된 것은 아닌지도 함께 본다.
+현재 구조에서는 고정값을 바로 손대기 전에, replay/memory가 최근 구간에서 undertrading 또는 overtrading pressure를 어떻게 읽고 있는지도 함께 본다.
 
 실험 아이디어:
 
@@ -301,12 +300,11 @@
 - `long_term_memory`
   - 운영 계약을 크게 바꿨다면 legacy lesson을 보존하려 하지 말고 `data/gpt_trader.db`와 `data/learning/`을 비운 뒤 새 사례를 다시 쌓는다
   - runtime retrieval과 batch reconciliation이 같은 lifecycle pool을 읽는지 본다. 오래된 active rule이 recent cap 때문에 사라지면 해석이 틀어진다.
-  - 다만 최근 15m/5m 규칙 수정은 long-term memory보다 candidate policy / promotion에 먼저 직접 반영된다.
+  - 다만 최근 운영 계약 수정은 long-term memory보다 코드/정책 파일에 먼저 직접 반영된다.
 - `learning_artifacts`
   - `journal_reranker_profile`, `similar_case_reranker_profile`, `shadow_model_dataset`, `learning_liveness`가 최근 배치에서 갱신됐는지 본다.
 - `candidate_lessons`
 - `policy_evaluations`
-- `policy_promotions`
 - 최근 `24h / 7d / latest 50` semantic fallback
 - in-sample vs recent out-of-sample 비교
 
@@ -315,7 +313,7 @@
 - 이 경우 "모델이 좋아졌다"는 착시가 많다.
 - 반드시 최근 구간, 비용 반영 결과, 실전 체결 결과를 분리해서 본다.
 - memory rule은 설명력이 아니라 반복성과 holdout 적합성이 중요하다.
-- champion score만 높고 bundle score가 약하면 개별 정책은 좋아 보여도 조합이 나쁜 경우다.
+- 일부 offline artifact score만 좋아 보여도, 실제 runtime contract와 최근 outcome이 맞지 않으면 운영 가치가 낮을 수 있다.
 
 바로 해볼 것:
 
@@ -455,7 +453,7 @@
 1. 거래 심볼을 절반으로 줄인다.
 2. 최근 손실이 큰 심볼 하나를 1주일 제외한다.
 3. 추세 정렬과 OI 확장이 동시에 있을 때만 신규 진입을 허용한다.
-4. `distance_to_invalid_level`이 넓으면 HOLD로 강제한다.
+4. `distance_to_invalid_level`이 넓으면 진입 크기와 confidence를 먼저 줄이고, 구조 충돌이 겹칠 때만 HOLD를 검토한다.
 5. range break 미확인 상태의 추격 시장가 진입을 금지한다.
 
 ### 6.2 실행 비용이 문제일 때

@@ -9,6 +9,7 @@
 - 리스크 제약 안에서 행동하는 단일 심볼 트레이딩 시스템이다.
 - LLM은 주문 실행 권한을 가진 주체가 아니라, 구조화된 추천을 만드는 decision layer다.
 - 실제 시스템 학습은 모델 파인튜닝보다 `retrieval + memory + replay + offline candidate evaluation` 구조를 통해 이뤄진다.
+- 정책은 live에서 고정하고, 학습은 판단 보조 구조와 offline review surface에만 반영한다.
 
 즉 목표는 "가장 공격적으로 많이 맞히는 모델"이 아니라, "제약을 지키면서 반복 가능한 의사결정을 개선하는 운영 시스템"이다.
 
@@ -55,6 +56,10 @@
 - recent journal, memory, similar past cases는 전부 샘플링된 보조 근거일 뿐이다.
 - system/validation fallback 같은 오류성 retrieval은 prompt 컨텍스트 후보에서 기본 제외해야 한다.
 - live market snapshot, risk state, enforceable policy limit가 과거 사례보다 우선이다.
+- retrieval은 advisory이지 vote가 아니다.
+- `trend_alignment='mixed'`와 넓은 `distance_to_invalid_level`은 caution/sizing 신호이지 단독 veto가 아니다.
+- account-risk pressure와 execution-quality deterioration은 같은 무게로 다루지 않는다.
+- liquidation, hard cooldown, drawdown은 신규 노출을 강하게 꺼리게 하지만, spread/depth/funding 악화는 우선 size/confidence penalty로 본다.
 
 요약하면 prompt는 설명 문서가 아니라 compact decision contract여야 한다.
 
@@ -68,6 +73,7 @@
 여기서 중요한 원칙은 다음과 같다.
 
 - schema validation fallback, semantic validation error, system fallback 성격의 audit는 prompt-safe 후보에서 제외한다.
+- explanation invalid audit도 prompt-safe 후보와 자동 학습 후보에서 제외한다.
 - audit row가 없다는 이유만으로 raw trade case를 숨기지는 않는다.
 - 반대로 prompt-safe 후보는 audit linkage를 통해 실제로 걸러져야 한다.
 
@@ -89,7 +95,7 @@
 
 1. `audit_logs`, `journal`, `trade_cases`, `replay_runs`가 운영 사실을 축적한다.
 2. `long_term_memory`와 retrieval artifact가 운영 결과를 바탕으로 갱신된다.
-3. candidate policy와 shadow decision이 offline surface에서 평가된다.
+3. candidate policy와 shadow decision은 legacy/offline surface에서만 평가된다.
 4. holdout, replay, liveness 조건은 live 자동 반영이 아니라 review 우선순위를 정하는 근거로만 쓴다.
 
 즉 "좋은 답변을 한 번 받는 것"이 아니라 "운영 결과를 반영해 보조 구조를 천천히 진화시키는 것"이 학습이다.
@@ -97,9 +103,10 @@
 여기서 중요한 구분이 하나 더 있다.
 
 - `candidate policy / promotion`은 현재 live 실행 규칙을 직접 바꾸지 않는다.
+- 현재 운영 계약에서는 shadow 기록과 auto promotion도 꺼져 있으므로, live 정책 변화는 코드/정책 파일 수정으로만 일어난다.
 - `long_term_memory`는 실행 규칙을 직접 바꾸지 않고, 이후 판단과 lesson synthesis의 보조 근거를 천천히 바꾸는 경로다.
 
-따라서 `15m/5m` 규칙을 수정하면 정책 진화 계층은 즉시 영향을 받고,
+따라서 `15m/5m` 규칙을 수정하면 live 계약은 즉시 바뀌고,
 장기 메모리 계층은 새 사례 분포가 누적되면서 간접적으로 따라온다.
 
 운영 계약이 크게 바뀌는 cutover도 같은 원칙으로 다룬다.
@@ -112,7 +119,10 @@
 - 큰 손실 audit는 더 높은 우선순위를 갖는다.
 - retrieval이 실제 decision 차이를 만든 audit는 다시 보기 가치가 높다.
 - `HOLD`도 missed opportunity를 보기 위해 별도 quota로 유지한다.
+- good hold와 missed hold를 분리해 보고, 둘 다 현재 결정에 대한 참고 근거로만 사용한다.
 - 하지만 system/validation fallback audit는 여전히 자동 학습 경로에서 제외한다.
+- 설명 실패 샘플은 raw 운영 기록으로는 남기되, `learning_eligible`이 아니면 replay/memory 자동 경로에서는 제외한다.
+- structured fallback이 나와도 다른 loop contract로 강등하지 않고, 같은 `1h` 계약으로 최대 두 번 더 빠르게 재시도한다.
 
 ## 6. Shadow Model 원칙
 
@@ -136,7 +146,7 @@
 - 최근 replay candidate 처리율
 - reranker artifact 준비 여부
 - shadow dataset 준비 여부
-- promotion blocked 여부
+- offline evaluation blocked 여부
 
 좋은 liveness는 단순 "replay run 개수"가 아니라, 중요한 후보군을 계속 커버하고 있는 상태를 뜻한다.
 그래서 replay batch는 후보량이 많아지면 처리 수를 가변적으로 늘리고, `HOLD`도 별도 quota로 보장한다.

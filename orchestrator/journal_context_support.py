@@ -1,4 +1,16 @@
 class TradingJournalContextSupportMixin:
+    def _extract_row_hold_quality(self, row) -> str:
+        rationale_items = row.get("rationale_items") or row.get("rationale_json") or []
+        if not isinstance(rationale_items, list):
+            return ""
+        for item in rationale_items:
+            if not isinstance(item, dict):
+                continue
+            hold_quality = str(item.get("hold_quality") or "").strip().lower()
+            if hold_quality:
+                return hold_quality
+        return ""
+
     def _extract_symbols_from_rationale_items(self, rationale_items):
         symbols = set()
         for item in rationale_items or []:
@@ -71,8 +83,19 @@ class TradingJournalContextSupportMixin:
         execution_summary = row.get("execution_summary") or {}
         if str(execution_summary.get("error") or "").strip():
             return True
+        decision_quality = execution_summary.get("decision_quality") or {}
+        if not bool(decision_quality.get("decision_valid", True)):
+            return True
+        if not bool(decision_quality.get("explanation_valid", True)):
+            return True
+        if not bool(decision_quality.get("learning_eligible", True)):
+            return True
         ai_usage = execution_summary.get("ai_usage") or {}
-        if bool(ai_usage.get("validation_error")) or bool(ai_usage.get("semantic_validation_error")):
+        if (
+            bool(ai_usage.get("validation_error"))
+            or bool(ai_usage.get("semantic_validation_error"))
+            or bool(ai_usage.get("explanation_invalid"))
+        ):
             return True
 
         text_markers = (
@@ -100,6 +123,7 @@ class TradingJournalContextSupportMixin:
             return "system_fallback"
 
         decision = str(row.get("decision") or "HOLD").upper()
+        hold_quality = self._extract_row_hold_quality(row)
         has_trigger = bool(row.get("trigger_symbols") or [])
         has_risk_trigger = bool(row.get("risk_trigger_symbols") or [])
         has_loss_signal = bool(row.get("loss_signal"))
@@ -107,10 +131,12 @@ class TradingJournalContextSupportMixin:
         is_non_default_risk_reason = risk_reason not in ("", "approved", "safe action.")
 
         if decision == "HOLD":
-            if has_trigger and not has_risk_trigger:
+            if hold_quality == "good_hold":
+                return "good_hold"
+            if hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
                 return "missed_opportunity_hold"
             if not has_trigger and not has_risk_trigger and not has_loss_signal and not is_non_default_risk_reason:
-                return "good_hold"
+                return "hold"
             return "hold"
         if decision in ("BUY", "SELL"):
             return "entry_action"

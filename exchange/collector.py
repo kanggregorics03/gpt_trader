@@ -211,6 +211,29 @@ class MarketCollector:
             return None
         return abs(current_price - reference_price) / reference_atr
 
+    def _resolve_trend_alignment(self, timeframes: Dict[str, TimeframeSnapshot]) -> str:
+        key_timeframes = ["15m", "1h", "4h"]
+        directional = {
+            timeframe: snapshot.trend
+            for timeframe, snapshot in timeframes.items()
+            if timeframe in key_timeframes and snapshot.last_close > 0 and snapshot.trend in {"UP", "DOWN"}
+        }
+        if not directional:
+            return "mixed"
+
+        primary_1h = directional.get("1h")
+        primary_4h = directional.get("4h")
+        if primary_1h and primary_4h and primary_1h == primary_4h:
+            return "bullish" if primary_1h == "UP" else "bearish"
+
+        up_count = sum(1 for trend in directional.values() if trend == "UP")
+        down_count = sum(1 for trend in directional.values() if trend == "DOWN")
+        if up_count >= 2 and up_count > down_count:
+            return "bullish"
+        if down_count >= 2 and down_count > up_count:
+            return "bearish"
+        return "mixed"
+
     def _build_top_level_derived_metrics(
         self,
         *,
@@ -691,12 +714,7 @@ class MarketCollector:
         trigger_state: Optional[Dict[str, Any]] = None,
     ) -> MarketRegimeSnapshot:
         trigger_state = trigger_state or {}
-        trends = [snapshot.trend for snapshot in timeframes.values() if snapshot.last_close > 0]
-        trend_alignment = "mixed"
-        if trends and all(trend == "UP" for trend in trends):
-            trend_alignment = "bullish"
-        elif trends and all(trend == "DOWN" for trend in trends):
-            trend_alignment = "bearish"
+        trend_alignment = self._resolve_trend_alignment(timeframes)
 
         atr_pcts = [snapshot.atr_pct for snapshot in timeframes.values() if snapshot.atr_pct > 0]
         avg_atr_pct = sum(atr_pcts) / len(atr_pcts) if atr_pcts else 0.0

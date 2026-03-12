@@ -82,8 +82,8 @@ StateStore -------/                  v                                  v
 ```text
 journal + trade_cases + replay + shadow -> MemoryUpdater
     -> long_term_memory
-    -> candidate_policy_versions
-    -> policy_registry (champions)
+    -> candidate_policy_versions (legacy offline artifacts)
+    -> policy_registry (legacy offline registry, no live promotion)
 ```
 
 ## 2026-03 리팩토링 상태
@@ -110,7 +110,7 @@ journal + trade_cases + replay + shadow -> MemoryUpdater
 .\.venv\Scripts\python.exe -m unittest discover -q
 ```
 
-현재 전체 `272`개 테스트가 통과한다.
+검증 기준선은 repo-local `.venv`의 전체 unittest 스위트다.
 
 ## 프로젝트 구조
 
@@ -296,6 +296,7 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 
 현재 구현에서는 live runtime이 레짐별 `policy_registry` champion을 직접 읽어
 `max_order_notional_pct_balance`나 `entry_size_multiplier`를 override하지 않는다.
+또한 shadow policy 기록과 자동 promotion 경로는 비활성화되어, live 정책은 `policy.yaml`과 코드 계약에 고정된다.
 노출 조정은 기본 risk profile을 그대로 사용한다.
 반면 아래 안전 가드레일은 자동 진화 대상이 아니다.
 
@@ -344,7 +345,8 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 - `1h`
   - 전략 판단 중심
   - 신규 진입과 방향성 결정을 담당
-  - `AlphaPolicyEngine`이 먼저 레짐별 진입 필터를 적용하고, 통과한 심볼만 AI 판단 대상으로 보낸다
+  - `AlphaPolicyEngine`은 현재 live pre-filter가 아니라 advisory 요약으로만 남고, AI에는 전체 심볼 스냅샷을 그대로 보낸다
+  - AI structured fallback이 발생하면 최대 2회까지 `1h` 전략 계약을 유지한 채 빠른 재시도 스케줄만 적용할 수 있다
 - `15m`
   - 포지션/주문 관리 중심
   - 기본적으로 신규 진입보다 `EXIT`, `CANCEL`, 주문 정리 쪽으로 제한
@@ -419,7 +421,8 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 여기서 중요한 변경점 세 가지가 있다.
 
 첫째, AI는 현재 리스크 모드와 프로파일을 직접 입력으로 받는다.  
-즉, 리스크 엔진이 나중에 막기만 하는 구조가 아니라, 애초에 더 보수적인 제안을 하도록 유도한다.
+다만 최근 계약에서는 모델 판단 자율성을 넓히기 위해, 이 입력은 hard execution constraint와 sizing context로 우선 쓰고
+설명 품질 문제만으로 행동을 `HOLD`로 덮어쓰지 않게 분리했다.
 
 둘째, AI는 `risk_state`의 구체 수치도 함께 받는다.  
 즉, 단순히 `drawdown` 같은 라벨만 보는 것이 아니라, 현재 일일 손익률, 연속 손실, 쿨다운 잔여 시간, 동적 쿨다운 길이, 반복 실패 패턴 점수, 현재 심볼의 재진입 가드 상태까지 보고 위험도를 해석할 수 있다.
@@ -431,6 +434,8 @@ recent close / recent loss 재진입 가드를 같은 `RiskStateSnapshot` 타입
 `basis_change_1h`, `spread_percentile_1h`, `depth_percentile_1h`, `spread_vs_1h_avg`,
 `distance_to_15m_breakout_level`, `distance_to_1h_breakout_level`, `distance_to_invalid_level`처럼
 LLM이 바로 해석하기 쉬운 파생 필드를 상단 요약으로 함께 전달한다.
+여기서 `trend_alignment`는 최근 `15m/1h/4h` 다수결과 `1h/4h` 우선 정렬로 완화되었고,
+`distance_to_invalid_level`은 신규 진입 veto가 아니라 sizing/stop-definition 입력으로 다루는 것이 현재 계약이다.
 
 최근 프롬프트는 입력 섹션 이름을 `market_context`가 아니라 `market_snapshots`로 통일한다.
 구조화 evidence의 `source`도 `market_snapshots.*`, `risk_state.*`, `account_state.*` 같은 실제 `DecisionRequest` 경로를 가리켜야 한다.
@@ -553,12 +558,29 @@ AI 출력은 `TradeIntent`다.
 - 리스크 우회 금지
 - 영어 텍스트 강제
 - guarded 상태에서는 신규 진입보다 리스크 축소 우선
+- retrieval context는 advisory only이며, hold-heavy retrieval이 현재 결정을 기계적으로 누르지 않게 한다
+- `trend_alignment='mixed'`는 caution flag이지 단독 veto가 아니다
+- `distance_to_invalid_level`은 size/stop-definition 입력이지 단독 veto가 아니다
 - `risk_trigger`가 있으면 스프레드와 펀딩 같은 거래 품질 악화를 별도 위험 신호로 해석
-- `rationale_items.evidence[].source`는 실제 `DecisionRequest` 경로를 가리켜야 하며, 관측값과 어긋나면 보수적으로 `HOLD` fallback
-- `operator`도 의미 검증한다. 즉 `gte`, `lt`, `cross_up`, `delta_abs_gte` 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 `HOLD` fallback
-- 신규 진입에서는 `trade_implication`이 실제 행동 방향과 맞지 않거나, 근거 품질 대비 confidence가 과하면 보수적으로 `HOLD` fallback
+- liquidation / hard cooldown / drawdown 같은 account-risk 압박은 신규 노출을 강하게 꺼리게 하지만,
+  spread / depth / funding 같은 execution-quality 악화는 우선 size/confidence 감산으로 처리한다
+- `rationale_items.evidence[].source`는 실제 `DecisionRequest` 경로를 가리켜야 하며, 관측값과 어긋나면 explanation invalid 또는 schema fallback으로 기록된다
+- `operator`도 의미 검증한다. 즉 `gte`, `lt`, `cross_up`, `delta_abs_gte` 같은 비교가 실제 관측값과 threshold에서 성립하지 않으면 action/schema 단계에서 차단된다
+- 신규 진입에서는 `trade_implication`이 실제 행동 방향과 맞지 않거나, 근거 품질 대비 confidence가 과하면 explanation invalid 또는 action/schema invalid로 분리 기록된다
 - 신규 진입에서 `rationale_items`가 있으면 evidence 품질도 본다. 신호 다양성, symbol 커버리지, failure_mode 유무가 약하면 entry size cap을 더 낮춘다.
 - 프롬프트에는 `entry_headroom`도 들어간다. 이는 남은 entry budget, pending entry notional, leverage 여유를 compact하게 요약한 입력이다.
+
+최근 결정 결과에는 아래 품질 플래그가 함께 저장된다.
+
+- `decision_valid`
+- `explanation_valid`
+- `execution_admissible`
+- `learning_eligible`
+
+즉 모델의 raw intent, 실행 가능 여부, 학습 적격성을 분리해서 본다.
+설명 품질 문제는 기본적으로 `explanation_valid=false`, `learning_eligible=false`로 남기고,
+행동 자체는 risk/execution gate가 막을 때만 실제 주문에서 차단하는 것이 현재 계약이다.
+`fallback_safe_intent`가 발생해도 다음 cycle을 `15m` 관리 loop로 바꾸지 않고, 같은 `1h` 전략 계약으로 최대 두 번 더 빠르게 재시도한다.
 
 ## 리스크 관리 상세
 
@@ -746,6 +768,7 @@ context_budget:
   - Learning note: runtime retrieval scores are additionally adjusted by batch-produced `journal_reranker_profile` and `similar_case_reranker_profile` artifacts instead of relying on static heuristics alone.
   - 최근 journal/long_term_memory/similar case를 전부 보내지 않고, 관련성 높은 상위 컨텍스트만 압축해 전달한다.
   - recent_journal_context는 action 사례만 몰리지 않도록 hold/action/fallback 버킷을 분산 선택한다.
+  - 단, explanation invalid 또는 learning ineligible audit는 prompt-safe retrieval에서 기본 제외한다.
   - similar_past_cases는 시스템 오류성 fallback audit, validation fallback audit, 그리고 그 audit에 연결된 trade case를 기본 제외한다.
   - long_term_memory는 `risk_control`, `opportunity`, `execution_quality`를 한쪽으로 쏠리지 않게 섞고, retired/저신뢰 항목은 기본 제외한다.
 
@@ -968,7 +991,7 @@ policy 평가에도 같은 opportunity cost를 함께 반영한다.
 여기서 `probe only opportunity hold`는 공격적 probe baseline은 이겼지만 더 보수적인 simple-rule baseline은 이기지 못한 경우다.
 즉 baseline 착시와 실제 missed opportunity를 분리하려는 중간 계층이다.
 중요한 점은 이 균형 점수가 이제 같은 단위만 비교한다는 것이다.
-`hold_opportunity_cost`와 promotion gate에 쓰이는 `false_entry_cost`는 둘 다 퍼센트 기준으로 비교하고,
+`hold_opportunity_cost`와 offline review gate에 쓰이는 `false_entry_cost`는 둘 다 퍼센트 기준으로 비교하고,
 실현 손익 금액은 `false_entry_cost_amount`로 별도 보조 메트릭으로만 남긴다.
 또한 opportunity lesson seed는 문장만 좁아진 것이 아니라,
 `trigger_context`, `execution_context`, `trend_context`, `hold_quality`를 구조화 memory에도 같이 저장한다.
@@ -1322,7 +1345,7 @@ baseline은 `attention active + acceptable spread/depth + manageable invalidatio
 또한 baseline entry 하나만 보지 않고 더 보수적인 `simple_rule_entry`도 같이 계산한다.
 즉 replay는 `probe_entry vs actual HOLD`뿐 아니라 `simple_rule_entry vs actual HOLD`도 함께 저장해,
 "놓친 기회"가 단순 공격적 baseline 착시인지까지 구분하려고 한다.
-그리고 memory/promotion은 opportunity cost만 보지 않는다.
+그리고 memory/offline evaluation은 opportunity cost만 보지 않는다.
 `turnover_rate`, `capital_idle_ratio`, `avg_holding_minutes`, `avg_entry_slippage_bps`,
 `drawdown_path_penalty`, `regime_capacity_penalty`, `portfolio_utility_score`도 같이 계산해
 "기회를 안 놓쳤다"가 아니라 "실제로 더 나은 포트폴리오 효용이었는가"까지 본다.
@@ -1415,7 +1438,7 @@ source lookup에는 current value뿐 아니라 previous value와 original/replay
 또한 `retired`, `retirement_reason`을 함께 계산해, holdout에서 더 이상 같은 손실 패턴이 재현되지 않거나 품질이 너무 낮은 cluster는 candidate lesson seed에서 자동 제외한다.
 배치는 replay에서 집계한 `hold_opportunity_summary`와 `trading_balance_summary`도 함께 읽는다.
 즉 최근 시스템이 과도한 HOLD 편향인지, 반대로 false entry cost가 더 큰 과잉 진입 상태인지도 함께 본다.
-이 값은 candidate lesson 생성뿐 아니라 `alpha_1h` 후보 평가와 offline review gate에도 들어간다.
+이 값은 candidate lesson 생성과 offline review gate에는 들어가지만, live 정책 자동 승격에는 사용하지 않는다.
 최근 review gate는 `hold_opportunity_cost`, `false_entry_cost`, `pressure_ratio`, `balance_score`뿐 아니라
 `portfolio_utility_score`, `confidence_alignment_score`, `temporal_holdout_summary`도 같이 본다.
 즉 한쪽 비용이 과도하게 큰 상태이거나 두 비용의 비율이 너무 깨져 있거나,
@@ -1497,6 +1520,9 @@ Flask 대시보드는 최근 운영 상태를 빠르게 확인하는 용도다.
 
 대시보드 상단 `Context Mix` 카드는 최근 24시간 audit에 저장된 `execution_summary.context_selection_summary`를 집계해
 실제 프롬프트 컨텍스트가 action-heavy인지, fallback이 과도한지, good hold가 충분히 회수되는지 확인하는 용도다.
+good hold는 보수성이 유효했던 사례, missed hold는 기회를 놓친 사례로 따로 본다. 둘 다 retrieval의 참고 근거이지 현재 결정을 투표로 누르는 신호는 아니다.
+운영 해석상 good hold는 불필요한 손실 회피 사례, missed hold는 진입 가능한 구조를 놓친 사례다.
+둘 다 memory/replay에서 따로 집계하되, live prompt에서는 advisory evidence로만 사용한다.
 
 ### audit 상세에서 볼 수 있는 것
 
@@ -1691,9 +1717,9 @@ Dashboard startup now resolves `.env` and opens `StateStore` lazily on the first
 - 최근 24시간 replay candidate 처리율
 - recent journal / similar case reranker artifact 준비 여부
 - shadow dataset 준비 여부
-- stale learning으로 인한 promotion 차단 여부
+- stale learning으로 인한 offline evaluation 차단 여부
 
-`Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도 `policy_promotions`는 자동으로 멈춘다.
+`Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도, offline evaluation artifact는 신뢰 가능한 최신 학습 상태로 간주하지 않는다.
 
 대시보드는 `.env`의 `DB_PATH`를 사용해 같은 SQLite를 읽는다.  
 audit replay를 대시보드에서 실행할 때는 `REPLAY_PROVIDER`, `REPLAY_API_KEY`, `REPLAY_MODEL`을 우선 보고, 비어 있으면 `AI_PROVIDER`, `AI_API_KEY`, `AI_DEFAULT_MODEL` 계열 설정으로 fallback 한다.
@@ -1742,7 +1768,7 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 - ExecutionEngine 체결 매칭과 상태 전이 생성
 - 장기 메모리 통계와 조건 메타데이터 저장
 
-현재 전체 테스트 수는 `272`개이며, 2026-03-09 기준 전체 통과 상태다.
+문서상 고정 테스트 개수는 유지하지 않는다. 기준은 repo-local unittest 스위트가 전체 통과하는 것이다.
 
 ## 운영 문서
 
@@ -1884,6 +1910,10 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
   - 최근 30~90일 audit는 hot storage
   - 그 이전은 별도 백업
 - replay와 memory를 계속 쓸 계획이면 `audit_logs`는 함부로 지우지 않는 편이 좋다.
+- 최근 `HOLD` 편향만 빠르게 씻고 싶으면 전체 DB 삭제보다 부분 초기화를 먼저 권한다.
+  - 보존: `audit_logs`, `journal`, `ledger`
+  - 재생성: `long_term_memory`, `learning_artifacts`, `replay_runs`, `data/learning/`
+  - 이 경우 런타임 프로세스를 재시작해 in-memory artifact cache도 같이 비운다.
 
 ## 수익률 진단
 

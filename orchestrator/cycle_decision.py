@@ -209,7 +209,18 @@ class TradingCycleDecisionMixin:
                 model_name="deterministic_skip",
                 input_hash=input_hash,
                 cache_hit=False,
-                usage_metadata={"skipped": True, "reason": skip_reason},
+                usage_metadata={
+                    "skipped": True,
+                    "reason": skip_reason,
+                    "decision_valid": True,
+                    "explanation_valid": True,
+                    "learning_eligible": True,
+                    "validation_stage": "deterministic_skip",
+                },
+                decision_valid=True,
+                explanation_valid=True,
+                learning_eligible=True,
+                validation_issues=[],
             )
         else:
             context_budget = self._build_context_budget()

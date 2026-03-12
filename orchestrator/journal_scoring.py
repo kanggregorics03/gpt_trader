@@ -51,10 +51,10 @@ class TradingJournalScoringMixin:
         elif decision == "HOLD":
             bucket = self._classify_recent_journal_bucket(row)
             if bucket == "good_hold":
-                score += 4.5
+                score += 1.75
                 matched_features.append("good_hold")
             elif bucket == "missed_opportunity_hold":
-                score += 1.5
+                score += 4.25
                 matched_features.append("missed_opportunity_hold")
         if bool(row.get("loss_signal")):
             score += 8.0

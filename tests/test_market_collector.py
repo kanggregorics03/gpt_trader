@@ -134,6 +134,22 @@ class RangeBreakHysteresisExchange:
         return {"last": 100.2, "high": 101.0, "low": 99.0, "percentage": 0.2}
 
 
+class PrimaryTimeframeAlignmentExchange:
+    has = {"fetchOrderBook": False}
+
+    def fetch_ohlcv(self, symbol, timeframe="15m", limit=80):
+        series = {
+            "5m": build_ohlcv_series(120, -0.7, 100, count=limit),
+            "15m": build_ohlcv_series(118, -0.2, 110, count=limit),
+            "1h": build_ohlcv_series(100, 1.6, 180, count=limit),
+            "4h": build_ohlcv_series(80, 2.8, 260, count=limit),
+        }
+        return series[timeframe]
+
+    def fetch_ticker(self, symbol):
+        return {"last": 205.0, "high": 212.0, "low": 160.0, "percentage": 2.8}
+
+
 class DynamicMetricsPublicFeed:
     def __init__(self):
         self.tick = 0
@@ -237,6 +253,16 @@ class TestMarketCollector(unittest.TestCase):
         self.assertIsNone(snapshot.oi_change_15m)
         self.assertIn("15m", snapshot.timeframes)
         self.assertEqual(snapshot.risk_trigger_reasons, [])
+
+    def test_market_snapshot_prioritizes_primary_timeframes_for_trend_alignment(self):
+        collector = MarketCollector(PrimaryTimeframeAlignmentExchange())
+
+        snapshot = collector.get_market_snapshot("BTCUSDT")
+
+        self.assertEqual(snapshot.timeframes["15m"].trend, "DOWN")
+        self.assertEqual(snapshot.timeframes["1h"].trend, "UP")
+        self.assertEqual(snapshot.timeframes["4h"].trend, "UP")
+        self.assertEqual(snapshot.regime.trend_alignment, "bullish")
 
     def test_fast_price_move_hysteresis_keeps_trigger_active_within_off_band(self):
         collector = MarketCollector(HysteresisExchange())

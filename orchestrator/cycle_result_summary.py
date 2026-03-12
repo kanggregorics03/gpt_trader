@@ -103,6 +103,9 @@ class TradingCycleResultSummaryMixin:
             "has_open_orders": self._has_live_open_orders(final_account_state),
             "has_unknown_orders": final_unknown_order_count > 0,
             "executed_order_count": execution_summary.get("executed_order_count", 0),
+            "ai_fallback_retriable": bool(
+                ((execution_summary.get("ai_fallback_retry") or {}).get("retriable"))
+            ),
             "position_closed": self._position_closed_during_cycle(
                 execution_outcome["effective_pre_execution_state"],
                 execution_outcome["post_account_state"],

@@ -35,4 +35,4 @@
 ## Current status
 
 - `.\.venv\Scripts\python.exe -m unittest discover -q`
-- Result: all `272` tests passing
+- Result: repo-local unittest suite passing at verification time

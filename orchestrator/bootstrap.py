@@ -224,7 +224,19 @@ class TradingBootstrapMixin:
             model_name=model_name,
             input_hash=input_hash,
             cache_hit=False,
-            usage_metadata={"skipped": True, "policy_source": metadata.get("policy_source") or model_name, **metadata},
+            usage_metadata={
+                "skipped": True,
+                "policy_source": metadata.get("policy_source") or model_name,
+                "decision_valid": True,
+                "explanation_valid": True,
+                "learning_eligible": True,
+                "validation_stage": "policy",
+                **metadata,
+            },
+            decision_valid=True,
+            explanation_valid=True,
+            learning_eligible=True,
+            validation_issues=[],
         )
 
     def _prepare_decision_market_snapshots(
@@ -238,7 +250,9 @@ class TradingBootstrapMixin:
         decision_market_snapshots = dict(market_snapshots or {})
         alpha_summary = {
             "applied": False,
+            "advisory_only": False,
             "allowed_symbols": sorted(decision_market_snapshots.keys()),
+            "policy_clear_symbols": sorted(decision_market_snapshots.keys()),
             "blocked_symbols": {},
         }
         if loop_mode == "5m":
@@ -258,10 +272,12 @@ class TradingBootstrapMixin:
         )
         alpha_summary = {
             "applied": bool(alpha_policy_override or self.alpha_policy_engine.get_active_policy(regime_key=regime_key)),
-            "allowed_symbols": sorted(filtered_snapshots.keys()),
+            "advisory_only": True,
+            "allowed_symbols": sorted(decision_market_snapshots.keys()),
+            "policy_clear_symbols": sorted(filtered_snapshots.keys()),
             "blocked_symbols": dict(blocked_symbols or {}),
         }
-        return self._sanitize_base_loop_market_context(filtered_snapshots), alpha_summary
+        return self._sanitize_base_loop_market_context(decision_market_snapshots), alpha_summary
 
     def _sanitize_base_loop_market_context(self, market_snapshots):
         stripped = {}
@@ -318,146 +334,10 @@ class TradingBootstrapMixin:
         symbol_journal_entries: list[dict],
         regime_key: str = "",
     ):
-        if not hasattr(self.state_store, "get_candidate_policy_versions"):
-            return
-        trade_case_by_symbol = {
-            str((entry or {}).get("symbol") or ""): str((entry or {}).get("trade_case_id") or "")
-            for entry in (symbol_journal_entries or [])
-            if (entry or {}).get("symbol")
-        }
-        shadow_entries = []
-        if loop_mode == "15m":
-            candidates = self.state_store.get_candidate_policy_versions(
-                domain="position_15m",
-                regime_key=regime_key or None,
-                statuses=["candidate", "shadow"],
-                limit=5,
-            )
-            if not candidates and regime_key:
-                candidates = self.state_store.get_candidate_policy_versions(
-                    domain="position_15m",
-                    statuses=["candidate", "shadow"],
-                    limit=5,
-                )
-            live_summary = {
-                "decision": live_intent.decision,
-                "orders": [order.model_dump() if hasattr(order, "model_dump") else dict(order) for order in (live_intent.orders or [])],
-                "exit_reason": getattr(live_intent, "exit_reason", None),
-            }
-            for candidate in candidates:
-                candidate_result = self.position_policy_engine.evaluate(
-                    account_state=account_state,
-                    market_snapshots=market_snapshots,
-                    risk_mode=risk_mode,
-                    loop_mode=loop_mode,
-                    regime_key=regime_key,
-                    policy_override=candidate.get("config") or {},
-                )
-                if candidate_result.get("escalate_to_ai"):
-                    continue
-                shadow_payload = candidate_result.get("decision_result") or {}
-                divergence_type = self._classify_shadow_divergence(live_summary, shadow_payload)
-                if divergence_type == "none":
-                    continue
-                symbol = ""
-                shadow_orders = shadow_payload.get("orders") or []
-                if shadow_orders:
-                    symbol = str(getattr(shadow_orders[0], "symbol", None) or shadow_orders[0].get("symbol") or "")
-                if not symbol and live_intent.orders:
-                    symbol = str(getattr(live_intent.orders[0], "symbol", None) or "")
-                shadow_entries.append(
-                    {
-                        "audit_log_id": audit_log_id,
-                        "candidate_policy_id": candidate.get("id"),
-                        "domain": "position_15m",
-                        "symbol": symbol or None,
-                        "loop_mode": loop_mode,
-                        "guarded_attention": bool(is_guarded_attention),
-                        "safety_mode": bool(is_safety_mode),
-                        "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
-                        "divergence_type": divergence_type,
-                        "payload": {
-                            "live_intent": live_summary,
-                            "shadow_intent": {
-                                "decision": shadow_payload.get("decision"),
-                                "orders": [
-                                    order.model_dump() if hasattr(order, "model_dump") else dict(order)
-                                    for order in shadow_orders
-                                ],
-                                "exit_reason": shadow_payload.get("exit_reason"),
-                                "rationale": shadow_payload.get("rationale") or [],
-                            },
-                            "candidate_policy": candidate,
-                        },
-                    }
-                )
-        if loop_mode == "5m":
-            candidates = self.state_store.get_candidate_policy_versions(
-                domain="safety_5m",
-                regime_key=regime_key or None,
-                statuses=["candidate", "shadow"],
-                limit=5,
-            )
-            if not candidates and regime_key:
-                candidates = self.state_store.get_candidate_policy_versions(
-                    domain="safety_5m",
-                    statuses=["candidate", "shadow"],
-                    limit=5,
-                )
-            live_summary = {
-                "decision": live_intent.decision,
-                "orders": [order.model_dump() if hasattr(order, "model_dump") else dict(order) for order in (live_intent.orders or [])],
-                "exit_reason": getattr(live_intent, "exit_reason", None),
-            }
-            for candidate in candidates:
-                candidate_result = self.safety_policy_engine.evaluate(
-                    account_state=account_state,
-                    market_snapshots=market_snapshots,
-                    risk_mode=risk_mode,
-                    loop_mode=loop_mode,
-                    regime_key=regime_key,
-                    policy_override=candidate.get("config") or {},
-                )
-                if candidate_result.get("escalate_to_ai"):
-                    continue
-                shadow_payload = candidate_result.get("decision_result") or {}
-                divergence_type = self._classify_safety_shadow_divergence(live_summary, shadow_payload)
-                if divergence_type == "none":
-                    continue
-                symbol = ""
-                shadow_orders = shadow_payload.get("orders") or []
-                if shadow_orders:
-                    symbol = str(getattr(shadow_orders[0], "symbol", None) or shadow_orders[0].get("symbol") or "")
-                if not symbol and live_intent.orders:
-                    symbol = str(getattr(live_intent.orders[0], "symbol", None) or "")
-                shadow_entries.append(
-                    {
-                        "audit_log_id": audit_log_id,
-                        "candidate_policy_id": candidate.get("id"),
-                        "domain": "safety_5m",
-                        "symbol": symbol or None,
-                        "loop_mode": loop_mode,
-                        "guarded_attention": bool(is_guarded_attention),
-                        "safety_mode": bool(is_safety_mode),
-                        "trade_case_id": trade_case_by_symbol.get(symbol or "", None),
-                        "divergence_type": divergence_type,
-                        "payload": {
-                            "live_intent": live_summary,
-                            "shadow_intent": {
-                                "decision": shadow_payload.get("decision"),
-                                "orders": [
-                                    order.model_dump() if hasattr(order, "model_dump") else dict(order)
-                                    for order in shadow_orders
-                                ],
-                                "exit_reason": shadow_payload.get("exit_reason"),
-                                "rationale": shadow_payload.get("rationale") or [],
-                            },
-                            "candidate_policy": candidate,
-                        },
-                    }
-                )
-        if shadow_entries and hasattr(self.state_store, "save_shadow_decisions"):
-            self.state_store.save_shadow_decisions(shadow_entries)
+        # Policy evolution remains disabled in live runtime. Keep the method as a
+        # no-op so the persistence flow stays stable without producing shadow data
+        # that suggests candidate policies can affect current trading behavior.
+        return
 
     def _classify_shadow_divergence(self, live_summary: dict, shadow_payload: dict) -> str:
         live_decision = str(live_summary.get("decision") or "")
@@ -592,6 +472,16 @@ class TradingBootstrapMixin:
             1,
             int(config.get("trade_case_snapshot_poll_seconds", 5) or 5),
         )
+        config["ai_fallback_retry_limit"] = max(
+            0,
+            int(config.get("ai_fallback_retry_limit", 2) or 0),
+        )
+        configured_retry_mode = str(config.get("ai_fallback_retry_mode", "15m") or "15m").strip()
+        config["ai_fallback_retry_mode"] = (
+            configured_retry_mode
+            if configured_retry_mode in getattr(self, "LOOP_MODE_PRIORITY", {"1h": 1, "15m": 2, "5m": 3})
+            else "15m"
+        )
         return config
 
     def _initialize_runtime_state(self):
@@ -602,6 +492,8 @@ class TradingBootstrapMixin:
         self.flat_clear_streak = 0
         self.last_execution_at = None
         self.last_close_at = None
+        self.ai_fallback_retry_remaining = 0
+        self.ai_fallback_retry_due = False
         self.last_recovery_sweep_at = 0.0
         self.last_daily_batch_date = None
         self.daily_batch_running = False

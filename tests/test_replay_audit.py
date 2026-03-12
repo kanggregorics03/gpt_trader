@@ -206,6 +206,75 @@ class TestReplayAudit(unittest.TestCase):
         self.assertIn("UP", summary["trend_context"]["signature"])
         self.assertGreater(summary["windows"]["30m"]["realized_move_pct"], 0.0)
 
+    def test_hold_opportunity_counterfactual_marks_validated_good_hold(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000.0, "available_balance": 1000.0, "positions": [], "open_orders": [], "open_orders_count": 0},
+            market={
+                "market_snapshots": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "current_price": 100.0,
+                        "mark_price": 100.0,
+                        "atr_1h": 3.0,
+                        "trend_1h": "UP",
+                        "volume_ratio_15m": 1.6,
+                        "spread_percentile_1h": 35.0,
+                        "depth_percentile_1h": 75.0,
+                        "distance_to_invalid_level": 0.9,
+                        "fast_move_signal_active": True,
+                        "volume_surge_signal_active": True,
+                        "range_break_signal_active": False,
+                        "timeframes": {
+                            "15m": {"trend": "UP", "change_3bar_pct": 0.3, "rsi_14": 56.0},
+                            "1h": {"trend": "UP", "change_3bar_pct": 0.5, "rsi_14": 57.0},
+                        },
+                        "order_book": {"mid_price": 100.0, "spread_bps": 2.0},
+                    }
+                }
+            },
+            intent={"decision": "HOLD", "orders": [], "rationale": ["Wait for confirmation."], "confidence": 0.35},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshots": {}},
+        )
+        self.store.conn.execute(
+            "UPDATE audit_logs SET timestamp = ? WHERE id = ?",
+            ("2026-03-08 12:00:00", audit_id),
+        )
+        future_id = self.store.save_audit(
+            account={"total_balance": 1000.0},
+            market={
+                "market_snapshots": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "current_price": 100.18,
+                        "mark_price": 100.15,
+                        "order_book": {"mid_price": 100.16, "spread_bps": 2.5},
+                    }
+                }
+            },
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.2},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        self.store.conn.execute(
+            "UPDATE audit_logs SET timestamp = ? WHERE id = ?",
+            ("2026-03-08 12:25:00", future_id),
+        )
+        self.store.conn.commit()
+
+        audit = self.store.get_audit_log(audit_id)
+        summary = evaluate_hold_opportunity_counterfactual(self.store, audit)
+
+        self.assertEqual(summary["hold_quality"], "good_hold")
+        self.assertEqual(summary["hold_quality_detail"], "probe_candidate_hold")
+        self.assertFalse(summary["baseline_beats_hold"])
+        self.assertFalse(summary["simple_rule_baseline_beats_hold"])
+        self.assertEqual(summary["missed_breakout_count"], 0)
+        self.assertEqual(summary["hold_opportunity_cost"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

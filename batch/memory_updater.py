@@ -3872,103 +3872,10 @@ Computed statistics:
         return evaluations
 
     def _promote_candidate_policies(self, candidates: List[Dict[str, Any]], evaluations: List[Dict[str, Any]]):
-        if not self._learning_promotions_allowed():
-            logger.warning("Skipping candidate policy promotion because learning liveness is stale.")
-            return
-        best_by_domain: Dict[tuple[str, str], Dict[str, Any]] = {}
-        for candidate in candidates or []:
-            candidate_id = candidate.get("id")
-            if not candidate_id:
-                continue
-            evaluation = next((row for row in evaluations if row.get("candidate_policy_id") == candidate_id), None)
-            if not evaluation:
-                continue
-            domain = str(candidate.get("domain") or "").strip()
-            regime_key = str(candidate.get("regime_key") or ((evaluation.get("metrics") or {}).get("regime_key")) or "").strip()
-            key = (domain, regime_key)
-            current = best_by_domain.get(key)
-            if current is None or float(evaluation.get("score") or 0.0) > float(current["evaluation"].get("score") or 0.0):
-                best_by_domain[key] = {"candidate": candidate, "evaluation": evaluation}
-
-        for (domain, _), bundle in best_by_domain.items():
-            candidate = bundle["candidate"]
-            evaluation = bundle["evaluation"]
-            sample_count = int(evaluation.get("sample_count") or 0)
-            score = float(evaluation.get("score") or 0.0)
-            evaluation_scope = str(evaluation.get("evaluation_scope") or "seed")
-            if domain == "alpha_1h":
-                trading_balance_summary = (evaluation.get("metrics") or {}).get("trading_balance_summary") or {}
-                hold_cost = float(trading_balance_summary.get("hold_opportunity_cost") or 0.0)
-                false_entry_cost = float(trading_balance_summary.get("false_entry_cost") or 0.0)
-                balance_score = float(trading_balance_summary.get("balance_score") or 0.0)
-                portfolio_utility_score = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
-                pressure_ratio = self._coerce_float(trading_balance_summary.get("pressure_ratio"))
-                confidence_alignment_score = float((evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5)
-                temporal_holdout_summary = (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {}
-                if (
-                    hold_cost > 3.5
-                    or false_entry_cost > 3.5
-                    or balance_score < 0.3
-                    or portfolio_utility_score < 0.25
-                    or confidence_alignment_score < 0.3
-                    or (pressure_ratio is not None and (pressure_ratio < 0.55 or pressure_ratio > 1.85))
-                    or not self._passes_temporal_holdout_gate(temporal_holdout_summary)
-                ):
-                    continue
-                if evaluation_scope == "shadow":
-                    if sample_count < 2 or score <= 0:
-                        continue
-                else:
-                    if sample_count < 4 or score < 0.15:
-                        continue
-            elif sample_count < 3 or score <= 0:
-                continue
-            regime_key = str(candidate.get("regime_key") or ((evaluation.get("metrics") or {}).get("regime_key")) or "").strip()
-            policy_key = (
-                self.state_store.build_policy_key(domain, regime_key)
-                if hasattr(self.state_store, "build_policy_key")
-                else (f"champion:{domain}:{regime_key}" if regime_key else f"champion:{domain}")
-            )
-            existing = self.state_store.get_policy_registry_entry(policy_key) if hasattr(self.state_store, "get_policy_registry_entry") else {}
-            existing_score = float(((existing.get("metrics") or {}).get("score")) or 0.0) if existing else 0.0
-            if existing and score <= existing_score:
-                continue
-            version = int(existing.get("version") or 0) + 1 if existing else 1
-            registry_entry = {
-                "policy_key": policy_key,
-                "domain": domain,
-                "policy_type": candidate.get("policy_type"),
-                "regime_key": regime_key or None,
-                "active_candidate_policy_id": candidate.get("id"),
-                "version": version,
-                "config": candidate.get("config") or {},
-                "metrics": {
-                    "score": score,
-                    "sample_count": sample_count,
-                    "candidate_policy_id": candidate.get("id"),
-                    "rule_text": candidate.get("rule_text"),
-                    "regime_key": regime_key or "",
-                    "temporal_holdout_summary": (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {},
-                    "confidence_alignment_score": (evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5,
-                    "portfolio_utility_score": (
-                        ((evaluation.get("metrics") or {}).get("trading_balance_summary") or {}).get("portfolio_utility_score")
-                        or 0.0
-                    ),
-                },
-            }
-            if hasattr(self.state_store, "upsert_policy_registry"):
-                self.state_store.upsert_policy_registry(registry_entry)
-            if hasattr(self.state_store, "save_policy_promotion"):
-                self.state_store.save_policy_promotion(
-                    {
-                        "domain": domain,
-                        "regime_key": regime_key or None,
-                        "previous_candidate_policy_id": existing.get("active_candidate_policy_id") if existing else None,
-                        "new_candidate_policy_id": candidate.get("id"),
-                        "reason": f"Auto-promoted from {evaluation.get('evaluation_scope')} evaluation.",
-                        "metrics": registry_entry["metrics"],
-                    }
-                )
+        logger.info(
+            "Skipping candidate policy promotion: policy evolution is disabled and live policy remains fixed."
+        )
+        return
 
     def _build_replay_execution_summary(self, replay_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not replay_runs:

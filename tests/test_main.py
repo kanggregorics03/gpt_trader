@@ -18,6 +18,8 @@ class DummyRiskEngine:
             "trigger_loop_minutes": 5,
         },
         "adaptive_loop": {
+            "ai_fallback_retry_limit": 2,
+            "ai_fallback_retry_mode": "15m",
             "trigger_clear_cycles": 2,
             "position_min_duration_minutes": 30,
             "flat_clear_cycles": 4,
@@ -671,7 +673,7 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "journal_id": 1,
                 "decision": "HOLD",
                 "rationale": ["No trigger, waiting for clarity."],
-                "rationale_items": [],
+                "rationale_items": [{"summary": "Replay-validated hold.", "hold_quality": "good_hold"}],
                 "risk_reason": "Safe action.",
                 "risk_mode": "normal",
                 "loss_signal": False,
@@ -704,6 +706,25 @@ class TestTradingOrchestrator(unittest.TestCase):
                 "summary": "HOLD: fallback",
                 "execution_summary": {"ai_usage": {"validation_error": True}},
             },
+            {
+                "journal_id": 4,
+                "decision": "BUY",
+                "rationale": ["Valid action but explanation failed."],
+                "rationale_items": [],
+                "risk_reason": "Approved",
+                "risk_mode": "normal",
+                "loss_signal": False,
+                "trigger_symbols": ["BTCUSDT"],
+                "risk_trigger_symbols": [],
+                "summary": "BUY: explanation invalid",
+                "execution_summary": {
+                    "decision_quality": {
+                        "decision_valid": True,
+                        "explanation_valid": False,
+                        "learning_eligible": False,
+                    }
+                },
+            },
         ]
 
         selected = orchestrator._select_recent_journal_context(
@@ -720,7 +741,7 @@ class TestTradingOrchestrator(unittest.TestCase):
 
         self.assertEqual([row["journal_id"] for row in selected], [1, 2])
         summary = orchestrator.last_context_selection_summary["recent_journal_context"]
-        self.assertEqual(summary["excluded_bucket_counts"]["system_fallback"], 1)
+        self.assertEqual(summary["excluded_bucket_counts"]["system_fallback"], 2)
         self.assertEqual(summary["selected_bucket_counts"]["good_hold"], 1)
         self.assertEqual(summary["selected_bucket_counts"]["entry_action"], 1)
 
@@ -1251,7 +1272,7 @@ class TestTradingOrchestrator(unittest.TestCase):
 
         self.assertEqual(len(cases), 3)
 
-    def test_deterministic_skip_when_no_exposure_and_entries_blocked(self):
+    def test_deterministic_skip_does_not_block_ai_during_cooldown_alone(self):
         orchestrator = self._make_orchestrator()
 
         reason = orchestrator._get_deterministic_skip_reason(
@@ -1277,7 +1298,35 @@ class TestTradingOrchestrator(unittest.TestCase):
             risk_profile={"allowed_actions": ["HOLD", "REDUCE", "EXIT"]},
         )
 
-        self.assertEqual(reason, "cooldown_active")
+        self.assertIsNone(reason)
+
+    def test_deterministic_skip_still_blocks_hard_daily_loss_kill_switch(self):
+        orchestrator = self._make_orchestrator()
+
+        reason = orchestrator._get_deterministic_skip_reason(
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=1000.0,
+                positions=[],
+                open_orders=[],
+                open_orders_count=0,
+            ),
+            market_snapshots={
+                "BTCUSDT": MarketSnapshot(
+                    symbol="BTCUSDT",
+                    current_price=30000.0,
+                    atr_15m=120.0,
+                    atr_1h=240.0,
+                    trend_1h="UP",
+                    recent_volume_surge=False,
+                )
+            },
+            risk_state={"daily_pnl_pct": -3.2},
+            risk_mode="drawdown",
+            risk_profile={"allowed_actions": ["HOLD", "REDUCE", "EXIT"]},
+        )
+
+        self.assertEqual(reason, "daily_loss_kill_switch")
 
     def test_deterministic_skip_does_not_block_only_wide_spread_context(self):
         orchestrator = self._make_orchestrator()
@@ -1384,8 +1433,10 @@ class TestTradingOrchestrator(unittest.TestCase):
             loop_mode="1h",
         )
 
-        self.assertEqual(sorted(filtered.keys()), ["ETHUSDT"])
+        self.assertEqual(sorted(filtered.keys()), ["BTCUSDT", "ETHUSDT"])
         self.assertTrue(summary["applied"])
+        self.assertTrue(summary["advisory_only"])
+        self.assertEqual(summary["policy_clear_symbols"], ["ETHUSDT"])
         self.assertIn("BTCUSDT", summary["blocked_symbols"])
 
     def test_determine_desired_loop_mode_uses_5m_only_for_active_management_under_safety_trigger(self):
@@ -1487,6 +1538,94 @@ class TestTradingOrchestrator(unittest.TestCase):
         )
 
         self.assertEqual(desired_mode, "1h")
+
+    def test_ai_fallback_retry_keeps_1h_mode_but_uses_15m_schedule_for_two_attempts(self):
+        orchestrator = self._make_orchestrator()
+
+        orchestrator._refresh_ai_fallback_retry_state(
+            {"ai_fallback_retriable": True},
+            "1h",
+        )
+        self.assertEqual(orchestrator.ai_fallback_retry_remaining, 2)
+        self.assertTrue(orchestrator.ai_fallback_retry_due)
+
+        desired_first = orchestrator._determine_desired_loop_mode(
+            {
+                "guarded_attention_active": False,
+                "final_account_state": AccountState(
+                    total_balance=1000.0,
+                    available_balance=1000.0,
+                    positions=[],
+                    open_orders=[],
+                    open_orders_count=0,
+                ),
+                "has_unknown_orders": False,
+            }
+        )
+        self.assertEqual(desired_first, "1h")
+        self.assertEqual(orchestrator._scheduled_minutes_for_active_mode(desired_first), 15)
+
+        orchestrator._refresh_ai_fallback_retry_state(
+            {"ai_fallback_retriable": True},
+            "1h",
+            was_retry_cycle=True,
+        )
+        self.assertEqual(orchestrator.ai_fallback_retry_remaining, 1)
+        self.assertTrue(orchestrator.ai_fallback_retry_due)
+
+        desired_second = orchestrator._determine_desired_loop_mode(
+            {
+                "guarded_attention_active": False,
+                "final_account_state": AccountState(
+                    total_balance=1000.0,
+                    available_balance=1000.0,
+                    positions=[],
+                    open_orders=[],
+                    open_orders_count=0,
+                ),
+                "has_unknown_orders": False,
+            }
+        )
+        self.assertEqual(desired_second, "1h")
+        self.assertEqual(orchestrator._scheduled_minutes_for_active_mode(desired_second), 15)
+
+        orchestrator._refresh_ai_fallback_retry_state(
+            {"ai_fallback_retriable": True},
+            "1h",
+            was_retry_cycle=True,
+        )
+        self.assertEqual(orchestrator.ai_fallback_retry_remaining, 0)
+        self.assertFalse(orchestrator.ai_fallback_retry_due)
+
+        desired_after_limit = orchestrator._determine_desired_loop_mode(
+            {
+                "guarded_attention_active": False,
+                "final_account_state": AccountState(
+                    total_balance=1000.0,
+                    available_balance=1000.0,
+                    positions=[],
+                    open_orders=[],
+                    open_orders_count=0,
+                ),
+                "has_unknown_orders": False,
+            }
+        )
+        self.assertEqual(desired_after_limit, "1h")
+        self.assertEqual(orchestrator._scheduled_minutes_for_active_mode(desired_after_limit), 60)
+
+    def test_successful_retry_cycle_clears_remaining_ai_fallback_budget(self):
+        orchestrator = self._make_orchestrator()
+        orchestrator.ai_fallback_retry_remaining = 2
+        orchestrator.ai_fallback_retry_due = True
+
+        orchestrator._refresh_ai_fallback_retry_state(
+            {"ai_fallback_retriable": False},
+            "1h",
+            was_retry_cycle=True,
+        )
+
+        self.assertEqual(orchestrator.ai_fallback_retry_remaining, 0)
+        self.assertFalse(orchestrator.ai_fallback_retry_due)
 
     def test_prepare_decision_market_snapshots_strips_opportunity_context_in_5m(self):
         orchestrator = self._make_orchestrator()
@@ -2177,7 +2316,7 @@ class TestTradingOrchestrator(unittest.TestCase):
             ["WebSocket Recovered", "WebSocket Recovered"],
         )
 
-    def test_recent_symbol_loss_guard_blocks_new_entries(self):
+    def test_recent_symbol_loss_guard_is_advisory_for_ai_call(self):
         orchestrator = self._make_orchestrator()
         orchestrator.state_store.recent_closed_cases["BTCUSDT"] = {
             "active": True,
@@ -2203,8 +2342,8 @@ class TestTradingOrchestrator(unittest.TestCase):
             risk_profile={"allowed_actions": ["HOLD", "BUY", "SELL", "REDUCE", "EXIT", "CANCEL", "REPLACE_ENTRY"]},
         )
 
-        self.assertEqual(reason, "recent_symbol_loss_guard")
-        rationale_items = orchestrator._build_skip_rationale_items(reason, enriched, {}, {})
+        self.assertIsNone(reason)
+        rationale_items = orchestrator._build_skip_rationale_items("recent_symbol_loss_guard", enriched, {}, {})
         self.assertEqual(rationale_items[0].evidence[0].source, "risk_state.reentry_guard_remaining_minutes")
 
     def test_recent_symbol_loss_guard_is_cleared_when_position_is_still_live(self):

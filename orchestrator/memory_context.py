@@ -147,7 +147,7 @@ class TradingMemoryContextMixin:
         if hold_quality_text == "missed_opportunity_hold" and trigger_text and trigger_text not in active_trigger:
             score -= 6.0
         elif hold_quality_text == "good_hold" and trigger_text == "none" and "none" in active_trigger:
-            score += 3.0
+            score += 1.25
         return score
 
     def _select_long_term_memory_context(self, rows, market_snapshots, risk_mode: str, limit: int, max_ignore_when: int):
@@ -210,9 +210,9 @@ class TradingMemoryContextMixin:
             elif category in {"execution_quality", "execution", "microstructure"}:
                 score += 2.5
             if hold_quality == "good_hold":
-                score += 2.5
-            elif hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
                 score += 0.75
+            elif hold_quality in {"missed_opportunity_hold", "probe_only_opportunity_hold"}:
+                score += 2.5
             if str(risk_mode or "") in apply_regimes:
                 score += 8.0
             if active_trends and active_trends.intersection(apply_trends):
@@ -239,9 +239,9 @@ class TradingMemoryContextMixin:
         bucket_priority = [
             "risk_control",
             "execution_quality",
-            "good_hold",
             "opportunity",
             "missed_opportunity_hold",
+            "good_hold",
             "general",
             "emerging",
             "retired_counterpoint",

@@ -636,6 +636,7 @@ def evaluate_hold_opportunity_counterfactual(store: StateStore, audit: Dict[str,
     baseline_intent = build_hold_baseline_intent(audit)
     simple_rule_intent = build_simple_rule_hold_baseline_intent(audit)
     hold_quality = classify_hold_decision(audit, baseline_intent)
+    hold_quality_detail = hold_quality
     if not baseline_intent and not simple_rule_intent:
         return {"hold_quality": hold_quality} if hold_quality else {}
     market_state = audit.get("market_state") or audit.get("market") or {}
@@ -672,12 +673,15 @@ def evaluate_hold_opportunity_counterfactual(store: StateStore, audit: Dict[str,
         hold_quality = "missed_opportunity_hold"
     elif primary_evaluation.get("baseline_beats_hold"):
         hold_quality = "probe_only_opportunity_hold"
+    elif hold_quality:
+        hold_quality = "good_hold"
     side = str(order.get("action") or (baseline_intent or simple_rule_intent).get("decision") or "").upper()
 
     return {
         "baseline_intent": baseline_intent,
         "simple_rule_baseline_intent": simple_rule_intent,
         "hold_quality": hold_quality,
+        "hold_quality_detail": hold_quality_detail,
         "symbol": symbol,
         "entry_side": side,
         "entry_reference_price": primary_evaluation.get("entry_reference_price"),

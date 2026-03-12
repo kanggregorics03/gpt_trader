@@ -660,6 +660,50 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(context[1]["journal_id"], 1)
         self.assertEqual(context[1]["rationale_items"][0]["hold_quality"], "good_hold")
 
+    def test_save_replay_run_backfills_hold_quality_into_linked_journal(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "HOLD", "orders": [], "confidence": 0.4},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            decision_request={"policy_summary": "x", "account_state": {}, "market_snapshot": {}},
+        )
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Held while waiting for confirmation."],
+            confidence=0.4,
+            audit_log_id=audit_id,
+            rationale_items=[{"summary": "Original hold note"}],
+            risk_reason="Safe action.",
+        )
+
+        self.store.save_replay_run(
+            audit_id,
+            {
+                "comparison": {"original_decision": "HOLD", "replayed_decision": "HOLD"},
+                "hold_opportunity_counterfactual": {
+                    "hold_quality": "good_hold",
+                    "hold_quality_detail": "probe_candidate_hold",
+                    "hold_opportunity_cost": 0.0,
+                    "missed_breakout_count": 0,
+                    "baseline_beats_hold": False,
+                    "simple_rule_baseline_beats_hold": False,
+                    "trigger_context": {"signature": "volume_surge+fast_move"},
+                    "execution_context": {"signature": "tight_spread|deep_book|manageable_invalidation"},
+                    "trend_context": {"signature": "UP|UP"},
+                },
+            },
+        )
+
+        context = self.store.get_recent_journal_context(limit=1)
+
+        self.assertEqual(context[0]["decision"], "HOLD")
+        self.assertEqual(context[0]["rationale_items"][0]["hold_quality"], "good_hold")
+        self.assertEqual(context[0]["rationale_items"][0]["hold_quality_detail"], "probe_candidate_hold")
+        self.assertEqual(context[0]["rationale_items"][0]["source"], "hold_opportunity_counterfactual")
+
     def test_replay_batch_candidates_prioritize_unreplayed_trade_audits(self):
         approved_trade_id = self.store.save_audit(
             account={"total_balance": 1000},
@@ -830,6 +874,28 @@ class TestStateStore(unittest.TestCase):
             receipts=[],
             decision_request={"policy_summary": "bad-json", "account_state": {}, "market_snapshot": {}},
             execution_summary={"ai_usage": {"validation_error": True, "model_name": "deepseek-reasoner"}},
+        )
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.4, "rationale": ["Probe long."]},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+            decision_request={"policy_summary": "bad-explanation", "account_state": {}, "market_snapshot": {}},
+            execution_summary={
+                "decision_quality": {
+                    "decision_valid": True,
+                    "explanation_valid": False,
+                    "execution_admissible": True,
+                    "learning_eligible": False,
+                },
+                "ai_usage": {
+                    "explanation_invalid": True,
+                    "semantic_validation_error": True,
+                    "model_name": "deepseek-reasoner",
+                },
+            },
         )
         self.store.save_audit(
             account={},

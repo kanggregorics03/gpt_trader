@@ -284,6 +284,9 @@ class TradingMaintenanceMixin:
                 next_snapshot_at = self.snapshot_service.next_materialization_epoch(now_epoch)
             if now_epoch >= next_cycle_at:
                 current_mode = self.active_loop_mode
+                was_ai_fallback_retry_cycle = bool(
+                    current_mode == "1h" and getattr(self, "ai_fallback_retry_due", False)
+                )
                 loop_type = self._loop_label_for_mode(current_mode)
                 snapshot_bundle = self.snapshot_service.materialize(now_epoch=now_epoch)
                 cycle_result = self.run_cycle(
@@ -293,6 +296,11 @@ class TradingMaintenanceMixin:
                 )
                 cycle_finished_at = time.time()
                 self._refresh_runtime_activity(cycle_result, cycle_finished_at)
+                self._refresh_ai_fallback_retry_state(
+                    cycle_result,
+                    current_mode,
+                    was_retry_cycle=was_ai_fallback_retry_cycle,
+                )
                 desired_mode = self._determine_desired_loop_mode(cycle_result)
                 active_mode = self._apply_adaptive_loop_mode(
                     desired_mode,
@@ -300,7 +308,7 @@ class TradingMaintenanceMixin:
                     cycle_result=cycle_result,
                 )
                 next_cycle_at = self._next_aligned_epoch(
-                    self._loop_minutes_for_mode(active_mode),
+                    self._scheduled_minutes_for_active_mode(active_mode),
                     cycle_finished_at,
                 )
                 log.info(

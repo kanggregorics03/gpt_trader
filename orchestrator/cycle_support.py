@@ -77,16 +77,6 @@ class TradingCycleSupportMixin:
         if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
             return "consecutive_loss_kill_switch"
 
-        if bool(risk_state.cooldown_active):
-            return "cooldown_active"
-
-        if bool(risk_state.reentry_guard_active):
-            return str(risk_state.reentry_guard_reason or "recent_symbol_close_guard")
-
-        allowed_actions = {str(action).upper() for action in risk_profile.get("allowed_actions", [])}
-        if "BUY" not in allowed_actions and "SELL" not in allowed_actions:
-            return f"risk_profile_{risk_mode}_blocks_entries"
-
         return None
 
     def _build_skip_rationale_items(self, skip_reason: str, risk_state, market_snapshots, risk_profile):

@@ -25,13 +25,29 @@ class StateStoreEligibilityMixin:
             execution_summary = {}
         if str(execution_summary.get("error") or "").strip():
             return False
+        decision_quality = execution_summary.get("decision_quality") or {}
+        if hasattr(decision_quality, "model_dump"):
+            decision_quality = decision_quality.model_dump(mode="json")
+        if not isinstance(decision_quality, dict):
+            decision_quality = {}
+        if decision_quality:
+            if not bool(decision_quality.get("decision_valid", True)):
+                return False
+            if not bool(decision_quality.get("execution_admissible", True)):
+                return False
+            if not bool(decision_quality.get("learning_eligible", True)):
+                return False
 
         ai_usage = execution_summary.get("ai_usage") or {}
         if hasattr(ai_usage, "model_dump"):
             ai_usage = ai_usage.model_dump(mode="json")
         if not isinstance(ai_usage, dict):
             ai_usage = {}
-        if bool(ai_usage.get("validation_error")) or bool(ai_usage.get("semantic_validation_error")):
+        if (
+            bool(ai_usage.get("validation_error"))
+            or bool(ai_usage.get("semantic_validation_error"))
+            or bool(ai_usage.get("explanation_invalid"))
+        ):
             return False
 
         intent = record.get("intent") or {}

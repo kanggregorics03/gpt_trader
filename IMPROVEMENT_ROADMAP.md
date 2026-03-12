@@ -30,7 +30,7 @@
 - validation/benchmark job
 - model registry
 - shadow model serving
-- champion 교체를 위한 automated promotion gate
+- offline experiment acceptance gate
 
 즉 학습 재료는 쌓이지만, 그 재료를 모델 실험으로 닫는 자동 파이프라인은 아직 없다.
 
@@ -50,14 +50,14 @@
 
 ### 1.4 Learning liveness는 감시하지만, 운영 자동 복구는 제한적이다
 
-지금은 stale learning을 감지하고 promotion을 막을 수 있다.
+지금은 stale learning을 감지하고 offline artifact 신뢰도를 낮출 수 있다.
 
 하지만 아직 아래는 약하다.
 
 - 왜 stale이 됐는지 root-cause 자동 분류
 - replay/memory batch 자동 재기동
 - artifact corruption 검출
-- 오래된 champion의 안전한 fallback policy 자동 선택
+- 오래된 artifact 대신 last-known-good runtime config를 되돌리는 자동 보조
 
 즉 "멈췄음을 안다"까지는 왔지만, "스스로 복구한다"까지는 아니다.
 
@@ -107,7 +107,7 @@ Learning liveness 이후 다음 단계는 self-healing이다.
 - replay batch stale alert
 - memory updater stale alert
 - artifact freshness SLO
-- promotion blocked 사유 기록
+- offline evaluation blocked 사유 기록
 - batch 재시도 또는 운영 경보 자동화
 
 운영 품질 측면에서 중요하다.
@@ -120,7 +120,7 @@ Learning liveness 이후 다음 단계는 self-healing이다.
 - very small size
 - limited live window
 - post-change holdout review
-- champion/policy bundle rollback drill
+- runtime config/policy rollback drill
 
 즉 기술 개선과 배포 절차를 같이 가져가야 한다.
 

@@ -36,6 +36,10 @@ class TradingCycleRiskEvaluationMixin:
             for symbol, snapshot in cycle_context["market_snapshots"].items()
             if snapshot.is_risk_trigger
         ]
+        ai_usage = dict(getattr(decision_result, "usage_metadata", {}) or {})
+        ai_fallback_retriable = bool(ai_usage.get("fallback_safe_intent")) and not bool(
+            getattr(decision_result, "decision_valid", True)
+        )
         execution_summary = {
             "loop_type": loop_type,
             "symbols": list(cycle_context["market_snapshots"].keys()),
@@ -48,7 +52,19 @@ class TradingCycleRiskEvaluationMixin:
             "cycle_role": cycle_context["effective_risk_profile"].get("cycle_role"),
             "risk_state": risk_outcome["risk_payload"],
             "decision_input_hash": decision_result.input_hash,
-            "ai_usage": decision_result.usage_metadata or {},
+            "ai_usage": ai_usage,
+            "decision_quality": {
+                "decision_valid": bool(getattr(decision_result, "decision_valid", True)),
+                "explanation_valid": bool(getattr(decision_result, "explanation_valid", True)),
+                "execution_admissible": bool(risk_outcome["is_approved"]),
+                "learning_eligible": bool(getattr(decision_result, "learning_eligible", True)),
+                "validation_issues": list(getattr(decision_result, "validation_issues", []) or []),
+            },
+            "ai_fallback_retry": {
+                "retriable": ai_fallback_retriable,
+                "due_before_schedule": bool(getattr(self, "ai_fallback_retry_due", False)),
+                "remaining_before_schedule": int(getattr(self, "ai_fallback_retry_remaining", 0) or 0),
+            },
             "regime_key": cycle_context["regime_key"],
             "alpha_policy": cycle_context["alpha_policy_summary"],
             "evidence_quality": risk_outcome["evidence_quality_summary"],

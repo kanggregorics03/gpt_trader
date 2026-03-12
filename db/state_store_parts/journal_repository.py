@@ -166,8 +166,8 @@ class StateStoreJournalRepositoryMixin:
                 FROM journal
                 ORDER BY
                     CASE
-                        WHEN COALESCE(rationale_json, '') LIKE '%good_hold%' THEN 6
                         WHEN COALESCE(rationale_json, '') LIKE '%missed_opportunity_hold%' THEN 6
+                        WHEN COALESCE(rationale_json, '') LIKE '%good_hold%' THEN 4
                         WHEN COALESCE(rationale_json, '') LIKE '%probe_only_opportunity_hold%' THEN 5
                         WHEN COALESCE(loss_signal, 0) = 1 THEN 5
                         WHEN decision IN ('EXIT', 'REDUCE', 'CANCEL', 'REPLACE_ENTRY') THEN 4

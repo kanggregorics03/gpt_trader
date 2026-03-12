@@ -5,6 +5,49 @@ from utils.logger import log
 
 
 class TradingCadencePolicyMixin:
+    def _ai_fallback_retry_mode(self) -> str:
+        configured = str(self.adaptive_loop_config.get("ai_fallback_retry_mode", "15m") or "15m").strip()
+        if configured in self.LOOP_MODE_PRIORITY:
+            return configured
+        return "15m"
+
+    def _refresh_ai_fallback_retry_state(
+        self,
+        cycle_result: dict,
+        completed_mode: str,
+        *,
+        was_retry_cycle: bool = False,
+    ):
+        if bool((cycle_result or {}).get("lock_skipped")):
+            return
+        retriable = bool((cycle_result or {}).get("ai_fallback_retriable"))
+        if completed_mode != "1h":
+            self.ai_fallback_retry_due = False
+            return
+        if was_retry_cycle and self.ai_fallback_retry_remaining > 0:
+            self.ai_fallback_retry_remaining = max(0, int(self.ai_fallback_retry_remaining) - 1)
+
+        self.ai_fallback_retry_due = False
+        if retriable:
+            if not was_retry_cycle:
+                self.ai_fallback_retry_remaining = int(
+                    self.adaptive_loop_config.get("ai_fallback_retry_limit", 2) or 0
+                )
+            if self.ai_fallback_retry_remaining > 0:
+                self.ai_fallback_retry_due = True
+        else:
+            self.ai_fallback_retry_remaining = 0
+
+    def _has_pending_ai_fallback_retry(self) -> bool:
+        return bool(getattr(self, "ai_fallback_retry_due", False)) and int(
+            getattr(self, "ai_fallback_retry_remaining", 0) or 0
+        ) > 0
+
+    def _scheduled_minutes_for_active_mode(self, active_mode: str) -> int:
+        if active_mode == "1h" and self._has_pending_ai_fallback_retry():
+            return self._loop_minutes_for_mode(self._ai_fallback_retry_mode())
+        return self._loop_minutes_for_mode(active_mode)
+
     def _loop_minutes_for_mode(self, mode: str) -> int:
         mapping = {
             "1h": self.adaptive_loop_config["base_loop_minutes"],

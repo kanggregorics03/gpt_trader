@@ -70,10 +70,10 @@ class TradingRecentJournalSelectionMixin:
         usable = [item for item in scored if str(item[2].get("context_bucket") or "") != "system_fallback"]
         bucket_priority = [
             "risk_outcome",
+            "missed_opportunity_hold",
+            "entry_action",
             "good_hold",
             "hold",
-            "entry_action",
-            "missed_opportunity_hold",
             "other_action",
         ]
         selected_rows_meta: list[dict] = []

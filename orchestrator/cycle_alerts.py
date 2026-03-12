@@ -2,6 +2,13 @@ from utils.logger import log
 
 
 class TradingCycleAlertsMixin:
+    def _coerce_rationale_item_summary(self, item) -> str:
+        if hasattr(item, "summary"):
+            return " ".join(str(getattr(item, "summary", "") or "").split())
+        if isinstance(item, dict):
+            return " ".join(str(item.get("summary") or "").split())
+        return ""
+
     def _build_cycle_order_summary(self, execution_summary: dict, intent) -> str:
         execution_policy = dict((execution_summary or {}).get("execution_policy") or {})
         policy_orders = execution_policy.get("orders") or []
@@ -45,27 +52,45 @@ class TradingCycleAlertsMixin:
     ):
         intent = decision_outcome["intent"]
         decision_reason = ""
-        if getattr(intent, "rationale", None):
-            decision_reason = str((intent.rationale or [""])[0] or "").strip()
+        rationale_lines = [
+            " ".join(str(item or "").split())
+            for item in (getattr(intent, "rationale", None) or [])
+            if str(item or "").strip()
+        ]
+        if rationale_lines:
+            decision_reason = " | ".join(rationale_lines[:2])
         if not decision_reason:
             decision_reason = str(execution_outcome.get("reason") or "").strip()
         decision_reason = " ".join(decision_reason.split())[:220]
+        detail_summaries = [
+            self._coerce_rationale_item_summary(item)
+            for item in (getattr(intent, "rationale_items", None) or [])
+            if self._coerce_rationale_item_summary(item)
+        ]
+        risk_notes = [
+            " ".join(str(item or "").split())
+            for item in (getattr(intent, "risk_notes", None) or [])
+            if str(item or "").strip()
+        ]
         approved = "yes" if bool(execution_outcome.get("is_approved")) else "no"
         model_name = str(getattr(decision_outcome.get("decision_result"), "model_name", "") or "").strip() or "unknown"
-        message = "\n".join(
-            [
-                (
-                    f"loop={cycle_context.get('loop_mode')} "
-                    f"risk={cycle_context.get('risk_mode')} "
-                    f"role={cycle_context.get('effective_risk_profile', {}).get('cycle_role') or ''} "
-                    f"decision={intent.decision} "
-                    f"approved={approved} "
-                    f"model={model_name}"
-                ).strip(),
-                f"why={decision_reason or 'n/a'}",
-                f"orders={self._build_cycle_order_summary(execution_summary, intent)}",
-            ]
-        )
+        lines = [
+            (
+                f"loop={cycle_context.get('loop_mode')} "
+                f"risk={cycle_context.get('risk_mode')} "
+                f"role={cycle_context.get('effective_risk_profile', {}).get('cycle_role') or ''} "
+                f"decision={intent.decision} "
+                f"approved={approved} "
+                f"model={model_name}"
+            ).strip(),
+            f"why={decision_reason or 'n/a'}",
+        ]
+        if detail_summaries:
+            lines.append(f"detail={' | '.join(detail_summaries[:2])[:220]}")
+        if risk_notes:
+            lines.append(f"risk={' | '.join(risk_notes[:2])[:180]}")
+        lines.append(f"orders={self._build_cycle_order_summary(execution_summary, intent)}")
+        message = "\n".join(lines)
         self.alert_manager.send(
             "Cycle Decision",
             message,
