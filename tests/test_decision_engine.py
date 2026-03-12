@@ -987,6 +987,35 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertNotIn("post_only", payload["orders"][0])
         self.assertNotIn("limit_offset_bps", payload["orders"][0])
 
+    def test_normalize_trade_intent_payload_accepts_cancel_aliases_without_order_type(self):
+        engine = DecisionEngine.__new__(DecisionEngine)
+
+        payload, issues = engine._normalize_trade_intent_payload(
+            {
+                "decision": "EXIT",
+                "orders": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "action": "CANCEL",
+                        "order_id": "order-123",
+                    },
+                    {
+                        "symbol": "ETHUSDT",
+                        "action": "SELL",
+                        "order_type": "MARKET",
+                        "quantity": 0.01,
+                        "reduce_only": True,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(payload["orders"][0]["action"], "CANCEL")
+        self.assertEqual(payload["orders"][0]["order_type"], "LIMIT")
+        self.assertEqual(payload["orders"][0]["target_order_id"], "order-123")
+        self.assertEqual(payload["orders"][1]["order_type"], "MARKET")
+
 
 if __name__ == "__main__":
     unittest.main()

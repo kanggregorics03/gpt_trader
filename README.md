@@ -528,6 +528,8 @@ AI 출력은 `TradeIntent`다.
 - `orders`
   - 각 주문 후보의 심볼, 액션, 주문 타입, 수량, 가격, `reduce_only`, TP, SL
   - `CANCEL` 액션일 때는 `target_order_id` 또는 `target_client_order_id`를 함께 담아 working order cleanup에 사용한다
+  - AI가 `order_id`, `clientOrderId`, `orderLinkId` 같은 alias를 보내도 정규화 단계에서 `target_*` 필드로 흡수한다
+  - `CANCEL`은 실행 경로에서 `order_type`을 사용하지 않으므로, `order_type` 누락만으로 semantic fallback 처리하지 않는다
   - `REPLACE_ENTRY`는 현재 자동 관리 루프가 아니라 명시적 1h working-order 관리 상황에서만 사용한다
   - AI 응답 스키마에는 `execution_profile`, `urgency_score`, `time_in_force`, `post_only`, `limit_offset_bps`, `max_slippage_bps`를 노출하지 않는다. 실행 메타데이터는 runtime이 채운다
   - `EXIT`와 `REDUCE`는 실행 레이어에서 항상 시장가 성격을 유지한다. 포지션 정리를 passive limit로 늦추지 않는다

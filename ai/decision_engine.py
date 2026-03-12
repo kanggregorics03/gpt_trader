@@ -150,7 +150,11 @@ class DecisionEngine:
             issues.append(f"orders[{order_index}].action is invalid")
             return None
         order_type = self._normalize_text(payload.get("order_type"), default="").upper()
-        if order_type not in {"MARKET", "LIMIT"}:
+        if action == "CANCEL" and order_type not in {"MARKET", "LIMIT"}:
+            # CANCEL execution ignores order_type, so accept omitted values and
+            # normalize to a stable placeholder that satisfies the runtime schema.
+            order_type = "LIMIT"
+        elif order_type not in {"MARKET", "LIMIT"}:
             issues.append(f"orders[{order_index}].order_type is invalid")
             return None
         entry_style = self._normalize_text(payload.get("entry_style"), default="").lower()
@@ -165,6 +169,18 @@ class DecisionEngine:
         if not symbol:
             issues.append(f"orders[{order_index}].symbol is missing")
             return None
+        target_order_id = self._normalize_text(
+            payload.get("target_order_id") or payload.get("order_id") or payload.get("orderId"),
+            default="",
+        ) or None
+        target_client_order_id = self._normalize_text(
+            payload.get("target_client_order_id")
+            or payload.get("client_order_id")
+            or payload.get("clientOrderId")
+            or payload.get("order_link_id")
+            or payload.get("orderLinkId"),
+            default="",
+        ) or None
         return {
             "symbol": symbol,
             "action": action,
@@ -175,8 +191,8 @@ class DecisionEngine:
             "reduce_only": reduce_only,
             "take_profit": self._coerce_float(payload.get("take_profit")),
             "stop_loss": self._coerce_float(payload.get("stop_loss")),
-            "target_order_id": self._normalize_text(payload.get("target_order_id"), default="") or None,
-            "target_client_order_id": self._normalize_text(payload.get("target_client_order_id"), default="") or None,
+            "target_order_id": target_order_id,
+            "target_client_order_id": target_client_order_id,
             "replace_group_id": self._normalize_text(payload.get("replace_group_id"), default="") or None,
             "lineage_role": self._normalize_text(payload.get("lineage_role"), default="") or None,
             "lineage_parent_order_id": self._normalize_text(payload.get("lineage_parent_order_id"), default="") or None,

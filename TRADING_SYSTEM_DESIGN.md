@@ -427,6 +427,8 @@ decision: HOLD/BUY/SELL/REDUCE/EXIT/CANCEL/REPLACE_ENTRY
 orders[]: 주문 후보(가격/수량/TP/SL/reduce_only 포함)
 
 `CANCEL` action은 `target_order_id` 또는 `target_client_order_id`를 함께 담아 stale working order를 정리한다.
+AI가 `order_id`, `clientOrderId`, `orderLinkId` 같은 alias를 보내도 정규화 단계에서 `target_*` 필드로 흡수한다.
+`CANCEL`은 실행 경로에서 `order_type`을 소비하지 않으므로, `order_type` 누락만으로 semantic fallback을 만들지 않는다.
 
 `REPLACE_ENTRY`는 명시적 1h working-order 관리에서만 쓰는 예외 액션이다.
 자동 15m/5m 관리 루프는 stale working order를 재호가하지 않고 cancel-only로 처리한다.
