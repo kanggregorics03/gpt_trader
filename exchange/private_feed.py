@@ -123,6 +123,7 @@ class BybitPrivateAccountFeed:
         try:
             self._ws = self.ws_factory(
                 testnet=(self.trading_mode == "testnet"),
+                demo=(self.trading_mode == "demo"),
                 channel_type="private",
                 api_key=self.api_key,
                 api_secret=self.api_secret,

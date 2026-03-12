@@ -6,6 +6,8 @@ from exchange.private_feed import BybitPrivateAccountFeed
 
 class DummyPrivateWebSocket:
     def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
         self.subscriptions = []
 
     def wallet_stream(self, callback):
@@ -77,6 +79,20 @@ class TestPrivateFeed(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(len(feed._ws.subscriptions), 4)
         self.assertEqual(feed.get_health_status(), "reconnecting")
+
+    def test_start_passes_demo_mode_to_websocket_factory(self):
+        feed = ControlledTimeFeed(
+            api_key="key",
+            api_secret="secret",
+            trading_mode="demo",
+            ws_factory=DummyPrivateWebSocket,
+        )
+
+        started = feed.start()
+
+        self.assertTrue(started)
+        self.assertTrue(feed._ws.kwargs["demo"])
+        self.assertFalse(feed._ws.kwargs["testnet"])
 
     def test_feed_recovers_after_reconcile_and_stability_window_without_private_events(self):
         feed = ControlledTimeFeed(
