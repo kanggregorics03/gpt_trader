@@ -24,9 +24,46 @@ class FakeStateStore:
                 }
             ],
             "semantic_validation_summary": {
-                "last_24h": {"failure_count": 1, "top_issues": [{"issue": "schema", "count": 1}], "top_models": []},
-                "last_7d": {"failure_count": 2, "top_models": []},
-                "latest_50": {"failure_count": 1, "top_models": []},
+                "last_24h": {
+                    "failure_count": 1,
+                    "safe_fallback_count": 1,
+                    "explanation_fallback_count": 1,
+                    "action_schema_fallback_count": 0,
+                    "json_parse_fallback_count": 0,
+                    "top_issues": [{"issue": "schema", "count": 1}],
+                    "top_models": [],
+                    "top_validation_stages": [{"stage": "explanation_semantic", "count": 1}],
+                },
+                "last_7d": {"failure_count": 2, "safe_fallback_count": 1, "top_models": []},
+                "latest_50": {"failure_count": 1, "safe_fallback_count": 1, "top_models": []},
+            },
+            "hold_quality_summary_7d": {
+                "total_hold_count": 5,
+                "good_hold_count": 2,
+                "bad_hold_count": 1,
+                "fallback_hold_count": 1,
+                "unlabeled_hold_count": 1,
+                "evaluated_hold_count": 4,
+            },
+            "replay_learning_summary_7d": {
+                "evaluation_count": 3,
+                "outcome_linked_count": 2,
+                "with_learning_better_count": 1,
+                "without_learning_better_count": 1,
+                "tie_count": 0,
+                "decision_changed_count": 2,
+                "avg_outcome_utility_delta": 0.15,
+            },
+            "label_quality_summary_7d": {
+                "tracked_total": 4,
+                "coverage_rate": 0.8,
+                "outcome_linked_rate": 0.6,
+                "label_counts": {
+                    "edge_failed": 1,
+                    "missed_due_to_no_fill": 1,
+                    "risk_exit": 1,
+                    "stale_entry_cancelled": 1,
+                },
             },
             "context_bias_summary": {
                 "last_24h": {
@@ -70,8 +107,15 @@ class FakeStateStore:
     def get_daily_ledger_report(self, days=7, now=None):
         return [{"day": "2026-03-07", "net_realized_pnl": 12.5, "gross_realized_pnl": 13.0, "fee_cost": 0.5, "row_count": 2}]
 
-    def get_recent_trade_cases(self, limit=10):
-        return [{"trade_case_id": "case-1", "symbol": "BTCUSDT", "status": "closed", "realized_pnl": 9.5, "holding_minutes": 45.0, "observed_mfe_pct": 2.0, "observed_mae_pct": -0.5, "slippage_bps": 1.2, "thesis_failure_reason": None}]
+    def get_recent_trade_cases(self, limit=10, status=None):
+        rows = [
+            {"trade_case_id": "case-3", "symbol": "SOLUSDT", "status": "closed", "realized_pnl": -1.2, "holding_minutes": 25.0, "observed_mfe_pct": 0.8, "observed_mae_pct": -1.1, "slippage_bps": 1.7, "thesis_failure_reason": "stopped_out"},
+            {"trade_case_id": "case-2", "symbol": "ETHUSDT", "status": "active", "estimated_pnl_pct": 0.4, "holding_minutes": 10.0, "observed_mfe_pct": None, "observed_mae_pct": None, "slippage_bps": None, "thesis_failure_reason": None, "exit_reason": None, "opened_at": "2026-03-07 09:00:00", "closed_at": None},
+            {"trade_case_id": "case-1", "symbol": "BTCUSDT", "status": "closed", "realized_pnl": 9.5, "holding_minutes": 45.0, "observed_mfe_pct": 2.0, "observed_mae_pct": -0.5, "slippage_bps": 1.2, "thesis_failure_reason": None, "exit_reason": "risk_exit", "opened_at": "2026-03-06 09:00:00", "closed_at": "2026-03-07 10:00:00"},
+        ]
+        if status:
+            rows = [row for row in rows if row["status"] == status]
+        return rows[:limit]
 
     def get_all_active_trade_cases(self):
         return [{"trade_case_id": "case-live", "symbol": "ETHUSDT"}]
@@ -306,6 +350,12 @@ class TestDashboardApp(unittest.TestCase):
         self.assertEqual(payload["post_trade_outcome_summary"]["label_counts"]["edge_failed"], 1)
         self.assertEqual(payload["post_trade_outcome_summary"]["label_counts"]["missed_due_to_no_fill"], 1)
         self.assertEqual(payload["context_bias_summary"]["last_24h"]["journal_selected"]["group_counts"]["action"], 6)
+        self.assertEqual(payload["semantic_validation_summary"]["last_24h"]["safe_fallback_count"], 1)
+        self.assertEqual(payload["semantic_validation_summary"]["last_24h"]["explanation_fallback_count"], 1)
+        self.assertEqual(payload["hold_quality_summary_7d"]["good_hold_count"], 2)
+        self.assertEqual(payload["replay_learning_summary_7d"]["evaluation_count"], 3)
+        self.assertEqual(payload["label_quality_summary_7d"]["tracked_total"], 4)
+        self.assertEqual(payload["label_quality_summary_7d"]["label_counts"]["risk_exit"], 1)
 
     def test_audit_detail_endpoint_includes_linked_trade_case_and_retrieval_data(self):
         response = self.client.get("/api/audits/101")
@@ -315,6 +365,23 @@ class TestDashboardApp(unittest.TestCase):
         self.assertIn("symbol_journal_entries", payload)
         self.assertIn("trade_cases", payload)
         self.assertIn("retrieval_evaluations", payload)
+        self.assertEqual(payload["trade_cases"][0]["trade_case_id"], "case-1")
+
+    def test_trade_cases_endpoint_can_return_full_history(self):
+        response = self.client.get("/api/trade-cases?all=1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["full_history"])
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(payload["trade_cases"][0]["trade_case_id"], "case-3")
+
+    def test_trade_cases_endpoint_supports_filters(self):
+        response = self.client.get("/api/trade-cases?all=1&status=closed&symbol=BTCUSDT&exit_reason=risk")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["trade_cases"][0]["trade_case_id"], "case-1")
 
     def test_audit_replay_endpoint_uses_replay_engine_and_payload_options(self):
@@ -342,6 +409,25 @@ class TestDashboardApp(unittest.TestCase):
             save=False,
             include_counterfactual=False,
         )
+
+    def test_runtime_freshness_summary_handles_timezone_aware_timestamps(self):
+        now = datetime(2026, 3, 13, 12, 0, 0)
+        latest_audit = {
+            "timestamp": "2026-03-13T11:45:00+00:00",
+            "account_state": {"snapshot_timestamp": 1773402300},
+        }
+        snapshot = {
+            "recent_order_states": [{"created_at": "2026-03-13T11:40:00Z"}],
+            "recent_position_states": [{"created_at": "2026-03-13 11:35:00"}],
+        }
+
+        result = dashboard_app._build_runtime_freshness_summary(now, latest_audit, snapshot)
+
+        self.assertEqual(result["freshness_state"], "fresh")
+        self.assertEqual(result["snapshot_age_minutes"], 15.0)
+        self.assertEqual(result["latest_audit_age_minutes"], 15.0)
+        self.assertEqual(result["latest_order_state_age_minutes"], 20.0)
+        self.assertEqual(result["latest_position_state_age_minutes"], 25.0)
 
 
 if __name__ == "__main__":

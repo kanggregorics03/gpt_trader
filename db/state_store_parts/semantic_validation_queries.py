@@ -18,7 +18,12 @@ class StateStoreSemanticValidationQueryMixin:
         issue_counts: Dict[str, int] = {}
         model_failure_counts: Dict[str, int] = {}
         model_total_counts: Dict[str, int] = {}
+        validation_stage_counts: Dict[str, int] = {}
         validation_failures = 0
+        safe_fallback_count = 0
+        explanation_fallback_count = 0
+        action_schema_fallback_count = 0
+        json_parse_fallback_count = 0
         for row in recent_logs:
             execution_summary = row.get("execution_summary") or {}
             ai_usage = execution_summary.get("ai_usage") or {}
@@ -29,6 +34,16 @@ class StateStoreSemanticValidationQueryMixin:
                 continue
             validation_failures += 1
             model_failure_counts[model_name] = model_failure_counts.get(model_name, 0) + 1
+            validation_stage = str(ai_usage.get("validation_stage") or "unknown").strip() or "unknown"
+            validation_stage_counts[validation_stage] = validation_stage_counts.get(validation_stage, 0) + 1
+            if bool(ai_usage.get("fallback_safe_intent")):
+                safe_fallback_count += 1
+                if validation_stage == "explanation_semantic":
+                    explanation_fallback_count += 1
+                elif validation_stage == "action_schema":
+                    action_schema_fallback_count += 1
+                elif validation_stage == "json_parse":
+                    json_parse_fallback_count += 1
             for issue in ai_usage.get("issues") or []:
                 key = str(issue).strip()
                 if not key:
@@ -50,9 +65,18 @@ class StateStoreSemanticValidationQueryMixin:
                     "failure_rate": round(failure_rate, 4),
                 }
             )
+        top_validation_stages = [
+            {"stage": stage, "count": count}
+            for stage, count in sorted(validation_stage_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+        ]
         return {
             "total_calls": sum(model_total_counts.values()),
             "failure_count": validation_failures,
+            "safe_fallback_count": safe_fallback_count,
+            "explanation_fallback_count": explanation_fallback_count,
+            "action_schema_fallback_count": action_schema_fallback_count,
+            "json_parse_fallback_count": json_parse_fallback_count,
             "top_issues": top_issues,
             "top_models": top_models,
+            "top_validation_stages": top_validation_stages,
         }

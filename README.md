@@ -1020,10 +1020,19 @@ policy 평가에도 같은 opportunity cost를 함께 반영한다.
 - 규칙 본문
 - 버전
 - 구조화 메트릭
-- `confidence_score` / `validity_score` / `decay_score`
+- `confidence_score` / `validity_score` / `decay_score` / `improvement_score`
 - `trigger_context` / `execution_context` / `trend_context` / `hold_quality`
 - `lifecycle_status` / `retirement_reason` / `revive_count`
 - `canonical_key` 기반 중복 병합 메타데이터
+
+현재 lifecycle은 단순 노후화만 보지 않는다.
+
+- `opportunity / setup / entry` 계열은 최근 `7d` 개선이 없으면 `no_improvement_7d`로 retire 후보가 된다.
+- 전체 category는 최근 `30d` 개선이 없으면 `no_improvement_30d`로 retire 후보가 된다.
+- `risk_control / execution_quality`는 승격 기준이 더 높다.
+  - support와 confidence 문턱을 opportunity memory보다 높게 둔다.
+- retire는 삭제가 아니라 lifecycle 전환이다.
+  - 이후 새 evidence와 score가 붙으면 revive될 수 있다.
 
 샘플 row:
 
@@ -1450,6 +1459,9 @@ walk-forward 성격의 holdout 구간이 무너지거나 confidence calibration�
 retrieval이 실제 성과와 반사실 비교 기준에서 얼마나 의미 있었는지, 그리고 그 차이가 path quality 기준으로도 유지되는지 장기 메모리 판단 근거로 남긴다.
 또한 최근 journal의 `confidence`와 사후 outcome을 비교해 `calibration_gap`, `brier_score`,
 `high_conf_error_rate`, `alignment_score`를 만들고, memory confidence와 policy evaluation에 같이 반영한다.
+추가로 최근에는 replay/실행 outcome을 바탕으로 `improvement_score`도 계산해,
+`7d/30d` 동안 개선이 없는 memory는 자동으로 retire lifecycle로 이동시킨다.
+즉 장기 메모리는 단순 누적 저장소가 아니라, 성과 없는 opportunity memory를 주기적으로 밀어내는 운영 장치로 본다.
 LLM은 이제 heuristic candidate lesson을 넓게 새로 발명하기보다,
 기존 seed를 좁고 읽기 좋게 정제하는 역할에 더 가깝다.
 generated lesson이 seed와 매칭되지 않으면 버리고, 매칭되더라도
@@ -1723,6 +1735,19 @@ Dashboard startup now resolves `.env` and opens `StateStore` lazily on the first
 
 `Learning Liveness`가 stale이면 daily batch는 replay/memory 산출물을 계속 저장하더라도, offline evaluation artifact는 신뢰 가능한 최신 학습 상태로 간주하지 않는다.
 
+최근 대시보드는 학습 품질을 직접 추적하는 카드도 함께 보여준다.
+
+- `Semantic Fallbacks`
+  - safe HOLD fallback, explanation fallback, action schema/json fallback, validation stage 분포
+- `Hold Quality 7d`
+  - `good_hold`, `bad_hold`, `fallback_hold`, `unlabeled_hold`
+- `Replay Learn 7d`
+  - 같은 audit 기준 `with-learning vs without-learning` replay 비교
+  - `outcome_linked_count`, `with_learning_better_count`, `avg_outcome_utility_delta`
+- `Label Quality 7d`
+  - `edge_failed`, `missed_due_to_no_fill`, `risk_exit`, `stale_entry_cancelled`
+  - `coverage_rate`, `outcome_linked_rate`
+
 대시보드는 `.env`의 `DB_PATH`를 사용해 같은 SQLite를 읽는다.  
 audit replay를 대시보드에서 실행할 때는 `REPLAY_PROVIDER`, `REPLAY_API_KEY`, `REPLAY_MODEL`을 우선 보고, 비어 있으면 `AI_PROVIDER`, `AI_API_KEY`, `AI_DEFAULT_MODEL` 계열 설정으로 fallback 한다.
 
@@ -1800,21 +1825,23 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
 
 ### 일간 체크리스트
 
-1. 대시보드에서 `ledger net pnl`, `Symbol Report`, `Semantic Fallbacks`를 확인한다.
+1. 대시보드에서 `ledger net pnl`, `Symbol Report`, `Semantic Fallbacks`, `Hold Quality 7d`, `Label Quality 7d`를 확인한다.
 2. `24h / 7d / latest 50 calls` 기준 semantic fallback이 갑자기 늘었는지 본다.
-3. 최근 audit 5~10개에서 `risk_reason`, `evidence_quality`, `entry_size_cap`이 이상하게 치우치지 않았는지 본다.
-4. `wide_spread`, `elevated_funding`, `cooldown`, `drawdown`이 특정 시간대에 몰리는지 확인한다.
-5. Bybit 실제 포지션/미체결과 audit의 `positions`, `open_orders`, `receipts`가 맞는지 샘플 확인한다.
-6. `timeout_unresolved`, `failed`, market fetch warning이 반복되는지 로그를 본다.
+3. `fallback_hold`가 늘었는지, `good_hold / bad_hold` 비율이 한쪽으로 무너졌는지 본다.
+4. 최근 audit 5~10개에서 `risk_reason`, `evidence_quality`, `entry_size_cap`이 이상하게 치우치지 않았는지 본다.
+5. `wide_spread`, `elevated_funding`, `cooldown`, `drawdown`이 특정 시간대에 몰리는지 확인한다.
+6. Bybit 실제 포지션/미체결과 audit의 `positions`, `open_orders`, `receipts`가 맞는지 샘플 확인한다.
+7. `timeout_unresolved`, `failed`, market fetch warning이 반복되는지 로그를 본다.
 
 ### 주간 체크리스트
 
 1. `tools/replay_audit.py`로 최근 손실 audit 10~20개를 다시 비교한다.
-2. replay에서 `evidence_signals_added/removed`, `source diff`, `previous value / threshold`를 점검한다.
-3. `long_term_memory`의 최근 rule과 `candidate_lessons`를 읽고 과잉 일반화가 없는지 확인한다.
-4. 심볼별 net pnl을 보고 손실 심볼을 유지할지 제외할지 결정한다.
-5. 정책 변경이 필요하면 한 번에 하나의 파라미터만 조정한다.
-6. 변경 후에는 반드시 demo 또는 축소된 size로 관찰한다.
+2. `Replay Learn 7d`에서 `with-learning vs without-learning` 우위가 실제로 유지되는지 본다.
+3. replay에서 `evidence_signals_added/removed`, `source diff`, `previous value / threshold`를 점검한다.
+4. `long_term_memory`의 최근 rule과 `candidate_lessons`, 최근 retire/revive 사유를 읽고 과잉 일반화가 없는지 확인한다.
+5. 심볼별 net pnl을 보고 손실 심볼을 유지할지 제외할지 결정한다.
+6. 정책 변경이 필요하면 한 번에 하나의 파라미터만 조정한다.
+7. 변경 후에는 반드시 demo 또는 축소된 size로 관찰한다.
 
 ### 월간 체크리스트
 
@@ -1900,6 +1927,10 @@ python tools/tune_context_budget.py --lookback 400 --target-token-p75 2800 --wri
   - support는 높은데 이후 replay에서 자주 무시됨
   - 특정 regime에서만 맞고 다른 regime에서 계속 손실
   - 저품질 evidence에서 나온 anti-pattern이 너무 일반화됨
+- 최근 lifecycle에서 `no_improvement_7d`, `no_improvement_30d` retire가 급증하면:
+  - memory 승격 기준이 너무 느슨한지
+  - outcome label 품질이 흔들리는지
+  - replay counterfactual이 실제 개선을 못 보여주는지 먼저 확인한다
 - memory batch 모델을 바꿨다면 최소 며칠은 새 rule의 tone과 과잉 일반화 여부를 직접 읽어보는 게 좋다.
 
 ### 6. DB / 로그 유지

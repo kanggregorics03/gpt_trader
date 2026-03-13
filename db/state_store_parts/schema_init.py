@@ -532,8 +532,14 @@ class StateStoreSchemaInitMixin:
                 CREATE INDEX IF NOT EXISTS idx_retrieval_evaluations_trade_case
                 ON retrieval_evaluations(trade_case_id, created_at, id);
 
+                CREATE INDEX IF NOT EXISTS idx_replay_runs_created_at
+                ON replay_runs(created_at, id);
+
                 CREATE INDEX IF NOT EXISTS idx_execution_policy_eval_context
                 ON execution_policy_evaluations(symbol, loop_mode, action_type, urgency_bucket, liquidity_bucket, id);
+
+                CREATE INDEX IF NOT EXISTS idx_execution_policy_eval_created_at
+                ON execution_policy_evaluations(created_at, id);
 
                 CREATE INDEX IF NOT EXISTS idx_candidate_policy_domain_status
                 ON candidate_policy_versions(domain, status, created_at);

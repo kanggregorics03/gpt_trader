@@ -61,6 +61,10 @@
 8. `safety_5m` contract가 과도하게 공격적이거나, 반대로 너무 늦게 반응하는지 recent audit/replay divergence를 본다.
    - 현재 철학상 `safety_5m`는 emergency exit 품질을 보는 계층이지, profit protect 감축 빈도를 높이는 계층이 아니다.
 9. 대시보드 `Learning Liveness`에서 replay heartbeat, memory updater heartbeat, replay 처리율, artifact freshness를 확인한다.
+10. 대시보드 `Hold Quality 7d`, `Replay Learn 7d`, `Label Quality 7d`를 같이 본다.
+   - `fallback_hold` 급증은 프롬프트/설명 계약 문제일 가능성이 크다.
+   - `bad_hold` 급증은 missed opportunity cost가 커졌다는 뜻이다.
+   - `coverage_rate` 하락은 outcome label 품질 저하 신호다.
 
 ## 4. 원인별 해석 가이드
 
@@ -210,6 +214,8 @@
 - `recent_journal_context`
 - 대시보드 `Context Mix`
   - `good_hold`, `missed_opportunity_hold`, `action`, `fallback` 비율이 retrieval 후보군 왜곡 없이 유지되는지 본다.
+- 대시보드 `Hold Quality 7d`
+  - `good_hold`, `bad_hold`, `fallback_hold`가 어떻게 갈리는지 본다.
 - 대시보드 `Learning Liveness`
   - reranker artifact가 stale이면 retrieval 품질 문제가 heuristic drift인지 운영 정지인지 먼저 구분한다.
 - `decision_fingerprints`
@@ -228,6 +234,7 @@
 3. decision cooldown을 늘린다.
 4. `range_break_signal_active=false`인 상태의 추격 진입을 줄인다.
 5. trigger는 감시 신호로 쓰고 진입은 별도 확인 조건을 요구한다.
+6. `fallback_hold`가 많으면 HOLD 정책보다 explanation fallback 원인을 먼저 줄인다.
 
 실험 아이디어:
 
@@ -255,6 +262,9 @@
 - `market_data_cache` freshness
 - `order_book`, `ticker`, `funding`, `open_interest` 수집 시점
 - REST reconcile 빈도
+- 대시보드 `Label Quality 7d`
+  - `edge_failed`, `missed_due_to_no_fill`, `risk_exit`, `stale_entry_cancelled` 집계가 안정적으로 붙는지 본다.
+  - `coverage_rate`, `outcome_linked_rate`가 갑자기 떨어지면 학습 입력 품질부터 의심한다.
 
 어떻게 해석할 것인가:
 

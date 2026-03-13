@@ -344,7 +344,7 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertEqual(result.intent.confidence, 0.55)
         self.assertIn('"decision":"hold"', result.raw_response)
 
-    def test_generate_decision_keeps_action_when_explanation_validation_fails(self):
+    def test_generate_decision_falls_back_to_safe_hold_when_explanation_validation_fails(self):
         class DummyResponse:
             text = (
                 '{"decision":"BUY","orders":[{"symbol":"ETHUSDT","action":"BUY","order_type":"LIMIT",'
@@ -404,12 +404,18 @@ class TestDecisionEngine(unittest.TestCase):
 
         result = engine.generate_decision(request)
 
-        self.assertEqual(result.intent.decision, "BUY")
-        self.assertTrue(result.decision_valid)
+        self.assertEqual(result.intent.decision, "HOLD")
+        self.assertEqual(
+            result.intent.rationale,
+            ["Fallback due to invalid explanation contract from AI."],
+        )
+        self.assertEqual(result.intent.risk_notes, ["Explanation validation failed."])
+        self.assertFalse(result.decision_valid)
         self.assertFalse(result.explanation_valid)
         self.assertFalse(result.learning_eligible)
         self.assertTrue(result.usage_metadata["semantic_validation_error"])
         self.assertTrue(result.usage_metadata["explanation_invalid"])
+        self.assertTrue(result.usage_metadata["fallback_safe_intent"])
         self.assertEqual(result.usage_metadata["validation_stage"], "explanation_semantic")
         self.assertIn("numeric_evidence_missing", result.usage_metadata["issues"][0])
 
@@ -766,7 +772,7 @@ class TestDecisionEngine(unittest.TestCase):
             prompt,
         )
         self.assertIn(
-            "Never make rationale_items[0] categorical-only; lead with the strongest numeric evidence-backed rationale_item.",
+            "Lead with the strongest numeric evidence-backed rationale_item.",
             prompt,
         )
         self.assertIn(
@@ -774,15 +780,15 @@ class TestDecisionEngine(unittest.TestCase):
             prompt,
         )
         self.assertIn(
-            "a small probe entry is allowed when directional bias exists",
+            "fresh directional exposure still needs clear structure",
             prompt,
         )
         self.assertIn(
-            "Do not let regime.trend_alignment='mixed' veto an otherwise tradable setup by itself.",
+            "Do not let regime.trend_alignment='mixed' act as a hard blocker by itself",
             prompt,
         )
         self.assertIn(
-            "distance_to_invalid_level is a sizing and risk-definition input, not a standalone veto.",
+            "distance_to_invalid_level should be used with structure and execution quality rather than as a standalone trigger.",
             prompt,
         )
         self.assertIn(
@@ -790,7 +796,7 @@ class TestDecisionEngine(unittest.TestCase):
             prompt,
         )
         self.assertIn(
-            "Treat execution-quality deterioration as a sizing penalty before treating it as a reason to HOLD",
+            "Prefer HOLD or de-risking when execution-quality deterioration materially weakens the trade's expected value.",
             prompt,
         )
 
@@ -928,6 +934,10 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn("Do not follow their majority vote mechanically", prompt)
         self.assertIn("Use retest only when there is explicit structure evidence", prompt)
         self.assertIn("Use value only for a passive retrace inside an already acceptable directional context", prompt)
+        self.assertIn(
+            "HOLD is correct when evidence is weak, conflicting, stale, or materially constrained.",
+            prompt,
+        )
         self.assertNotIn("previous_values", prompt)
         self.assertNotIn("candidate_lessons", prompt)
         self.assertNotIn("long detail", prompt)

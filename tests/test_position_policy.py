@@ -186,6 +186,40 @@ class TestPositionPolicyEngine(unittest.TestCase):
         self.assertEqual(result["decision_result"]["decision"], "CANCEL")
         self.assertEqual([order.action for order in result["decision_result"]["orders"]], ["CANCEL"])
 
+    def test_reduce_only_open_orders_without_positions_are_ignored(self):
+        engine = PositionPolicyEngine(
+            policy={"position_policy": {"stale_order_minutes": 1}},
+            state_store=DummyStore(),
+        )
+        account_state = AccountState(
+            total_balance=1000.0,
+            available_balance=1000.0,
+            positions=[],
+            open_orders=[
+                OpenOrderState(
+                    symbol="BTCUSDT",
+                    order_id="stop-1",
+                    client_order_id="stop-client-1",
+                    side="SELL",
+                    order_type="MARKET",
+                    quantity=0.1,
+                    reduce_only=True,
+                    stop_loss=29400.0,
+                    timestamp=int((time.time() - (5 * 60)) * 1000),
+                )
+            ],
+        )
+
+        result = engine.evaluate(
+            account_state=account_state,
+            market_snapshots={},
+            risk_mode="normal",
+            loop_mode="15m",
+        )
+
+        self.assertTrue(result["escalate_to_ai"])
+        self.assertEqual(result["reason"], "no_live_positions")
+
     def test_negative_pnl_without_invalidation_proximity_holds(self):
         engine = PositionPolicyEngine(
             policy={"position_policy": {"weakened_minutes": 1, "stalled_minutes": 100000}},

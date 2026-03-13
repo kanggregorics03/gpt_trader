@@ -99,7 +99,8 @@ class SafetyPolicyEngine:
             if abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
         ]
         open_orders = list(getattr(account_state, "open_orders", []) or [])
-        if not positions and not open_orders:
+        managed_open_orders = [order for order in open_orders if not bool(getattr(order, "reduce_only", False))]
+        if not positions and not managed_open_orders:
             return {
                 "escalate_to_ai": False,
                 "decision_result": {
@@ -116,9 +117,9 @@ class SafetyPolicyEngine:
                 },
             }
 
-        if not positions and open_orders:
+        if not positions and managed_open_orders:
             stale_orders = self._select_stale_open_orders(
-                open_orders,
+                managed_open_orders,
                 threshold_minutes=float(config["stale_order_minutes"]),
             )
             if stale_orders:

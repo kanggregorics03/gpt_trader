@@ -613,7 +613,7 @@ class DecisionEngine:
         prompt = f"""
 You are an expert crypto trading strategist.
 You are ONLY a strategist. Do not bypass risk limits.
-Choose the highest expected-value action supported by the live state. Do not default to HOLD unless the evidence is genuinely weak, conflicting, or explicitly constrained.
+Choose the best risk-adjusted action supported by the live state. HOLD is correct when evidence is weak, conflicting, stale, or materially constrained.
 Return ONLY valid JSON matching the TradeIntent schema.
 
 INPUTS
@@ -650,15 +650,15 @@ MARKET INTERPRETATION
 0b. If retrieved context conflicts with the current market_snapshots or risk_state, prefer the live snapshot evidence.
 0c. Treat fallback, retired, and error-like context as cautionary metadata, not as direct trading instructions.
 0d. policy_summary is an extracted policy digest, not a full document. Treat it as the binding summary of enforceable limits and execution guards.
-0e. retrieval context is advisory, not a vote. Do not infer HOLD just because many retrieved examples held, and do not let a HOLD-heavy context suppress an otherwise tradable setup.
-0f. The runtime risk and execution layers enforce hard limits after your decision. Outside the explicit rules below, optimize for the best risk-adjusted opportunity rather than pre-emptively self-censoring into HOLD.
+0e. retrieval context is advisory, not a vote. Do not infer HOLD just because many retrieved examples held, and do not force a trade just because retrieved examples traded.
+0f. The runtime risk and execution layers enforce hard limits after your decision. Outside the explicit rules below, optimize for the best risk-adjusted action supported by the live state.
 1. Prefer derived fields such as change, percentile, distance, and stabilized trigger state over raw values when making decisions.
 2. volume_surge_15m_now is the immediate current-bar condition. volume_surge_signal_active is the stabilized signal state after hysteresis. Do not treat them as interchangeable.
 3. fast_move_signal_active, volume_surge_signal_active, and range_break_signal_active are short-horizon stabilization signals. Use them in 15m and 5m loops for cadence and follow-through. In the 1h loop, prioritize higher-timeframe structure, breakout distance, trend alignment, and participation instead.
 3a. In the 1h loop, treat 15m context as entry confirmation only. Do not let 15m momentum or noise create a fresh thesis that is not already supported by the 1h structure.
-4. spread_vs_1h_avg, spread_percentile_1h, and depth_percentile_1h describe execution quality. Poor execution quality should reduce aggressiveness even if direction looks favorable.
+4. spread_vs_1h_avg, spread_percentile_1h, and depth_percentile_1h describe execution quality. Poor execution quality should reduce aggressiveness and can justify HOLD or de-risking when execution is materially impaired.
 5. oi_change_15m, oi_change_1h, funding_rate_change_1h, and basis_change_1h describe change and participation, not just static state.
-6. distance_to_15m_breakout_level, distance_to_1h_breakout_level, and distance_to_invalid_level describe structure quality. Smaller and clearer invalidation distance generally supports cleaner entries, but distance_to_invalid_level is a sizing and risk-definition input, not a standalone veto.
+6. distance_to_15m_breakout_level, distance_to_1h_breakout_level, and distance_to_invalid_level describe structure quality. Smaller and clearer invalidation distance generally supports cleaner entries, but distance_to_invalid_level should be used with structure and execution quality rather than as a standalone trigger.
 7. entry_headroom summarizes remaining entry budget and leverage room before this decision. Treat blocked or near-zero headroom as a real constraint, not a suggestion.
 
 RULES
@@ -667,38 +667,37 @@ RULES
 3. If entering or reducing, populate orders and include take_profit / stop_loss when appropriate.
 3a. For non-reduce BUY/SELL entry orders, set entry_style to one of immediate, retest, or value. immediate means the thesis requires entering now. retest means wait for a breakout or reclaim retest near structure. value means wait for a general passive retrace away from the current price.
 3c. Use retest only when there is explicit structure evidence such as breakout/reclaim context, nearby breakout distance, or a clearly defined retest level. If the setup is not anchored to structure, do not call it retest.
-3d. Use value only for a passive retrace inside an already acceptable directional context. If higher-timeframe trend alignment is imperfect or the invalidation distance is wider than ideal, reduce confidence and size first; prefer HOLD only when structure is materially conflicting or invalidation is extreme.
+3d. Use value only for a passive retrace inside an already acceptable directional context. If higher-timeframe trend alignment is imperfect or the invalidation distance is wider than ideal, reduce confidence and size first. Prefer HOLD when structure is materially conflicting or risk cannot be defined cleanly.
 3b. If the decision is REDUCE or EXIT, use MARKET orders. Do not express exit or reduction intent as passive limit waiting.
 4. Distinguish follow-through or breakout trigger state from risk triggers when they are present. Risk triggers mean more conservative execution and possible de-risking.
 5. Review existing open orders and avoid duplicate or conflicting orders for the same symbol.
 6. Separate account-risk pressure from execution-quality pressure. Liquidation risk, hard cooldown pressure, and drawdown pressure should strongly discourage new exposure and may justify HOLD, REDUCE, or EXIT when they materially constrain the account.
-6a. Wide spread, weak depth, and unfavorable funding should reduce aggressiveness, size, or confidence first. Treat execution-quality deterioration as a sizing penalty before treating it as a reason to HOLD, unless multiple adverse conditions align or an explicit hard constraint blocks the trade.
+6a. Wide spread, weak depth, and unfavorable funding should reduce aggressiveness, size, or confidence. Prefer HOLD or de-risking when execution-quality deterioration materially weakens the trade's expected value.
 7. If loop_mode is 5m or cycle_role is execution_safety, do not open new positions. Only HOLD, REDUCE, EXIT, or CANCEL are valid.
 8. If loop_mode is 15m or cycle_role is position_management, avoid opening new positions and focus on managing live exposure and stale working orders conservatively. Prefer CANCEL over repricing.
 9. Use REPLACE_ENTRY only when explicitly managing a working entry in the 1h strategy loop. Never use it in 5m safety or 15m position-management loops.
 9a. entry_style and order_type must agree semantically: immediate should usually pair with MARKET or an aggressive limit, while retest and value should pair with LIMIT.
 9b. Do not emit execution_profile, urgency_score, max_slippage_bps, time_in_force, post_only, or limit_offset_bps. The runtime execution layer computes those fields.
 10. Only the 1h strategy loop should initiate fresh directional exposure unless the risk_profile explicitly blocks entries.
-10a. In the 1h strategy loop, a small probe entry is allowed when directional bias exists and at least two numeric signals support structure or participation, even if some regime labels remain mixed.
-10b. Do not let regime.trend_alignment='mixed' veto an otherwise tradable setup by itself. Treat trend_alignment as a caution flag and directional prior, not a hard blocker.
+10a. In the 1h strategy loop, fresh directional exposure still needs clear structure, risk definition, and at least two numeric signals supporting structure or participation.
+10b. Do not let regime.trend_alignment='mixed' act as a hard blocker by itself, but treat it as a real caution flag that should lower confidence and size unless higher-timeframe structure is otherwise clear.
 11. In guarded state, prioritize risk reduction and execution quality over new exposure.
 12. Consider idempotency and avoid repeating a failed request from recent_journal_context.
 13. Put identified risks in risk_notes.
 14. All text fields must be English.
 15. market_snapshots contains the configured trading symbol set. Do not invent or reference other symbols.
 16. Do not force a trade just because trigger state is active.
-17. A breakout without volume, open-interest support, or acceptable execution quality is weaker, but a single weak input should reduce size or confidence before forcing HOLD.
-18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence and size first. Treat distance_to_invalid_level as a sizing and stop-definition input before treating it as a reason to HOLD.
+17. A breakout without volume, open-interest support, or acceptable execution quality is weaker. Reduce size or confidence when the weakness is limited; prefer HOLD when the setup lacks enough confirmation to define risk cleanly.
+18. If price is too extended relative to ATR or too far from a clean invalidation level, reduce confidence and size first. Prefer HOLD when the extension or invalidation distance makes the trade structurally unclear.
 19. rationale must stay concise for humans, but should still explain the trade in enough detail to audit later. Use 1-3 short rationale lines that cover thesis, participation or execution quality, and invalidation or key risk when possible.
 20. Every rationale_item must include at least one evidence row with a valid source path from the DecisionRequest.
-21. Every rationale_item must include at least one numeric or boolean evidence row. Do not emit a categorical-only rationale_item.
-22. If a categorical field such as trend_alignment, volatility_regime, momentum_regime, or liquidity_regime matters, pair it in the same rationale_item with at least one numeric evidence row such as distance_to_invalid_level, oi_change_15m, oi_change_1h, spread_percentile_1h, depth_percentile_1h, range_position_pct, RSI, ATR pct, or volume_ratio.
-23. The first rationale_item is validated first. Never make rationale_items[0] categorical-only; lead with the strongest numeric evidence-backed rationale_item.
-24. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, risk_state.cooldown_remaining_minutes, or market_snapshots.BTCUSDT.timeframes.1h.trend.
-25. Numeric operators gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte require numeric observed_value and numeric threshold.
-26. If you reference a categorical or boolean field, use operator eq or note only. For eq, observed_value and threshold must match the original categorical/bool value exactly, e.g. "FLAT" or true.
-27. If operator is not note, threshold is required. If operator is note, threshold must be null.
-28. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
+21. Every rationale_item must include at least one numeric or boolean evidence row. If a categorical field matters, pair it with numeric evidence in the same rationale_item.
+22. Lead with the strongest numeric evidence-backed rationale_item.
+23. source must point to an existing field such as market_snapshots.BTCUSDT.timeframes.15m.rsi_14, market_snapshots.BTCUSDT.oi_change_15m, risk_state.cooldown_remaining_minutes, or market_snapshots.BTCUSDT.timeframes.1h.trend.
+24. Numeric operators gte/lte/gt/lt/cross_up/cross_down/delta_abs_gte require numeric observed_value and numeric threshold.
+25. If you reference a categorical or boolean field, use operator eq or note only. For eq, observed_value and threshold must match the original categorical/bool value exactly, e.g. "FLAT" or true.
+26. If operator is not note, threshold is required. If operator is note, threshold must be null.
+27. Do not use vague words such as strong, weak, likely, maybe unless the same rationale_item contains a numeric comparison.
 
 OUTPUT EXAMPLE
 {{
@@ -788,6 +787,16 @@ OUTPUT EXAMPLE
             payload["fallback_safe_intent"] = True
         return payload
 
+    def _build_safe_hold_intent(self, *, rationale: str, risk_note: str) -> TradeIntent:
+        return TradeIntent(
+            decision="HOLD",
+            orders=[],
+            rationale=[rationale],
+            rationale_items=[],
+            risk_notes=[risk_note],
+            confidence=0.0,
+        )
+
     def generate_intent(self, request: DecisionRequest) -> TradeIntent:
         return self.generate_decision(request).intent
 
@@ -850,13 +859,9 @@ OUTPUT EXAMPLE
                     ", ".join(normalization_issues),
                 )
                 return DecisionResult(
-                    intent=TradeIntent(
-                        decision="HOLD",
-                        orders=[],
-                        rationale=["Fallback due to invalid semantic contract from AI."],
-                        rationale_items=[],
-                        risk_notes=["Semantic contract validation failed."],
-                        confidence=0.0,
+                    intent=self._build_safe_hold_intent(
+                        rationale="Fallback due to invalid semantic contract from AI.",
+                        risk_note="Semantic contract validation failed.",
                     ),
                     prompt=prompt,
                     raw_response=raw_text,
@@ -886,7 +891,10 @@ OUTPUT EXAMPLE
                     ", ".join(validation_result.issues),
                 )
                 return DecisionResult(
-                    intent=intent,
+                    intent=self._build_safe_hold_intent(
+                        rationale="Fallback due to invalid explanation contract from AI.",
+                        risk_note="Explanation validation failed.",
+                    ),
                     prompt=prompt,
                     raw_response=raw_text,
                     model_name=model_to_use,
@@ -894,13 +902,14 @@ OUTPUT EXAMPLE
                     cache_hit=False,
                     usage_metadata=self._build_decision_metadata(
                         model_name=model_to_use,
-                        decision_valid=True,
+                        decision_valid=False,
                         explanation_valid=False,
                         learning_eligible=False,
                         validation_stage="explanation_semantic",
                         issues=validation_result.issues,
+                        fallback_safe_intent=True,
                     ),
-                    decision_valid=True,
+                    decision_valid=False,
                     explanation_valid=False,
                     learning_eligible=False,
                     validation_issues=validation_result.issues,
@@ -948,11 +957,9 @@ OUTPUT EXAMPLE
             )
             # Fallback safe intent
             return DecisionResult(
-                intent=TradeIntent(
-                    decision="HOLD",
-                    rationale=["Fallback due to json validation error from AI."],
-                    risk_notes=["System Error"],
-                    confidence=0.0
+                intent=self._build_safe_hold_intent(
+                    rationale="Fallback due to json validation error from AI.",
+                    risk_note="System Error",
                 ),
                 prompt=prompt,
                 raw_response="",

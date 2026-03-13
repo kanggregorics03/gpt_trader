@@ -26,7 +26,7 @@ load_dotenv()
 class MemoryLesson(BaseModel):
     rule: str = Field(description="Concrete lesson or anti-pattern in English.")
     regime: str = Field(description="Applicable regime such as trending_up or high_volatility.")
-    category: Literal["lesson", "anti_pattern", "risk_control", "opportunity"]
+    category: Literal["lesson", "anti_pattern", "risk_control", "opportunity", "execution_quality"]
     support_count: int = Field(ge=1)
     evidence_journal_ids: List[int] = Field(default_factory=list)
     hypothesis: bool = False
@@ -172,7 +172,7 @@ class MemoryUpdater:
             if item is not None and self._coerce_int(item, default=0) > 0
         ]
         category = self._normalize_text(payload.get("category"), default="").lower()
-        if category not in {"lesson", "anti_pattern", "risk_control", "opportunity"}:
+        if category not in {"lesson", "anti_pattern", "risk_control", "opportunity", "execution_quality"}:
             if self._coerce_bool(payload.get("risk_control"), default=False):
                 category = "risk_control"
             else:
@@ -3506,18 +3506,53 @@ Computed statistics:
                 continue
         return fallback
 
+    def _estimate_memory_improvement_score(self, metrics: Dict[str, Any]) -> float:
+        category = str(metrics.get("category") or "lesson").strip().lower()
+        retrieval_summary = metrics.get("retrieval_counterfactual_summary") or {}
+        trading_balance_summary = metrics.get("trading_balance_summary") or {}
+        execution_policy_summary = metrics.get("execution_policy_summary") or {}
+        hold_opportunity_summary = metrics.get("hold_opportunity_summary") or {}
+        if category in {"opportunity", "setup", "entry"}:
+            with_better = float(retrieval_summary.get("with_retrieval_better_count") or 0.0)
+            without_better = float(retrieval_summary.get("without_retrieval_better_count") or 0.0)
+            tie_count = float(retrieval_summary.get("outcome_tie_count") or 0.0)
+            total = with_better + without_better + tie_count
+            retrieval_edge = ((with_better - without_better) / total) if total else 0.0
+            utility_delta = float(retrieval_summary.get("avg_outcome_utility_delta") or 0.0)
+            opportunity_cost = float(hold_opportunity_summary.get("hold_opportunity_cost") or 0.0)
+            score = (retrieval_edge * 0.6) + (utility_delta * 0.4) - min(0.25, opportunity_cost * 0.05)
+            return round(score, 4)
+        if category in {"risk_control", "execution_quality", "execution", "microstructure"}:
+            utility = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
+            fill_ratio = float(execution_policy_summary.get("avg_fill_ratio") or 0.0)
+            cancel_success = float(execution_policy_summary.get("cancel_success_rate") or 0.0)
+            cancel_timeout = float(execution_policy_summary.get("cancel_timeout_rate") or 0.0)
+            score = ((utility - 0.5) * 1.2) + ((fill_ratio - 0.5) * 0.4) + (cancel_success * 0.15) - (cancel_timeout * 0.25)
+            return round(score, 4)
+        confidence = float(metrics.get("confidence_score") or 0.0)
+        validity = float(metrics.get("validity_score") or confidence or 0.0)
+        return round(((confidence - 0.5) * 0.5) + ((validity - 0.5) * 0.5), 4)
+
     def _build_decayed_memory_entry(self, row: Dict[str, Any], now: datetime) -> Dict[str, Any]:
         metrics = dict(row.get("metrics") or {})
         timestamp = self._safe_parse_timestamp(row.get("timestamp"), fallback=now)
         age_days = max(0.0, (now - timestamp).total_seconds() / 86400.0)
         confidence = float(metrics.get("confidence_score") or 0.0)
         prior_validity = float(metrics.get("validity_score") or confidence or 0.0)
+        category = str(metrics.get("category") or "lesson").strip().lower()
+        improvement_score = self._estimate_memory_improvement_score(metrics)
         decay_score = round(max(0.12, 1.0 - min(1.0, age_days / 90.0)), 4)
         freshness_score = round(max(0.0, 1.0 - min(1.0, age_days / 45.0)), 4)
         validity_score = round(max(0.0, min(0.99, (prior_validity * 0.65) + (decay_score * 0.35))), 4)
         retired = bool(metrics.get("retired"))
         retirement_reason = metrics.get("retirement_reason")
-        if not retired and age_days >= 90.0:
+        if not retired and category in {"opportunity", "setup", "entry"} and age_days >= 7.0 and improvement_score <= 0.0:
+            retired = True
+            retirement_reason = "no_improvement_7d"
+        elif not retired and age_days >= 30.0 and improvement_score <= 0.05:
+            retired = True
+            retirement_reason = "no_improvement_30d"
+        elif not retired and age_days >= 90.0:
             retired = True
             retirement_reason = "stale_timeout"
         elif not retired and age_days >= 30.0 and (confidence < 0.4 or validity_score < 0.35):
@@ -3527,6 +3562,7 @@ Computed statistics:
         metrics["validity_score"] = validity_score
         metrics["decay_score"] = decay_score
         metrics["freshness_score"] = freshness_score
+        metrics["improvement_score"] = improvement_score
         metrics["lifecycle_status"] = "retired" if retired else "active"
         metrics["retired"] = retired
         metrics["retirement_reason"] = retirement_reason
@@ -3614,6 +3650,14 @@ Computed statistics:
             reconciled.append(self._build_decayed_memory_entry(row, now))
         return reconciled
 
+    def _memory_promotion_thresholds(self, category: str) -> Dict[str, float]:
+        category_text = str(category or "").strip().lower()
+        if category_text in {"risk_control", "execution_quality", "execution", "microstructure"}:
+            return {"support_min": 4, "confidence_min": 0.62}
+        if category_text in {"opportunity", "setup", "entry"}:
+            return {"support_min": 3, "confidence_min": 0.56}
+        return {"support_min": 3, "confidence_min": 0.58}
+
     def _prepare_memory_entries(
         self,
         stats_package: Dict[str, Any],
@@ -3628,21 +3672,35 @@ Computed statistics:
                 lesson.support_count,
                 max(1, len(lesson.evidence_journal_ids) or lesson.support_count),
             )
-            status = "hypothesis" if lesson.hypothesis or support_count < 3 else "rule"
+            promotion_thresholds = self._memory_promotion_thresholds(lesson.category)
+            hypothesis = bool(lesson.hypothesis or support_count < int(promotion_thresholds["support_min"]))
+            status = "hypothesis" if hypothesis else "rule"
             confidence_score = self._compute_memory_confidence_score(
                 support_count=support_count,
                 evidence_count=len(lesson.evidence_journal_ids or []),
                 status=status,
                 category=lesson.category,
                 stats_package=stats_package,
-                hypothesis=bool(lesson.hypothesis or support_count < 3),
+                hypothesis=hypothesis,
             )
+            if not hypothesis and confidence_score < float(promotion_thresholds["confidence_min"]):
+                hypothesis = True
+                status = "hypothesis"
+                confidence_score = self._compute_memory_confidence_score(
+                    support_count=support_count,
+                    evidence_count=len(lesson.evidence_journal_ids or []),
+                    status=status,
+                    category=lesson.category,
+                    stats_package=stats_package,
+                    hypothesis=True,
+                )
             metrics = {
                 "support": support_count,
                 "window_days": round(stats_package["window_hours"] / 24, 2),
                 "category": lesson.category,
                 "regime": lesson.regime,
                 "status": status,
+                "promotion_thresholds": promotion_thresholds,
                 "apply_when": lesson.apply_when.model_dump(),
                 "ignore_when": lesson.ignore_when,
                 "trigger_context": lesson.trigger_context,

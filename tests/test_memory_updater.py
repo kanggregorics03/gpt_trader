@@ -1289,6 +1289,49 @@ class TestMemoryUpdater(unittest.TestCase):
             entries[0]["metrics"]["ignore_when"],
             ["Ignore when breakout retest holds with rising volume."],
         )
+
+    def test_prepare_memory_entries_uses_stricter_thresholds_for_risk_and_execution_memory(self):
+        stats = {
+            "window_hours": 24,
+            "journal_count": 10,
+            "evaluated_trade_count": 6,
+            "win_rate": 60.0,
+            "avg_estimated_pnl_pct": 0.2,
+            "trade_case_cluster_evaluation": {"avg_quality_score": 0.7},
+            "retrieval_counterfactual_summary": {
+                "with_retrieval_better_count": 3,
+                "without_retrieval_better_count": 1,
+                "outcome_tie_count": 1,
+            },
+            "confidence_calibration_summary": {"alignment_score": 0.7},
+        }
+        lessons = [
+            MemoryLesson(
+                rule="Allow small continuation probes only when structure is clean.",
+                regime="aligned_up_normal",
+                category="opportunity",
+                support_count=3,
+                evidence_journal_ids=[1, 2, 3],
+                apply_when=MemoryCondition(regime=["aligned_up_normal"], volatility=["normal"], trend=["aligned_up"]),
+                ignore_when=["Ignore when spread widens."],
+            ),
+            MemoryLesson(
+                rule="Reduce size after repeated execution-quality deterioration.",
+                regime="high_volatility",
+                category="execution_quality",
+                support_count=3,
+                evidence_journal_ids=[4, 5, 6],
+                apply_when=MemoryCondition(regime=["high_volatility"], volatility=["high"], trend=["mixed"]),
+                ignore_when=["Ignore when depth recovers materially."],
+            ),
+        ]
+
+        entries = self.updater._prepare_memory_entries(stats, lessons)
+
+        self.assertEqual(entries[0]["metrics"]["status"], "rule")
+        self.assertEqual(entries[0]["metrics"]["promotion_thresholds"]["support_min"], 3)
+        self.assertEqual(entries[1]["metrics"]["status"], "hypothesis")
+        self.assertEqual(entries[1]["metrics"]["promotion_thresholds"]["support_min"], 4)
         self.assertIn("confidence_score", entries[0]["metrics"])
         self.assertEqual(entries[0]["metrics"]["lifecycle_status"], "active")
         self.assertFalse(entries[0]["metrics"]["retired"])
@@ -1344,6 +1387,69 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertGreaterEqual(entries[0]["metrics"]["support"], 4)
         self.assertGreaterEqual(entries[0]["metrics"]["merge_count"], 2)
         self.assertGreaterEqual(len(entries[0]["metrics"]["evidence_journal_ids"]), 4)
+
+    def test_build_decayed_memory_entry_retires_opportunity_without_improvement_after_7d(self):
+        now = datetime(2026, 3, 13, 12, 0, tzinfo=UTC)
+
+        entry = self.updater._build_decayed_memory_entry(
+            {
+                "id": 21,
+                "timestamp": (now - timedelta(days=10)).isoformat(),
+                "rule": "Probe breakouts after weak compression.",
+                "version": 2,
+                "metrics": {
+                    "category": "opportunity",
+                    "confidence_score": 0.66,
+                    "validity_score": 0.63,
+                    "retrieval_counterfactual_summary": {
+                        "with_retrieval_better_count": 0,
+                        "without_retrieval_better_count": 3,
+                        "outcome_tie_count": 0,
+                        "avg_outcome_utility_delta": -0.12,
+                    },
+                    "hold_opportunity_summary": {"hold_opportunity_cost": 1.1},
+                    "retired": False,
+                },
+            },
+            now,
+        )
+
+        self.assertEqual(entry["version"], 3)
+        self.assertTrue(entry["metrics"]["retired"])
+        self.assertEqual(entry["metrics"]["lifecycle_status"], "retired")
+        self.assertEqual(entry["metrics"]["retirement_reason"], "no_improvement_7d")
+        self.assertLessEqual(entry["metrics"]["improvement_score"], 0.0)
+
+    def test_build_decayed_memory_entry_retires_stagnant_memory_after_30d(self):
+        now = datetime(2026, 3, 13, 12, 0, tzinfo=UTC)
+
+        entry = self.updater._build_decayed_memory_entry(
+            {
+                "id": 22,
+                "timestamp": (now - timedelta(days=35)).isoformat(),
+                "rule": "Trim aggressiveness when execution quality decays.",
+                "version": 4,
+                "metrics": {
+                    "category": "risk_control",
+                    "confidence_score": 0.58,
+                    "validity_score": 0.57,
+                    "trading_balance_summary": {"portfolio_utility_score": 0.52},
+                    "execution_policy_summary": {
+                        "avg_fill_ratio": 0.5,
+                        "cancel_success_rate": 0.1,
+                        "cancel_timeout_rate": 0.0,
+                    },
+                    "retired": False,
+                },
+            },
+            now,
+        )
+
+        self.assertEqual(entry["version"], 5)
+        self.assertTrue(entry["metrics"]["retired"])
+        self.assertEqual(entry["metrics"]["lifecycle_status"], "retired")
+        self.assertEqual(entry["metrics"]["retirement_reason"], "no_improvement_30d")
+        self.assertLessEqual(entry["metrics"]["improvement_score"], 0.05)
 
     def test_reconcile_long_term_memory_entries_retires_stale_and_revives_matching_memory(self):
         now = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
@@ -1421,7 +1527,7 @@ class TestMemoryUpdater(unittest.TestCase):
         self.assertEqual(revived["metrics"]["lifecycle_status"], "active")
         self.assertGreaterEqual(revived["metrics"]["revive_count"], 2)
         self.assertTrue(retired["metrics"]["retired"])
-        self.assertEqual(retired["metrics"]["retirement_reason"], "stale_timeout")
+        self.assertEqual(retired["metrics"]["retirement_reason"], "no_improvement_30d")
 
 
 if __name__ == "__main__":

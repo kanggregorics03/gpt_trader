@@ -72,6 +72,37 @@ class TestSafetyPolicyEngine(unittest.TestCase):
         self.assertEqual(result["decision_result"]["decision"], "HOLD")
         self.assertIn("1h alpha loop", result["decision_result"]["rationale"][0])
 
+    def test_reduce_only_open_orders_without_positions_are_treated_as_flat(self):
+        engine = SafetyPolicyEngine(policy={"safety_policy": {"stale_order_minutes": 1}}, state_store=DummyStore())
+
+        result = engine.evaluate(
+            account_state=AccountState(
+                total_balance=1000.0,
+                available_balance=1000.0,
+                positions=[],
+                open_orders=[
+                    OpenOrderState(
+                        symbol="BTCUSDT",
+                        order_id="stop-1",
+                        client_order_id="stop-client-1",
+                        side="SELL",
+                        order_type="MARKET",
+                        quantity=0.1,
+                        reduce_only=True,
+                        stop_loss=29400.0,
+                        timestamp=int((time.time() - (5 * 60)) * 1000),
+                    )
+                ],
+            ),
+            market_snapshots={},
+            risk_mode="guarded",
+            loop_mode="5m",
+        )
+
+        self.assertFalse(result["escalate_to_ai"])
+        self.assertEqual(result["decision_result"]["decision"], "HOLD")
+        self.assertIn("1h alpha loop", result["decision_result"]["rationale"][0])
+
     def test_position_exits_on_acute_loss(self):
         engine = SafetyPolicyEngine(policy={}, state_store=DummyStore())
         account_state = AccountState(

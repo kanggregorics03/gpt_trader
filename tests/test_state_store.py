@@ -74,6 +74,10 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(snapshot["timeouts_unresolved_24h"], 1)
         self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 0)
         self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 0)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["safe_fallback_count"], 0)
+        self.assertEqual(snapshot["hold_quality_summary_7d"]["total_hold_count"], 0)
+        self.assertEqual(snapshot["replay_learning_summary_7d"]["evaluation_count"], 0)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["tracked_total"], 0)
         self.assertEqual(snapshot["context_bias_summary"]["last_24h"]["journal_selected"]["total"], 0)
         self.assertEqual(len(snapshot["recent_memory"]), 1)
         self.assertEqual(snapshot["recent_memory"][0]["metrics"]["status"], "rule")
@@ -210,25 +214,273 @@ class TestStateStore(unittest.TestCase):
                 }
             },
         )
+        self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            execution_summary={
+                "ai_usage": {
+                    "semantic_validation_error": True,
+                    "fallback_safe_intent": True,
+                    "validation_stage": "explanation_semantic",
+                    "model_name": "deepseek-reasoner",
+                    "issues": ["rationale_items[0].numeric_evidence_missing"],
+                }
+            },
+        )
 
         snapshot = self.store.get_monitoring_snapshot()
 
-        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 1)
-        self.assertEqual(snapshot["semantic_validation_summary"]["last_7d"]["failure_count"], 1)
-        self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["failure_count"], 2)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_7d"]["failure_count"], 2)
+        self.assertEqual(snapshot["semantic_validation_summary"]["latest_50"]["failure_count"], 2)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["safe_fallback_count"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["explanation_fallback_count"], 1)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["action_schema_fallback_count"], 0)
+        self.assertEqual(snapshot["semantic_validation_summary"]["last_24h"]["json_parse_fallback_count"], 0)
         self.assertEqual(
             snapshot["semantic_validation_summary"]["last_24h"]["top_issues"][0],
             {"issue": "trade_implication_action_mismatch", "count": 2},
         )
-        self.assertEqual(
-            snapshot["semantic_validation_summary"]["last_24h"]["top_models"][0],
+        top_models = snapshot["semantic_validation_summary"]["last_24h"]["top_models"]
+        self.assertIn(
             {
                 "model_name": "gemini-2.5-flash",
                 "count": 1,
                 "total_calls": 2,
                 "failure_rate": 0.5,
             },
+            top_models,
         )
+        self.assertIn(
+            {
+                "model_name": "deepseek-reasoner",
+                "count": 1,
+                "total_calls": 1,
+                "failure_rate": 1.0,
+            },
+            top_models,
+        )
+        self.assertEqual(
+            snapshot["semantic_validation_summary"]["last_24h"]["top_validation_stages"][0],
+            {"stage": "explanation_semantic", "count": 1},
+        )
+
+    def test_monitoring_snapshot_summarizes_hold_quality_and_replay_learning(self):
+        good_hold_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Wait for clearer structure."],
+            confidence=0.45,
+            audit_log_id=good_hold_audit_id,
+            rationale_items=[{"summary": "Replay validated hold.", "hold_quality": "good_hold"}],
+            risk_reason="Safe action.",
+        )
+        bad_hold_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "ETHUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+        )
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Wait for confirmation."],
+            confidence=0.35,
+            audit_log_id=bad_hold_audit_id,
+            rationale_items=[{"summary": "Replay found missed move.", "hold_quality": "missed_opportunity_hold"}],
+            risk_reason="Safe action.",
+        )
+        fallback_hold_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "SOLUSDT"},
+            intent={"decision": "HOLD"},
+            risk_ok=True,
+            reason="Safe action.",
+            receipts=[],
+            execution_summary={
+                "decision_quality": {"decision_valid": False, "explanation_valid": False},
+                "ai_usage": {
+                    "fallback_safe_intent": True,
+                    "semantic_validation_error": True,
+                    "validation_stage": "explanation_semantic",
+                },
+            },
+        )
+        self.store.save_journal(
+            decision="HOLD",
+            rationale=["Fallback due to invalid explanation contract from AI."],
+            confidence=0.0,
+            audit_log_id=fallback_hold_audit_id,
+            rationale_items=[],
+            risk_reason="Safe action.",
+        )
+
+        replay_audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.55},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+        )
+        self.store.save_retrieval_evaluations(
+            replay_audit_id,
+            [
+                {
+                    "context_type": "similar_past_cases",
+                    "rank_index": 0,
+                    "trade_case_id": "case-1",
+                    "case_symbol": "BTCUSDT",
+                    "matched_symbol": "BTCUSDT",
+                    "decision": "BUY",
+                    "decision_symbol_aligned": True,
+                    "similarity": 0.84,
+                    "final_score": 0.91,
+                    "retrieval_source": "band_index",
+                    "matched_band_count": 3,
+                    "outcome_trade_case_id": "case-1",
+                    "outcome_status": "closed",
+                    "outcome_estimated_pnl_pct": 1.2,
+                    "outcome_observed_mfe_pct": 1.6,
+                    "outcome_observed_mae_pct": -0.4,
+                    "outcome_slippage_bps": 3.0,
+                    "outcome_holding_minutes": 55.0,
+                }
+            ],
+        )
+        self.store.save_replay_run(
+            replay_audit_id,
+            {
+                "comparison": {"original_decision": "BUY", "replayed_decision": "BUY"},
+                "retrieval_counterfactual": {
+                    "with_retrieval_intent": {"decision": "BUY"},
+                    "without_retrieval_intent": {"decision": "HOLD"},
+                    "with_vs_without_comparison": {
+                        "decision_changed": True,
+                        "side_changed": False,
+                        "confidence_delta": 0.12,
+                        "size_delta": 0.05,
+                    },
+                },
+            },
+        )
+
+        snapshot = self.store.get_monitoring_snapshot()
+
+        self.assertEqual(snapshot["hold_quality_summary_7d"]["total_hold_count"], 3)
+        self.assertEqual(snapshot["hold_quality_summary_7d"]["good_hold_count"], 1)
+        self.assertEqual(snapshot["hold_quality_summary_7d"]["bad_hold_count"], 1)
+        self.assertEqual(snapshot["hold_quality_summary_7d"]["fallback_hold_count"], 1)
+        self.assertEqual(snapshot["replay_learning_summary_7d"]["evaluation_count"], 1)
+        self.assertEqual(snapshot["replay_learning_summary_7d"]["outcome_linked_count"], 1)
+        self.assertEqual(snapshot["replay_learning_summary_7d"]["with_learning_better_count"], 1)
+        self.assertEqual(snapshot["replay_learning_summary_7d"]["without_learning_better_count"], 0)
+
+    def test_monitoring_snapshot_summarizes_label_quality(self):
+        audit_id = self.store.save_audit(
+            account={"total_balance": 1000},
+            market={"symbol": "BTCUSDT"},
+            intent={"decision": "BUY", "orders": [], "confidence": 0.6},
+            risk_ok=True,
+            reason="Approved",
+            receipts=[],
+        )
+        self.store.save_execution_policy_evaluations(
+            audit_id,
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "action_type": "entry",
+                    "decision": "BUY",
+                    "order_action": "BUY",
+                    "order_type": "MARKET",
+                    "status": "filled",
+                    "filled_quantity": 0.01,
+                    "outcome_trade_case_id": "case-1",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "action_type": "entry",
+                    "entry_style": "retest",
+                    "decision": "BUY",
+                    "order_action": "BUY",
+                    "order_type": "LIMIT",
+                    "status": "filled",
+                    "filled_quantity": 0.02,
+                    "outcome_trade_case_id": "case-2",
+                    "outcome_label": "edge_failed",
+                },
+                {
+                    "symbol": "SOLUSDT",
+                    "action_type": "entry",
+                    "entry_style": "value",
+                    "decision": "BUY",
+                    "order_action": "BUY",
+                    "order_type": "LIMIT",
+                    "status": "cancelled",
+                    "filled_quantity": 0.0,
+                    "outcome_label": "missed_due_to_no_fill",
+                },
+                {
+                    "symbol": "XRPUSDT",
+                    "action_type": "cancel",
+                    "decision": "CANCEL",
+                    "order_action": "CANCEL",
+                    "order_type": "LIMIT",
+                    "status": "cancelled",
+                    "filled_quantity": 0.0,
+                    "outcome_label": "stale_entry_cancelled",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "action_type": "exit",
+                    "decision": "EXIT",
+                    "order_action": "SELL",
+                    "order_type": "MARKET",
+                    "status": "filled",
+                    "filled_quantity": 0.01,
+                    "outcome_trade_case_id": "case-1",
+                    "outcome_realized_pnl": 8.5,
+                    "outcome_label": "risk_exit",
+                },
+                {
+                    "symbol": "BNBUSDT",
+                    "action_type": "reduce",
+                    "decision": "REDUCE",
+                    "order_action": "SELL",
+                    "order_type": "MARKET",
+                    "status": "filled",
+                    "filled_quantity": 0.01,
+                    "outcome_trade_case_id": "case-3",
+                },
+            ],
+        )
+
+        snapshot = self.store.get_monitoring_snapshot()
+
+        self.assertEqual(snapshot["label_quality_summary_7d"]["relevant_count"], 5)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["tracked_total"], 4)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["outcome_linked_count"], 3)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["coverage_rate"], 0.8)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["outcome_linked_rate"], 0.6)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["top_label"], "edge_failed")
+        self.assertEqual(snapshot["label_quality_summary_7d"]["top_count"], 1)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["label_counts"]["edge_failed"], 1)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["label_counts"]["missed_due_to_no_fill"], 1)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["label_counts"]["risk_exit"], 1)
+        self.assertEqual(snapshot["label_quality_summary_7d"]["label_counts"]["stale_entry_cancelled"], 1)
 
     def test_get_journal_entries_since_returns_new_fields(self):
         audit_id = self.store.save_audit(

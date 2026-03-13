@@ -42,6 +42,7 @@ class PositionPolicyEngine:
             if abs(float(getattr(position, "size", 0.0) or 0.0)) > 0
         ]
         open_orders = list(getattr(account_state, "open_orders", []) or [])
+        managed_open_orders = [order for order in open_orders if not bool(getattr(order, "reduce_only", False))]
 
         config = dict(self.config)
         if policy_override:
@@ -49,7 +50,7 @@ class PositionPolicyEngine:
 
         if not positions:
             stale_orders = self._select_stale_open_orders(
-                open_orders,
+                managed_open_orders,
                 threshold_minutes=float(config["stale_order_minutes"]),
             )
             if stale_orders:
@@ -67,7 +68,7 @@ class PositionPolicyEngine:
                         "metadata": {"policy_source": "position_fsm", "loop_mode": loop_mode, "state": "working_orders_only"},
                     },
                 }
-            if open_orders:
+            if managed_open_orders:
                 return {
                     "escalate_to_ai": False,
                     "decision_result": {
