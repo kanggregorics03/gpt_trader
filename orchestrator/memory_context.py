@@ -2,6 +2,37 @@ from collections import defaultdict
 
 
 class TradingMemoryContextMixin:
+    def _allow_memory_in_live_context(
+        self,
+        *,
+        status: str,
+        category: str,
+        support: int,
+        confidence_score: float,
+        validity_score: float,
+        freshness_score: float,
+        improvement_score: float,
+    ) -> bool:
+        status_text = str(status or "rule").strip().lower()
+        category_text = str(category or "lesson").strip().lower()
+        if status_text == "rule":
+            return True
+        if status_text != "hypothesis":
+            return False
+        if category_text != "risk_control":
+            return False
+        if support < 3:
+            return False
+        if confidence_score < 0.55:
+            return False
+        if validity_score < 0.60:
+            return False
+        if freshness_score < 0.70:
+            return False
+        if improvement_score <= 0.0:
+            return False
+        return True
+
     def _compact_memory_record(self, row, max_ignore_when: int):
         metrics = row.get("metrics") or {}
         apply_when = row.get("apply_when") or metrics.get("apply_when") or {
@@ -175,7 +206,7 @@ class TradingMemoryContextMixin:
         for index, row in enumerate(rows):
             score = 0.0
             metrics = row.get("metrics") or {}
-            status = str(row.get("status") or "rule")
+            status = str(row.get("status") or metrics.get("status") or "rule")
             support = int(row.get("support") or 0)
             category = str(row.get("category") or "lesson")
             rule_text = str(row.get("rule") or "")
@@ -183,6 +214,7 @@ class TradingMemoryContextMixin:
             confidence_score = float(row.get("confidence_score") or metrics.get("confidence_score") or 0.0)
             validity_score = float(row.get("validity_score") or metrics.get("validity_score") or 0.0)
             freshness_score = float(row.get("freshness_score") or metrics.get("freshness_score") or 0.0)
+            improvement_score = float(row.get("improvement_score") or metrics.get("improvement_score") or 0.0)
             lifecycle_status = str(row.get("lifecycle_status") or metrics.get("lifecycle_status") or "active")
             trigger_context = str(row.get("trigger_context") or metrics.get("trigger_context") or "")
             execution_context = str(row.get("execution_context") or metrics.get("execution_context") or "")
@@ -196,6 +228,17 @@ class TradingMemoryContextMixin:
                     excluded_bucket_counts[bucket] += 1
                     continue
                 score -= 7.0
+            if not self._allow_memory_in_live_context(
+                status=status,
+                category=category,
+                support=support,
+                confidence_score=confidence_score,
+                validity_score=validity_score,
+                freshness_score=freshness_score,
+                improvement_score=improvement_score,
+            ):
+                excluded_bucket_counts[bucket] += 1
+                continue
             apply_regimes = set(apply_when.get("regime") or [])
             apply_trends = set(apply_when.get("trend") or [])
             apply_volatility = set(apply_when.get("volatility") or [])

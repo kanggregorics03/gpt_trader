@@ -1040,6 +1040,125 @@ class TestTradingOrchestrator(unittest.TestCase):
         self.assertEqual(len(selected[0]["ignore_when"]), 1)
         self.assertNotIn("candidate_lessons", selected[0]["metrics"])
 
+    def test_select_long_term_memory_context_excludes_weak_hypotheses(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+            )
+        }
+        market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
+        market_snapshots["BTCUSDT"].regime.volatility_regime = "high"
+        rows = [
+            {
+                "rule": "Allow a continuation probe when momentum returns.",
+                "category": "opportunity",
+                "status": "hypothesis",
+                "support": 4,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when spread widens."],
+                "metrics": {
+                    "confidence_score": 0.72,
+                    "validity_score": 0.71,
+                    "freshness_score": 0.82,
+                    "improvement_score": 0.18,
+                },
+            },
+            {
+                "rule": "Reduce size when execution quality deteriorates sharply.",
+                "category": "risk_control",
+                "status": "hypothesis",
+                "support": 2,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when execution normalizes."],
+                "metrics": {
+                    "confidence_score": 0.8,
+                    "validity_score": 0.8,
+                    "freshness_score": 0.85,
+                    "improvement_score": 0.22,
+                },
+            },
+        ]
+
+        selected = orchestrator._select_long_term_memory_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=2,
+            max_ignore_when=1,
+        )
+
+        self.assertEqual(selected, [])
+        summary = orchestrator.last_context_selection_summary["long_term_memory"]
+        self.assertEqual(summary["excluded_bucket_counts"]["opportunity"], 1)
+        self.assertEqual(summary["excluded_bucket_counts"]["risk_control"], 1)
+
+    def test_select_long_term_memory_context_keeps_only_strong_risk_control_hypothesis(self):
+        orchestrator = self._make_orchestrator()
+        market_snapshots = {
+            "BTCUSDT": MarketSnapshot(
+                symbol="BTCUSDT",
+                current_price=30000.0,
+                atr_15m=120.0,
+                atr_1h=240.0,
+                trend_1h="UP",
+                recent_volume_surge=True,
+            )
+        }
+        market_snapshots["BTCUSDT"].regime.trend_alignment = "aligned_up"
+        market_snapshots["BTCUSDT"].regime.volatility_regime = "high"
+        rows = [
+            {
+                "rule": "Tighten entry filters after clustered execution failures.",
+                "category": "risk_control",
+                "status": "hypothesis",
+                "support": 3,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when spread snaps back quickly."],
+                "metrics": {
+                    "confidence_score": 0.61,
+                    "validity_score": 0.66,
+                    "freshness_score": 0.84,
+                    "improvement_score": 0.11,
+                },
+            },
+            {
+                "rule": "Wait for momentum confirmation before probing.",
+                "category": "opportunity",
+                "status": "hypothesis",
+                "support": 5,
+                "regime": "trigger",
+                "apply_when": {"regime": ["trigger"], "volatility": ["high"], "trend": ["aligned_up"]},
+                "ignore_when": ["Ignore when breakout retest holds."],
+                "metrics": {
+                    "confidence_score": 0.83,
+                    "validity_score": 0.8,
+                    "freshness_score": 0.86,
+                    "improvement_score": 0.25,
+                },
+            },
+        ]
+
+        selected = orchestrator._select_long_term_memory_context(
+            rows=rows,
+            market_snapshots=market_snapshots,
+            risk_mode="trigger",
+            limit=2,
+            max_ignore_when=1,
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["category"], "risk_control")
+        self.assertEqual(selected[0]["status"], "hypothesis")
+
     def test_select_long_term_memory_context_prioritizes_matching_hold_contexts(self):
         orchestrator = self._make_orchestrator()
         market_snapshots = {

@@ -932,6 +932,8 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn('"entry_size_cap":{"adjusted":true,"effective_cap_pct":20.0,"base_cap_pct":30.0}', prompt)
         self.assertIn('"ignore_when":["Ignore when retest holds with strong follow-through.","Ignore when trend is flat."]', prompt)
         self.assertIn("Do not follow their majority vote mechanically", prompt)
+        self.assertIn("long_term_memory status=hypothesis is weak advisory context only", prompt)
+        self.assertIn("it must not create a trade thesis by itself", prompt)
         self.assertIn("Use retest only when there is explicit structure evidence", prompt)
         self.assertIn("Use value only for a passive retrace inside an already acceptable directional context", prompt)
         self.assertIn(
