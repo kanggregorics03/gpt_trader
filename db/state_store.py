@@ -2006,8 +2006,9 @@ class StateStore:
         since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         query = """
-            SELECT *
-            FROM trade_case_vector_index
+            SELECT v.*, t.entry_audit_log_id, t.exit_audit_log_id
+            FROM trade_case_vector_index v
+            JOIN trade_cases t ON t.trade_case_id = v.trade_case_id
         """
         params: List[Any] = []
         clauses: List[str] = []
@@ -2015,26 +2016,26 @@ class StateStore:
         clean_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
         if clean_symbols:
             placeholders = ", ".join("?" for _ in clean_symbols)
-            clauses.append(f"symbol IN ({placeholders})")
+            clauses.append(f"v.symbol IN ({placeholders})")
             params.extend(clean_symbols)
         if clean_statuses:
             placeholders = ", ".join("?" for _ in clean_statuses)
-            clauses.append(f"status IN ({placeholders})")
+            clauses.append(f"v.status IN ({placeholders})")
             params.extend(clean_statuses)
         if since is not None:
-            clauses.append("COALESCE(closed_at, opened_at) >= ?")
+            clauses.append("COALESCE(v.closed_at, v.opened_at) >= ?")
             params.append(since.strftime("%Y-%m-%d %H:%M:%S"))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY COALESCE(closed_at, opened_at) DESC, trade_case_id DESC LIMIT ?"
+        query += " ORDER BY COALESCE(v.closed_at, v.opened_at) DESC, v.trade_case_id DESC LIMIT ?"
         params.append(limit)
         cursor = self.conn.execute(query, params)
         rows = []
         for row in cursor.fetchall():
-            item = self._decode_trade_case_row(dict(row))
+            item = self._decode_trade_case_vector_row(dict(row))
             if not self.is_prompt_eligible_trade_case_record(item):
                 continue
-            rows.append(self._decode_trade_case_vector_row(item))
+            rows.append(item)
         return rows
 
     def get_trade_case_vector_band_candidates(
@@ -2056,10 +2057,13 @@ class StateStore:
         query = """
             SELECT
                 v.*,
+                t.entry_audit_log_id,
+                t.exit_audit_log_id,
                 COUNT(*) AS matched_band_count
             FROM trade_case_vector_bands b
             JOIN trade_case_vector_index v
                 ON v.trade_case_id = b.trade_case_id
+            JOIN trade_cases t ON t.trade_case_id = v.trade_case_id
             WHERE
         """
         params: List[Any] = []
@@ -2087,10 +2091,10 @@ class StateStore:
         cursor = self.conn.execute(query, params)
         rows = []
         for row in cursor.fetchall():
-            item = self._decode_trade_case_row(dict(row))
+            item = self._decode_trade_case_vector_row(dict(row))
             if not self.is_prompt_eligible_trade_case_record(item):
                 continue
-            rows.append(self._decode_trade_case_vector_row(item))
+            rows.append(item)
         return rows
 
     def save_trade_case_snapshots(self, entries: List[Dict[str, Any]]):
@@ -3485,7 +3489,15 @@ class StateStore:
         ).fetchone()
         return row is not None
 
+    def count_unknown_orders(self) -> int:
+        """Unresolved orders never expire merely because time has passed."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM order_runtime_state WHERE state = 'unknown'"
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
     def count_recent_unknown_orders(self, minutes: int = 30) -> int:
+        """Monitoring window only. Entry guards must use count_unknown_orders."""
         lookback_minutes = max(1, int(minutes or 1))
         since = (self._utcnow() - timedelta(minutes=lookback_minutes)).strftime("%Y-%m-%d %H:%M:%S")
         row = self.conn.execute(
@@ -5092,7 +5104,7 @@ class StateStore:
         allowed = {
             "none": {"deferred", "submitted", "unknown"},
             "deferred": {"deferred", "submitted", "failed", "unknown"},
-            "cancel_requested": {"cancel_requested", "cancelled", "failed", "unknown"},
+            "cancel_requested": {"cancel_requested", "completed", "cancelled", "failed", "unknown"},
             "submitted": {"submitted", "cancel_requested", "partial_filled", "completed", "cancelled", "failed", "unknown"},
             "partial_filled": {"partial_filled", "cancel_requested", "completed", "cancelled", "failed", "unknown"},
             "unknown": {"unknown", "submitted", "cancel_requested", "partial_filled", "completed", "cancelled", "failed"},

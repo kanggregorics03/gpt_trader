@@ -3765,7 +3765,8 @@ Computed statistics:
         replay_summary = self._build_replay_execution_summary(replay_runs or [])
         trading_balance_summary = trading_balance_summary or {}
         confidence_calibration_summary = confidence_calibration_summary or {}
-        confidence_alignment_score = float(confidence_calibration_summary.get("alignment_score") or 0.5)
+        alignment = self._coerce_float(confidence_calibration_summary.get("alignment_score"))
+        confidence_alignment_score = 0.5 if alignment is None else alignment
         for candidate in candidates or []:
             candidate_id = candidate.get("id")
             domain = str(candidate.get("domain") or "").strip()
@@ -3807,7 +3808,9 @@ Computed statistics:
                     float(trading_balance_summary.get("false_entry_cost") or 0.0) * 0.05,
                 )
             score += min(0.12, float(trading_balance_summary.get("portfolio_utility_score") or 0.0) * 0.12)
-            score += min(0.08, confidence_alignment_score * 0.08)
+            # A neutral default is not observed evidence for a policy bonus.
+            if int(confidence_calibration_summary.get("evaluated_count") or 0) > 0:
+                score += min(0.08, max(0.0, confidence_alignment_score) * 0.08)
             holdout_score = self._coerce_float(temporal_holdout_summary.get("holdout_score"))
             if holdout_score is not None:
                 score += max(-0.12, min(0.12, holdout_score * 0.12))
@@ -3864,7 +3867,8 @@ Computed statistics:
                 balance_score = float(trading_balance_summary.get("balance_score") or 0.0)
                 portfolio_utility_score = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
                 pressure_ratio = self._coerce_float(trading_balance_summary.get("pressure_ratio"))
-                confidence_alignment_score = float((evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5)
+                alignment = self._coerce_float((evaluation.get("metrics") or {}).get("confidence_alignment_score"))
+                confidence_alignment_score = 0.5 if alignment is None else alignment
                 temporal_holdout_summary = (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {}
                 if (
                     hold_cost > 3.5
@@ -3910,7 +3914,7 @@ Computed statistics:
                     "rule_text": candidate.get("rule_text"),
                     "regime_key": regime_key or "",
                     "temporal_holdout_summary": (evaluation.get("metrics") or {}).get("temporal_holdout_summary") or {},
-                    "confidence_alignment_score": (evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5,
+                    "confidence_alignment_score": (evaluation.get("metrics") or {}).get("confidence_alignment_score", 0.5),
                     "portfolio_utility_score": (
                         ((evaluation.get("metrics") or {}).get("trading_balance_summary") or {}).get("portfolio_utility_score")
                         or 0.0
@@ -4041,7 +4045,8 @@ Computed statistics:
         replay_summary = self._build_replay_execution_summary(replay_runs)
         trading_balance_summary = trading_balance_summary or {}
         confidence_calibration_summary = confidence_calibration_summary or {}
-        confidence_alignment_score = float(confidence_calibration_summary.get("alignment_score") or 0.5)
+        alignment = self._coerce_float(confidence_calibration_summary.get("alignment_score"))
+        confidence_alignment_score = 0.5 if alignment is None else alignment
         evaluations = []
         for bundle in bundles or []:
             component_scores = (bundle.get("metrics") or {}).get("component_scores") or {}
@@ -4069,7 +4074,8 @@ Computed statistics:
             score -= min(0.2, float(trading_balance_summary.get("false_entry_cost") or 0.0) * 0.04)
             score += min(0.1, float(trading_balance_summary.get("balance_score") or 0.0) * 0.1)
             score += min(0.12, float(trading_balance_summary.get("portfolio_utility_score") or 0.0) * 0.12)
-            score += min(0.08, confidence_alignment_score * 0.08)
+            if int(confidence_calibration_summary.get("evaluated_count") or 0) > 0:
+                score += min(0.08, max(0.0, confidence_alignment_score) * 0.08)
             if holdout_scores:
                 score += max(-0.12, min(0.12, (sum(holdout_scores) / len(holdout_scores)) * 0.12))
             evaluation = {
@@ -4117,7 +4123,8 @@ Computed statistics:
             false_entry_cost = float(trading_balance_summary.get("false_entry_cost") or 0.0)
             balance_score = float(trading_balance_summary.get("balance_score") or 0.0)
             portfolio_utility_score = float(trading_balance_summary.get("portfolio_utility_score") or 0.0)
-            confidence_alignment_score = float((evaluation.get("metrics") or {}).get("confidence_alignment_score") or 0.5)
+            alignment = self._coerce_float((evaluation.get("metrics") or {}).get("confidence_alignment_score"))
+            confidence_alignment_score = 0.5 if alignment is None else alignment
             pressure_ratio = self._coerce_float(trading_balance_summary.get("pressure_ratio"))
             component_holdout_summaries = (evaluation.get("metrics") or {}).get("component_holdout_summaries") or {}
             if (

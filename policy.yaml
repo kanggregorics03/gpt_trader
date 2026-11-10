@@ -141,7 +141,7 @@ execution_guards:
   loop_lock_ttl_seconds: 240        # Global loop lock TTL to prevent overlapping loop execution.
   decision_cooldown_minutes: 10     # Block repeated entry decisions for same symbol+action+size band.
   entry_mutex_ttl_seconds: 180      # Per-symbol entry mutex TTL while entry execution is in-flight.
-  unknown_order_block_minutes: 30   # Block new entries when unresolved unknown order states exist.
+  unknown_order_block_minutes: 30   # Legacy setting; entry guards now count ALL unknown states regardless of age.
   recovery_sweep_minutes: 5         # Sweep interval to recover unknown/timeout order runtime states.
   symbol_reentry_close_cooldown_minutes: 10  # Pause same-symbol re-entry after a fully flat close.
   symbol_reentry_loss_cooldown_minutes: 30   # Must be >= close cooldown; extends pause after a losing fully flat close.

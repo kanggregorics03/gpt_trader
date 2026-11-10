@@ -510,6 +510,11 @@ class RiskEngine:
         uses_entry_exposure = is_entry_decision or is_replace_entry_decision
         is_risk_reducing = intent.decision in ("REDUCE", "EXIT", "CANCEL")
 
+        if uses_entry_exposure and int(unresolved_timeout_count or 0) > 0:
+            return False, (
+                f"Entry blocked: {int(unresolved_timeout_count)} unresolved order lifecycle state(s) remain unknown."
+            )
+
         def get_snapshot_for_symbol(symbol: str) -> Optional[MarketSnapshot]:
             symbol = normalize_symbol(symbol)
             if symbol in market_snapshots:
@@ -643,10 +648,6 @@ class RiskEngine:
                 return False, (
                     "Trigger mode blocks additional entry while a live position already exists. "
                     "Manage the position with HOLD/REDUCE/EXIT instead."
-                )
-            if int(unresolved_timeout_count or 0) > 0:
-                return False, (
-                    f"Entry blocked: {int(unresolved_timeout_count)} unresolved order lifecycle state(s) remain unknown."
                 )
             daily_max_loss_pct = float(risk_limits.get("daily_max_loss_pct", 0.0) or 0.0)
             daily_pnl_pct = float(risk_state.daily_pnl_pct or 0.0)

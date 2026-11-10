@@ -25,7 +25,8 @@ def normalize_trading_mode(
     if legacy_testnet is not None and str(legacy_testnet).strip().lower() == "true":
         return "testnet"
 
-    return "live"
+    # Live trading must be an explicit choice, including for legacy configs.
+    return "demo"
 
 
 def create_public_exchange() -> ccxt.bybit:
@@ -40,7 +41,8 @@ def create_public_exchange() -> ccxt.bybit:
     )
 
 
-def create_private_exchange(api_key: str, api_secret: str, trading_mode: str = "live") -> ccxt.bybit:
+def create_private_exchange(api_key: str, api_secret: str, trading_mode: str = "demo") -> ccxt.bybit:
+    trading_mode = normalize_trading_mode(trading_mode)
     exchange = ccxt.bybit(
         {
             "apiKey": api_key,
@@ -72,7 +74,7 @@ def create_public_market_feed(symbols: list[str], **feed_kwargs) -> Optional[Byb
 def create_private_account_feed(
     api_key: str,
     api_secret: str,
-    trading_mode: str = "live",
+    trading_mode: str = "demo",
     **feed_kwargs,
 ) -> Optional[BybitPrivateAccountFeed]:
     feed = BybitPrivateAccountFeed(

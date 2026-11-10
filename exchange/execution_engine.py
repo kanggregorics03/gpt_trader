@@ -33,22 +33,34 @@ class ExecutionEngine:
         receipts = []
         orders_to_execute = self.resolve_orders(intent, account_state)
         cancel_status_by_group: Dict[str, str] = {}
+        cancel_filled_by_group: Dict[str, float] = {}
+        has_unknown_order = False
         for order in orders_to_execute:
+            if has_unknown_order and order.action != "CANCEL" and not order.reduce_only:
+                deferred = self._build_deferred_replace_receipt(order, reason="unknown_order_requires_recovery")
+                deferred["status"] = "deferred_unknown_order"
+                receipts.append(deferred)
+                continue
             if order.lineage_role == "replacement" and order.wait_for_cancel_confirmation:
                 group_id = str(order.replace_group_id or "").strip()
                 group_status = cancel_status_by_group.get(group_id, "")
-                if not self._is_cancel_confirmed_status(group_status):
+                has_cancel_fills = cancel_filled_by_group.get(group_id, 0.0) > 0
+                if not self._is_cancel_confirmed_status(group_status) or has_cancel_fills:
                     receipts.append(
                         self._build_deferred_replace_receipt(
                             order,
-                            reason=f"waiting_for_cancel_confirmation:{group_status or 'missing_cancel_receipt'}",
+                            reason=("cancelled_with_fills_requires_replan" if has_cancel_fills else
+                                    f"waiting_for_cancel_confirmation:{group_status or 'missing_cancel_receipt'}"),
                         )
                     )
                     continue
             receipt = self._execute_single_order(order)
             receipts.append(receipt)
+            if self._derive_order_state(order, receipt, []) == "unknown":
+                has_unknown_order = True
             if order.action == "CANCEL" and order.replace_group_id:
                 cancel_status_by_group[str(order.replace_group_id)] = str(receipt.get("status") or "").lower()
+                cancel_filled_by_group[str(order.replace_group_id)] = float(receipt.get("filled") or 0.0)
 
         return receipts
 
@@ -94,9 +106,11 @@ class ExecutionEngine:
                         },
                     }
                 )
-            if str(receipt.get("status") or "").lower() == "deferred_waiting_cancel":
+            if str(receipt.get("status") or "").lower() in ("deferred_waiting_cancel", "deferred_unknown_order"):
                 transitions[-1]["to_state"] = "deferred"
-                transitions[-1]["event_type"] = "replace_deferred"
+                transitions[-1]["event_type"] = (
+                    "entry_deferred" if receipt.get("status") == "deferred_unknown_order" else "replace_deferred"
+                )
                 transitions[-1]["payload"]["deferred_reason"] = receipt.get("error")
                 continue
             final_state = self._derive_order_state(order, receipt, matched_fills)
@@ -236,7 +250,7 @@ class ExecutionEngine:
                 summary["recovered_orders"] += 1
             elif status == "timeout_unresolved":
                 summary["unresolved_timeouts"] += 1
-            elif status == "deferred_waiting_cancel":
+            elif status in ("deferred_waiting_cancel", "deferred_unknown_order"):
                 continue
             elif status in ("rejected", "failed"):
                 summary["failed_orders"] += 1
@@ -306,9 +320,13 @@ class ExecutionEngine:
 
     def _recover_timed_out_order(self, symbol: str, client_order_id: str) -> Optional[Dict]:
         if self.private_feed is not None:
-            for order in self.private_feed.get_recent_orders(symbol):
-                if self._matches_client_order_id(order, client_order_id):
-                    return order
+            try:
+                if self.private_feed.get_health_status() == "healthy":
+                    for order in self.private_feed.get_recent_orders(symbol):
+                        if self._matches_client_order_id(order, client_order_id):
+                            return order
+            except Exception as exc:
+                logger.warning("WS order recovery unavailable for {}: {}", symbol, type(exc).__name__)
         for fetcher in (self._fetch_open_orders, self._fetch_closed_orders):
             try:
                 orders = fetcher(symbol)
@@ -321,7 +339,7 @@ class ExecutionEngine:
         return None
 
     def _is_cancel_confirmed_status(self, status: str) -> bool:
-        return str(status or "").lower() in ("canceled", "cancelled", "closed", "filled")
+        return str(status or "").lower() in ("canceled", "cancelled")
 
     def _build_deferred_replace_receipt(self, order: OrderIntent, reason: str) -> Dict[str, Any]:
         return {
@@ -367,7 +385,7 @@ class ExecutionEngine:
                 if not normalized.get("status"):
                     normalized["status"] = "canceled"
                 return self._enrich_receipt_with_lineage(normalized, order)
-            except ccxt.RequestTimeout:
+            except ccxt.NetworkError:
                 logger.error(
                     f"Timeout cancelling {order.symbol} target={cancel_target_id or 'unknown'}."
                 )
@@ -428,11 +446,16 @@ class ExecutionEngine:
             normalized = self.normalize_receipt(receipt, fallback_client_order_id=client_order_id)
             time.sleep(0.5)
             return self._enrich_receipt_with_lineage(normalized, order)
-        except ccxt.RequestTimeout:
+        except ccxt.NetworkError:
             logger.error(f"Timeout executing {client_order_id}. IMPORTANT: We must NOT blindly retry without checking!")
             recovered_order = self._recover_timed_out_order(order.symbol, client_order_id)
+            recovered_receipt = (
+                self.normalize_receipt(recovered_order, fallback_client_order_id=client_order_id)
+                if recovered_order else {}
+            )
             return self._enrich_receipt_with_lineage(
                 {
+                    **recovered_receipt,
                     "symbol": order.symbol,
                     "clientOrderId": client_order_id,
                     "status": "recovered" if recovered_order else "timeout_unresolved",
@@ -602,10 +625,12 @@ class ExecutionEngine:
                 return "unknown"
             if status in ("failed", "rejected"):
                 return "failed"
-            if status in ("canceled", "cancelled", "closed", "filled"):
+            if status in ("closed", "filled"):
+                return "completed"
+            if status in ("canceled", "cancelled"):
                 return "cancelled"
             return "cancel_requested"
-        if status == "deferred_waiting_cancel":
+        if status in ("deferred_waiting_cancel", "deferred_unknown_order"):
             return "deferred"
         if status in ("timeout_unresolved", "unknown"):
             return "unknown"

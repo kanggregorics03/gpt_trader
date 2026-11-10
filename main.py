@@ -1474,8 +1474,11 @@ class TradingOrchestrator:
             return "cancelled"
         if status in ("failed", "rejected"):
             return "failed"
-        if status in ("open", "partially_filled", "partiallyfilled"):
+        if status in ("partially_filled", "partiallyfilled"):
             return "partial_filled"
+        if status in ("open", "new", "created", "untriggered"):
+            filled = float(recovered_order.get("filled") or (recovered_order.get("info") or {}).get("cumExecQty") or 0.0)
+            return "partial_filled" if filled > 0 else "submitted"
         return "unknown"
 
     def _extract_symbols_from_rationale_items(self, rationale_items):
@@ -4352,9 +4355,7 @@ class TradingOrchestrator:
             )
 
             # 4. Risk Evaluation
-            unresolved_timeout_count = self.state_store.count_recent_unknown_orders(
-                minutes=execution_guards["unknown_order_block_minutes"]
-            )
+            unresolved_timeout_count = self.state_store.count_unknown_orders()
             is_approved, reason = self.risk_engine.evaluate_intent(
                 intent,
                 account_state,
@@ -4424,9 +4425,7 @@ class TradingOrchestrator:
                         self.symbols,
                         force_refresh=True,
                     )
-                    unresolved_after_reconcile = self.state_store.count_recent_unknown_orders(
-                        minutes=execution_guards["unknown_order_block_minutes"]
-                    )
+                    unresolved_after_reconcile = self.state_store.count_unknown_orders()
                     reapproved, rereason = self.risk_engine.evaluate_intent(
                         intent,
                         effective_pre_execution_state,
@@ -4713,9 +4712,7 @@ class TradingOrchestrator:
                 case_summary=case_summary,
             )
             final_account_state = post_account_state or effective_pre_execution_state or account_state
-            final_unknown_order_count = self.state_store.count_recent_unknown_orders(
-                minutes=execution_guards["unknown_order_block_minutes"]
-            )
+            final_unknown_order_count = self.state_store.count_unknown_orders()
             return {
                 "loop_type": loop_type,
                 "trigger_active": is_trigger_mode,

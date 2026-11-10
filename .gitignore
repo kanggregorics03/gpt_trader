@@ -26,6 +26,12 @@ logs/
 data/
 *.db
 *.sqlite3
+*.sqlite
+*.db-*
+*.sqlite3-*
+*.log
+*.pem
+*.key
 
 # Docker local overrides and runtime files
 .docker/

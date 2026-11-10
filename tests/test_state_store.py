@@ -1,5 +1,3 @@
-import os
-import shutil
 import tempfile
 import time
 import unittest
@@ -12,21 +10,13 @@ from db.state_store import StateStore
 
 class TestStateStore(unittest.TestCase):
     def setUp(self):
-        base_tmp = Path("c:/gpt_trader/.tmp_tests")
-        base_tmp.mkdir(parents=True, exist_ok=True)
-        fd, raw_path = tempfile.mkstemp(dir=base_tmp, suffix=".db")
-        os.close(fd)
-        self.tmpdir = base_tmp
-        self.db_path = raw_path
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "state.db")
         self.store = StateStore(self.db_path)
 
     def tearDown(self):
         self.store.close()
-        try:
-            Path(self.db_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        self.tmpdir.cleanup()
 
     def test_monitoring_snapshot_counts_rejections_timeouts_and_memory(self):
         self.store.save_audit(
@@ -1600,6 +1590,11 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(evaluations[0]["sample_count"], 3)
 
     def test_trade_case_round_trip_and_query(self):
+        # Cases used for retrieval must reference actual, eligible audit rows.
+        audit_ids = [self.store.save_audit(
+            account={}, market={}, intent={"decision": decision}, risk_ok=True,
+            reason="Approved", receipts=[],
+        ) for decision in ("BUY", "EXIT")]
         self.store.upsert_trade_case(
             {
                 "trade_case_id": "BTCUSDT-case-5",
@@ -1608,8 +1603,8 @@ class TestStateStore(unittest.TestCase):
                 "risk_mode": "trigger",
                 "opened_at": "2026-03-07 13:00:00",
                 "closed_at": "2026-03-07 13:20:00",
-                "entry_audit_log_id": 15,
-                "exit_audit_log_id": 16,
+                "entry_audit_log_id": audit_ids[0],
+                "exit_audit_log_id": audit_ids[1],
                 "entry_decision": "BUY",
                 "exit_decision": "EXIT",
                 "entry_side": "LONG",

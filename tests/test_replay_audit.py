@@ -14,8 +14,7 @@ from tools.replay_audit import (
 
 class TestReplayAudit(unittest.TestCase):
     def setUp(self):
-        Path("c:/gpt_trader/.tmp_tests").mkdir(parents=True, exist_ok=True)
-        self.tmpdir = tempfile.TemporaryDirectory(dir="c:/gpt_trader/.tmp_tests")
+        self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmpdir.name) / "replay.db")
         self.store = StateStore(self.db_path)
 

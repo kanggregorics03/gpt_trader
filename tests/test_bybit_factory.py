@@ -14,7 +14,7 @@ class TestBybitFactory(unittest.TestCase):
 
     def test_normalize_trading_mode_falls_back_to_legacy_testnet(self):
         self.assertEqual(normalize_trading_mode(None, "true"), "testnet")
-        self.assertEqual(normalize_trading_mode(None, "false"), "live")
+        self.assertEqual(normalize_trading_mode(None, "false"), "demo")
 
     def test_normalize_trading_mode_rejects_invalid_values(self):
         with self.assertRaises(ValueError):
